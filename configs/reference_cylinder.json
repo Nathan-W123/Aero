@@ -1,0 +1,16 @@
+{
+  "_comment": "Canonical validation case: cylinder at Re=100. Expected Cd ≈ 1.0-1.35.",
+  "shape": "cylinder",
+  "radius": 20.0,
+  "cx_frac": 0.3333333333333333,
+  "cy_frac": 0.5,
+  "re": 100.0,
+  "u0": 0.05,
+  "nx": 400,
+  "ny": 200,
+  "steps": 80000,
+  "check_every": 2000,
+  "early_stop": false,
+  "output": "./outputs",
+  "verbose": true
+}

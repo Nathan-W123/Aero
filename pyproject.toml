@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aero-cfd"
+version = "0.1.0"
+description = "From-scratch 2D/3D LBM wind tunnel CFD simulator"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+numba = [
+    "numba>=0.57",
+]
+viz3d = [
+    "pyvista>=0.43",
+    "pyvistaqt>=0.11",
+]
+gui = [
+    "PySide6>=6.7",
+    "pyvista>=0.43",
+    "pyvistaqt>=0.11",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "numba>=0.57",
+]
+
+[project.scripts]
+aero = "cli:main"
+aero-gui = "gui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aero*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+markers = [
+    "slow: benchmark tests against literature values (deselect with -m 'not slow')",
+]
