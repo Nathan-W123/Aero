@@ -40,6 +40,11 @@ def _lattice_arrays():
     return ex, ey, w
 
 
+def _call_collision_kernel(f, got, solid, omega, ex, ey, w, ny, nx):
+    dummy = np.zeros((ny, nx), dtype=np.float64)
+    collision_kernel(f, got, solid, omega, ex, ey, w, dummy, False)
+
+
 # ---------------------------------------------------------------------------
 # 1. Kernel unit tests
 # ---------------------------------------------------------------------------
@@ -86,7 +91,7 @@ class TestCollisionKernel:
             pytest.skip("Numba not installed")
         ref = self._numpy_collision()
         got = np.empty_like(self.f)
-        collision_kernel(self.f, got, self.solid, self.omega, self.ex, self.ey, self.w)
+        _call_collision_kernel(self.f, got, self.solid, self.omega, self.ex, self.ey, self.w, self.Ny, self.Nx)
         np.testing.assert_allclose(got, ref, rtol=1e-12, atol=1e-14)
 
     def test_mass_conservation(self):
@@ -95,7 +100,7 @@ class TestCollisionKernel:
             pytest.skip("Numba not installed")
         mass_before = self.f.sum()
         got = np.empty_like(self.f)
-        collision_kernel(self.f, got, self.solid, self.omega, self.ex, self.ey, self.w)
+        _call_collision_kernel(self.f, got, self.solid, self.omega, self.ex, self.ey, self.w, self.Ny, self.Nx)
         np.testing.assert_allclose(got.sum(), mass_before, rtol=1e-12)
 
     def test_solid_cells_zero_velocity(self):
@@ -103,7 +108,7 @@ class TestCollisionKernel:
         if not HAS_NUMBA:
             pytest.skip("Numba not installed")
         got = np.empty_like(self.f)
-        collision_kernel(self.f, got, self.solid, self.omega, self.ex, self.ey, self.w)
+        _call_collision_kernel(self.f, got, self.solid, self.omega, self.ex, self.ey, self.w, self.Ny, self.Nx)
         _, ux_out, uy_out = compute_macroscopic(got)
         # Solid cells: feq(rho, 0, 0) is exact equilibrium, so after one
         # collision step the velocity should converge toward zero.  With omega=1.5,

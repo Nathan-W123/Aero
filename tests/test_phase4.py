@@ -32,6 +32,11 @@ from aero.geometry3d.box import Box
 from aero.forces3d import compute_forces_3d, forces_to_coefficients_3d
 
 
+def _call_collision_kernel_3d(f, got, solid, omega, ex, ey, ez, w, nz, ny, nx):
+    dummy = np.zeros((nz, ny, nx), dtype=np.float64)
+    collision_kernel_3d(f, got, solid, omega, ex, ey, ez, w, dummy, False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -227,8 +232,9 @@ class TestKernels3D:
 
     def test_collision_mass_conservation(self):
         f_post = np.empty_like(self.f)
-        collision_kernel_3d(self.f, f_post, self.solid, self.omega,
-                            self.ex, self.ey, self.ez, self.w)
+        _call_collision_kernel_3d(self.f, f_post, self.solid, self.omega,
+                                  self.ex, self.ey, self.ez, self.w,
+                                  self.Nz, self.Ny, self.Nx)
         np.testing.assert_allclose(f_post.sum(), self.f.sum(), rtol=1e-12)
 
     def test_stream_mass_conservation(self):
@@ -264,8 +270,9 @@ class TestKernels3D:
         ref = (1.0 - self.omega) * self.f + self.omega * feq
 
         got = np.empty_like(self.f)
-        collision_kernel_3d(self.f, got, self.solid, self.omega,
-                            self.ex, self.ey, self.ez, self.w)
+        _call_collision_kernel_3d(self.f, got, self.solid, self.omega,
+                                  self.ex, self.ey, self.ez, self.w,
+                                  self.Nz, self.Ny, self.Nx)
         np.testing.assert_allclose(got, ref, rtol=1e-12, atol=1e-14)
 
 

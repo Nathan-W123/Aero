@@ -19,29 +19,19 @@ from .d3q19 import E3, OPP3, Y_MIR3
 # Inlet: Zou-He 3D velocity BC (ux=u0, uy=0, uz=0) at x=0
 # ---------------------------------------------------------------------------
 
-def apply_inlet_zou_he_3d(f: np.ndarray, u0: float) -> None:
+def apply_inlet_zou_he_3d(
+    f: np.ndarray,
+    u0: float,
+    *,
+    uy_amp: float = 0.0,
+    uz_amp: float = 0.0,
+    step: int = 0,
+) -> None:
     """
-    3D Zou-He velocity BC at left face (x=0): impose ux=u0, uy=0, uz=0.
+    3D Zou-He velocity BC at left face (x=0): impose ux=u0, uy≈0, uz≈0.
 
-    Derives missing distributions (those with ex=+1: i=1,7,9,11,13) from
-    mass and momentum constraints.
-
-    Derivation
-    ----------
-    ex<0 directions (known after streaming): i = 2, 8, 10, 12, 14
-    ex=0 directions (known):                 i = 0, 3, 4, 5, 6, 15, 16, 17, 18
-    ex>0 directions (unknown):               i = 1, 7, 9, 11, 13
-
-    rho_in  = (2*F_minus + F_neut) / (1 - u0)
-
-    Anti-symmetric Zou-He bounce-back with ey/ez correction terms:
-      f[1]  = f[2]  + (1/3)*rho_in*u0
-      f[7]  = f[10] + (1/6)*rho_in*u0 - 0.5*cy
-      f[9]  = f[8]  + (1/6)*rho_in*u0 + 0.5*cy
-      f[11] = f[14] + (1/6)*rho_in*u0 - 0.5*cz
-      f[13] = f[12] + (1/6)*rho_in*u0 + 0.5*cz
-
-    where cy and cz enforce uy=0 and uz=0 at the inlet.
+    Optional spanwise uz_amp and vertical uy_amp perturbations (fraction of u0)
+    trigger 3D shedding at supercritical Re.
     """
     c = 0  # x=0 column index
 
@@ -52,13 +42,22 @@ def apply_inlet_zou_he_3d(f: np.ndarray, u0: float) -> None:
                + f[15,:,:,c] + f[16,:,:,c] + f[17,:,:,c] + f[18,:,:,c])
     rho_in = (2.0 * F_minus + F_neut) / (1.0 - u0)
 
-    # ey-correction to enforce uy=0 (sum over known ex≤0 ey populations)
     cy = (f[3,:,:,c] - f[4,:,:,c]
           + f[15,:,:,c] - f[16,:,:,c] + f[17,:,:,c] - f[18,:,:,c])
-
-    # ez-correction to enforce uz=0
     cz = (f[5,:,:,c] - f[6,:,:,c]
           + f[15,:,:,c] + f[16,:,:,c] - f[17,:,:,c] - f[18,:,:,c])
+
+    if uy_amp > 0.0 or uz_amp > 0.0:
+        nz, ny = f.shape[1], f.shape[2]
+        yy = np.arange(ny, dtype=np.float64)
+        zz = np.arange(nz, dtype=np.float64)
+        phase = 0.17 * step
+        if uy_amp > 0.0:
+            uy = uy_amp * u0 * np.sin(2.0 * np.pi * yy / max(ny, 1) + phase)
+            cy = cy + rho_in * uy
+        if uz_amp > 0.0:
+            uz = uz_amp * u0 * np.sin(2.0 * np.pi * zz / max(nz, 1) + phase)
+            cz = cz + rho_in * uz[:, None]
 
     f[1, :,:,c]  = f[2, :,:,c] + (1.0/3.0) * rho_in * u0
     f[7, :,:,c]  = f[10,:,:,c] + (1.0/6.0) * rho_in * u0 - 0.5 * cy

@@ -107,8 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
     # Backend (Phase 3)
     p.add_argument("--backend", choices=["auto", "numpy", "numba"], default="auto",
                    help="Compute backend: auto=use Numba if installed, else NumPy")
-    p.add_argument("--collision", choices=["bgk", "mrt"], default="bgk",
-                   help="Collision operator: BGK (default) or MRT")
+    p.add_argument("--collision", choices=["bgk", "mrt", "trt"], default="bgk",
+                   help="Collision operator: BGK, MRT, or TRT")
+    p.add_argument("--trt-lambda", type=float, default=0.25, help="TRT magic parameter")
+    p.add_argument("--sponge-cells", type=int, default=0, help="Outlet sponge thickness (0=off)")
+    p.add_argument("--sponge-strength", type=float, default=0.1, help="Max sponge relaxation")
+    p.add_argument("--les", action="store_true", help="Enable Smagorinsky LES")
+    p.add_argument("--les-cs", type=float, default=0.16, help="Smagorinsky constant")
 
     # Output / config
     p.add_argument("--output",  type=str, default="./outputs",
@@ -324,6 +329,11 @@ def main() -> int:
         backend=args.backend,
         collision=args.collision,
         inlet_perturbation=args.inlet_perturbation,
+        trt_lambda=args.trt_lambda,
+        sponge_thickness=args.sponge_cells,
+        sponge_strength=args.sponge_strength,
+        les=args.les,
+        les_cs=args.les_cs,
     )
     print(f"Surf links: {solver.surface_links.shape[0]}")
     print()
@@ -382,6 +392,9 @@ def main() -> int:
     print("  === RESULTS ===")
     print(f"  Cd (mean) = {result['Cd_mean']:.4f}  ±  {result['Cd_std']:.4f}")
     print(f"  Cl (mean) = {result['Cl_mean']:.4f}  ±  {result['Cl_std']:.4f}")
+    if "Cd_p_mean" in result:
+        print(f"  Cd_press  = {result['Cd_p_mean']:.4f}  (pressure drag)")
+        print(f"  Cd_visc   = {result['Cd_v_mean']:.4f}  (viscous drag)")
     if St is not None:
         print(f"  St        = {St:.4f}  (Strouhal — expected ~0.164 for cylinder Re=100)")
     print(f"  Elapsed   = {elapsed:.1f} s")

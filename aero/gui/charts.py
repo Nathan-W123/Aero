@@ -117,6 +117,37 @@ if HAS_QT:
             self.figure.tight_layout(pad=0.8)
             self.canvas.draw_idle()
 
+        def plot_re_sweep(
+            self,
+            re_values: Sequence[float],
+            cd_values: Sequence[float],
+        ) -> None:
+            if not re_values or not cd_values or len(re_values) != len(cd_values):
+                self.title_label.setText("Re sweep")
+                self._draw_empty("Run Re Sweep to plot Cd vs Re.")
+                return
+            self.title_label.setText("Cd vs Re")
+            self.figure.clf()
+            self.ax = self.figure.add_subplot(111)
+            self._style_axes(self.ax)
+            re_arr = np.asarray(re_values, dtype=np.float64)
+            cd_arr = np.asarray(cd_values, dtype=np.float64)
+            order = np.argsort(re_arr)
+            re_arr = re_arr[order]
+            cd_arr = cd_arr[order]
+            self.ax.plot(
+                re_arr, cd_arr,
+                color=CHART_THEME["cd"],
+                marker="o",
+                linewidth=1.4,
+                markersize=6,
+            )
+            self.ax.set_xlabel("Reynolds number", fontsize=9)
+            self.ax.set_ylabel("Cd (mean)", fontsize=9)
+            self.ax.grid(True, alpha=0.35, color=CHART_THEME["grid"])
+            self.figure.tight_layout(pad=0.8)
+            self.canvas.draw_idle()
+
         def plot_pressure_field(self, pressure: np.ndarray, solid: Optional[np.ndarray] = None) -> None:
             if pressure.size == 0:
                 self._draw_empty("Run a 3D case to see pressure.")
@@ -141,6 +172,40 @@ if HAS_QT:
             cbar = self.figure.colorbar(im, ax=self.ax, fraction=0.046, pad=0.04)
             cbar.ax.tick_params(labelsize=7, colors=CHART_THEME["text"])
             cbar.set_label("p", fontsize=8, color=CHART_THEME["text"])
+            self.figure.tight_layout(pad=0.8)
+            self.canvas.draw_idle()
+
+        def plot_mesh_voxel_preview(
+            self,
+            slice_field: np.ndarray,
+            *,
+            blockage: float,
+            solid_cells: int,
+        ) -> None:
+            """Y-midplane voxel preview before running a mesh case."""
+            if slice_field.size == 0:
+                self._draw_empty("Select an STL to preview voxelization.")
+                return
+            self.title_label.setText("Mesh voxel preview")
+            self.figure.clf()
+            self.ax = self.figure.add_subplot(111)
+            self._style_axes(self.ax)
+            im = self.ax.imshow(
+                slice_field,
+                origin="lower",
+                cmap="gray_r",
+                aspect="auto",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            self.ax.set_xlabel("streamwise x", fontsize=9)
+            self.ax.set_ylabel("spanwise z", fontsize=9)
+            self.ax.set_title(
+                f"Blockage {blockage*100:.1f}% · {solid_cells:,} solid cells",
+                fontsize=9,
+                color=CHART_THEME["text"],
+            )
+            self.figure.colorbar(im, ax=self.ax, fraction=0.046, pad=0.04)
             self.figure.tight_layout(pad=0.8)
             self.canvas.draw_idle()
 

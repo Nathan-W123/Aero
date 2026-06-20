@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Shape
-    p.add_argument("--shape", choices=["sphere", "box", "cylinder"], default="sphere")
+    p.add_argument("--shape", choices=["sphere", "box", "cylinder", "mesh"], default="sphere")
     p.add_argument("--radius", type=float, default=10.0,
                    help="Sphere radius (lattice cells)")
     p.add_argument("--width",  type=float, default=10.0,
@@ -49,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Box spanwise depth (lattice cells)")
     p.add_argument("--length", type=float, default=20.0,
                    help="Cylinder spanwise length (lattice cells)")
+    p.add_argument("--stl-path", type=str, default=None,
+                   help="Path to STL file for --shape mesh")
+    p.add_argument("--stl-fit", type=float, default=0.35,
+                   help="Max cross-stream mesh extent as fraction of min(Ny,Nz)")
+    p.add_argument("--mesh-orient", choices=["auto", "none"], default="auto",
+                   help="Auto-orient STL: stream +x, span +y, thin +z (PCA)")
     p.add_argument("--cx-frac", type=float, default=1.0/3.0,
                    help="Obstacle centre x as fraction of Nx")
     p.add_argument("--cy-frac", type=float, default=0.5)
@@ -69,7 +75,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Backend
     p.add_argument("--backend", choices=["auto", "numpy", "numba"], default="auto")
-    p.add_argument("--collision", choices=["bgk", "mrt"], default="bgk")
+    p.add_argument("--collision", choices=["bgk", "mrt", "trt"], default="bgk")
+    p.add_argument("--trt-lambda", type=float, default=0.25)
+    p.add_argument("--inlet-perturbation", type=float, default=0.0,
+                   help="Inlet uz perturbation amplitude (fraction of u0)")
+    p.add_argument("--sponge-cells", type=int, default=0)
+    p.add_argument("--sponge-strength", type=float, default=0.1)
+    p.add_argument("--les", action="store_true")
+    p.add_argument("--les-cs", type=float, default=0.16)
+    p.add_argument("--mesh-bc", choices=["voxel", "ibm"], default="voxel",
+                   help="STL mesh boundary: voxel bounce-back or Guo IBM")
     p.add_argument("--allow-high-blockage", action="store_true",
                    help="Allow very confined runs (>30% frontal blockage)")
 
@@ -114,6 +129,10 @@ def compute_blockage_metrics(args: argparse.Namespace, D: float) -> Tuple[float,
     elif args.shape == "cylinder":
         frontal_y = D
         frontal_z = args.length
+    elif args.shape == "mesh":
+        fit = getattr(args, "stl_fit", 0.35)
+        frontal_y = args.ny * fit
+        frontal_z = args.nz * fit
     else:
         frontal_y = D
         frontal_z = D
@@ -153,8 +172,43 @@ def main() -> int:
     parser = build_parser()
     args   = parser.parse_args()
 
-    # Derived LBM parameters
-    if args.shape == "sphere":
+    geom = None
+    solid = None
+    phi_field = None
+    ibm_enabled = False
+    mesh_blockage_tuple = None
+
+    # Derived LBM parameters (D may come from voxelized mesh)
+    if args.shape == "mesh":
+        if not args.stl_path:
+            print("[X] --stl-path required for --shape mesh")
+            return 1
+        from aero.geometry3d.mesh_mask import MeshMask
+        from aero.geometry3d.signed_distance import compute_phi_field
+        from aero.geometry3d.stl_io import load_stl_triangles
+        from aero.geometry3d.stl_prep import compute_frontal_blockage
+
+        geom = MeshMask(
+            path=args.stl_path,
+            cx_frac=args.cx_frac,
+            cy_frac=args.cy_frac,
+            cz_frac=args.cz_frac,
+            fit_frac=args.stl_fit,
+            mesh_orient=args.mesh_orient,
+        )
+        solid = geom.mark_solid(args.nz, args.ny, args.nx)
+        ibm_enabled = args.mesh_bc == "ibm"
+        if ibm_enabled:
+            tris = load_stl_triangles(args.stl_path)
+            phi_field = compute_phi_field(
+                tris, args.nz, args.ny, args.nx,
+                args.cx_frac, args.cy_frac, args.cz_frac, args.stl_fit,
+                args.mesh_orient,
+            )
+            solid = phi_field <= 0.0
+        D = geom.reference_length()
+        mesh_blockage_tuple = compute_frontal_blockage(solid)
+    elif args.shape == "sphere":
         D = 2.0 * args.radius
     elif args.shape == "box":
         D = args.height
@@ -167,7 +221,10 @@ def main() -> int:
     tau    = 3.0 * nu_lbm + 0.5
     omega  = 1.0 / tau
     Ma     = args.u0 * math.sqrt(3.0)
-    blockage_y, blockage_z, blockage = compute_blockage_metrics(args, D)
+    if mesh_blockage_tuple is not None:
+        blockage_y, blockage_z, blockage = mesh_blockage_tuple
+    else:
+        blockage_y, blockage_z, blockage = compute_blockage_metrics(args, D)
     blockage_label, blockage_blocked = assess_blockage(blockage, args.allow_high_blockage)
 
     if tau < 0.55:
@@ -226,8 +283,16 @@ def main() -> int:
     else:
         output_dir = args.output
 
-    # Geometry
-    if args.shape == "sphere":
+    # Geometry (analytic shapes; mesh was voxelized above)
+    if args.shape == "mesh":
+        if tau < 0.55:
+            print(f"[X] tau={tau:.4f} < 0.55 — unstable after mesh fit. Reduce Re or enlarge grid.")
+            return 1
+        print(
+            f"Obstacle  : {solid.sum()} solid cells (STL mesh, D≈{D:.1f}, "
+            f"orient={args.mesh_orient})"
+        )
+    elif args.shape == "sphere":
         geom = Sphere(radius=args.radius,
                       cx_frac=args.cx_frac, cy_frac=args.cy_frac, cz_frac=args.cz_frac)
     elif args.shape == "box":
@@ -240,8 +305,9 @@ def main() -> int:
         print(f"[X] Unknown shape: {args.shape}")
         return 1
 
-    solid = geom.mark_solid(args.nz, args.ny, args.nx)
-    print(f"Obstacle  : {solid.sum()} solid cells")
+    if args.shape != "mesh":
+        solid = geom.mark_solid(args.nz, args.ny, args.nx)
+        print(f"Obstacle  : {solid.sum()} solid cells")
 
     # Solver
     solver = Solver3D(
@@ -255,6 +321,14 @@ def main() -> int:
         outlet_bc=args.outlet_bc,
         backend=args.backend,
         collision=args.collision,
+        inlet_perturbation=args.inlet_perturbation,
+        trt_lambda=args.trt_lambda,
+        sponge_thickness=args.sponge_cells,
+        sponge_strength=args.sponge_strength,
+        les=args.les,
+        les_cs=args.les_cs,
+        ibm_enabled=(args.shape == "mesh" and args.mesh_bc == "ibm"),
+        phi=phi_field if args.shape == "mesh" and args.mesh_bc == "ibm" else None,
     )
     print(f"Surf links: {solver.surface_links.shape[0]}")
     print()
@@ -285,6 +359,9 @@ def main() -> int:
     print()
     print("  === RESULTS ===")
     print(f"  Cd    (mean) = {result['Cd_mean']:.4f}  ±  {result['Cd_std']:.4f}")
+    if "Cd_p_mean" in result:
+        print(f"  Cd_press       = {result['Cd_p_mean']:.4f}  (pressure drag)")
+        print(f"  Cd_visc        = {result['Cd_v_mean']:.4f}  (viscous drag)")
     print(f"  Cl_y  (mean) = {result['Cly_mean']:.4f}  ±  {result['Cly_std']:.4f}")
     print(f"  Cl_z  (mean) = {result['Clz_mean']:.4f}  ±  {result['Clz_std']:.4f}")
     print(f"  Elapsed      = {elapsed:.1f} s  ({args.steps/elapsed:.0f} steps/s)")

@@ -140,6 +140,11 @@ def validate_bc_config(
     else:
         if wall_bc not in {"slip", "noslip"}:
             warnings.append(f"Unknown wall_bc '{wall_bc}' — use slip or noslip.")
+        if re > 47 and inlet_perturbation <= 0 and wall_bc == "slip":
+            warnings.append(
+                "Re > 47 with slip walls and no inlet perturbation — "
+                "3D shedding may not trigger; try inlet_perturbation ≥ 0.02."
+            )
 
     if outlet_bc == "zerogradient" and re > 200:
         warnings.append("Zero-gradient outlet at high Re may reflect spurious waves — prefer convective.")
@@ -165,8 +170,13 @@ def assess_collision(
             return "warn", f"MRT with tau={tau:.3f} — monitor stability at Re={re:.0f}."
         return "pass", f"MRT collision, tau={tau:.3f} — suitable for Re={re:.0f}."
 
+    if collision == "trt":
+        if re > 300:
+            return "warn", f"TRT at Re={re:.0f} — consider LES for turbulent regimes."
+        return "pass", f"TRT collision, tau={tau:.3f} — enhanced stability for Re={re:.0f}."
+
     if re > 250:
-        return "warn", f"BGK at Re={re:.0f} may be stiff — try collision=mrt for stability."
+        return "warn", f"BGK at Re={re:.0f} may be stiff — try collision=mrt or trt."
     if tau < 0.58:
         return "warn", f"BGK with tau={tau:.3f} near stability limit — consider MRT or lower Re."
     return "pass", f"BGK collision, tau={tau:.3f} — stable for Re={re:.0f}."
@@ -217,6 +227,15 @@ def build_validation_report(
         inlet_perturbation=float(params.get("inlet_perturbation", "0") or "0"),
     )
     c_status, c_msg = assess_collision(re=re, tau=tau, collision=params.get("collision", "bgk"))
+
+    bc_warnings = list(bc_warnings)
+    les_enabled = str(params.get("les", "false")).lower() in ("true", "1", "yes")
+    if re > 300 and not les_enabled and params.get("collision", "bgk") == "bgk":
+        bc_warnings.append(
+            "Re > 300 with BGK and no LES — consider collision=trt/mrt or enable LES."
+        )
+    if params.get("mesh_bc") == "ibm":
+        bc_warnings.append("IBM boundary active — compare against voxel mode for validation.")
 
     return ValidationReport(
         benchmark_status=b_status,

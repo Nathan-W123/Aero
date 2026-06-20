@@ -48,6 +48,8 @@ if HAS_NUMBA:
         ex: np.ndarray,
         ey: np.ndarray,
         w: np.ndarray,
+        omega_field: np.ndarray,
+        use_omega_field: bool,
     ) -> None:
         """
         Fused macroscopic + BGK collision.
@@ -81,12 +83,13 @@ if HAS_NUMBA:
                     uy = my * inv_rho
 
                 usq = ux * ux + uy * uy
+                om = omega_field[y, x] if use_omega_field else omega
 
                 # --- BGK ---
                 for i in range(Q):
                     eu    = ex[i] * ux + ey[i] * uy
                     feqi  = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
-                    f_post[i, y, x] = (1.0 - omega) * f[i, y, x] + omega * feqi
+                    f_post[i, y, x] = (1.0 - om) * f[i, y, x] + om * feqi
 
     @nb.njit(cache=True, parallel=True)
     def stream_kernel(
@@ -123,6 +126,8 @@ else:
         ex: np.ndarray,
         ey: np.ndarray,
         w: np.ndarray,
+        omega_field: np.ndarray,
+        use_omega_field: bool,
     ) -> None:
         """NumPy fallback for collision_kernel (used when Numba is not installed)."""
         rho = f.sum(axis=0)
@@ -132,10 +137,11 @@ else:
         ux[solid] = 0.0
         uy[solid] = 0.0
         usq = ux * ux + uy * uy
+        om = omega_field if use_omega_field else np.full(ux.shape, omega)
         for i in range(9):
             eu = ex[i] * ux + ey[i] * uy
             feqi = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
-            f_post[i] = (1.0 - omega) * f[i] + omega * feqi
+            f_post[i] = (1.0 - om) * f[i] + om * feqi
 
     def stream_kernel(
         f_src: np.ndarray,

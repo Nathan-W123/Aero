@@ -31,6 +31,8 @@ if HAS_NUMBA:
         ey: np.ndarray,
         ez: np.ndarray,
         w: np.ndarray,
+        omega_field: np.ndarray,
+        use_omega_field: bool,
     ) -> None:
         """Fused macroscopic + BGK collision for D3Q19.  Parallel over z slices."""
         Q, Nz, Ny, Nx = f.shape
@@ -52,10 +54,11 @@ if HAS_NUMBA:
                         uy = my * inv_rho
                         uz = mz * inv_rho
                     usq = ux*ux + uy*uy + uz*uz
+                    om = omega_field[z, y, x] if use_omega_field else omega
                     for i in range(Q):
                         eu   = ex[i]*ux + ey[i]*uy + ez[i]*uz
                         feqi = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
-                        f_post[i, z, y, x] = (1.0 - omega) * f[i, z, y, x] + omega * feqi
+                        f_post[i, z, y, x] = (1.0 - om) * f[i, z, y, x] + om * feqi
 
     @nb.njit(cache=True, parallel=True)
     def stream_kernel_3d(
@@ -77,7 +80,7 @@ if HAS_NUMBA:
                         f_dst[i, zn, yn, xn] = f_src[i, z, y, x]
 
 else:
-    def collision_kernel_3d(f, f_post, solid, omega, ex, ey, ez, w):
+    def collision_kernel_3d(f, f_post, solid, omega, ex, ey, ez, w, omega_field, use_omega_field):
         """NumPy fallback for collision_kernel_3d."""
         rho = f.sum(axis=0)
         inv_rho = np.where(rho > 0.0, 1.0 / rho, 0.0)
@@ -86,10 +89,11 @@ else:
         uz = inv_rho * np.einsum('i,izyx->zyx', ez.astype(np.float64), f)
         ux[solid] = 0.0; uy[solid] = 0.0; uz[solid] = 0.0
         usq = ux*ux + uy*uy + uz*uz
+        om = omega_field if use_omega_field else np.full(ux.shape, omega)
         for i in range(19):
             eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
             feqi = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
-            f_post[i] = (1.0 - omega) * f[i] + omega * feqi
+            f_post[i] = (1.0 - om) * f[i] + om * feqi
 
     def stream_kernel_3d(f_src, f_dst, ex, ey, ez):
         """NumPy fallback for stream_kernel_3d."""

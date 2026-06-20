@@ -22,8 +22,12 @@ from .state import (
     GUI_COMBO_FIELDS,
     build_command,
     build_grid_study_commands,
+    build_re_sweep_commands,
     parse_progress_line,
     parse_run_results,
+    read_checkpoint_step,
+    remaining_steps_for_resume,
+    search_resumable_checkpoint,
 )
 from aero.benchmarks import ValidationReport, build_validation_report
 from .run_data import chart_data_from_run, latest_volume_file, resolve_output_dir
@@ -121,6 +125,8 @@ if HAS_QT:
             self._value_labels: Dict[str, QtWidgets.QLabel] = {}
             rows = [
                 ("Drag coefficient", "cd"),
+                ("Pressure drag", "cd_p"),
+                ("Viscous drag", "cd_v"),
                 ("Lift coefficient (Y)", "cl_y"),
                 ("Lift coefficient (Z)", "cl_z"),
                 ("Runtime", "elapsed"),
@@ -210,6 +216,8 @@ if HAS_QT:
             steps_per_sec = metrics.get("steps_per_sec", "")
 
             self._value_labels["cd"].setText(f"{cd} ± {cd_std}" if cd_std else cd)
+            self._value_labels["cd_p"].setText(metrics.get("cd_p_mean", "—"))
+            self._value_labels["cd_v"].setText(metrics.get("cd_v_mean", "—"))
             self._value_labels["cl_y"].setText(f"{cl_y} ± {cl_y_std}" if cl_y_std else cl_y)
             self._value_labels["cl_z"].setText(f"{cl_z} ± {cl_z_std}" if cl_z_std else cl_z)
             if elapsed != "—":
@@ -242,6 +250,12 @@ if HAS_QT:
             self._grid_study_index = 0
             self._grid_study_cds: List[float] = []
             self._saved_params_before_grid: Optional[Dict[str, str]] = None
+            self._re_sweep_active = False
+            self._re_sweep_commands: List[List[str]] = []
+            self._re_sweep_res: List[float] = []
+            self._re_sweep_index = 0
+            self._re_sweep_points: List[tuple[float, float]] = []
+            self._resume_checkpoint: Optional[Path] = None
 
             self.setWindowTitle("Aero CFD Studio")
             self.resize(1680, 980)
@@ -253,7 +267,7 @@ if HAS_QT:
 
             self._shape_options = {
                 "2d": ["cylinder", "rectangle"],
-                "3d": ["sphere", "box", "cylinder"],
+                "3d": ["sphere", "box", "cylinder", "mesh"],
             }
             self._on_mode_changed(self.config.mode, refresh=False)
             self._simulation.output.connect(self._on_sim_output)
@@ -341,8 +355,14 @@ if HAS_QT:
             load3d_button.clicked.connect(self._load_3d_if_available)
             grid_study_button = QtWidgets.QPushButton("Grid Study")
             grid_study_button.clicked.connect(self._run_grid_study)
+            re_sweep_button = QtWidgets.QPushButton("Re Sweep")
+            re_sweep_button.clicked.connect(self._run_re_sweep)
+            self.resume_button = QtWidgets.QPushButton("Resume")
+            self.resume_button.clicked.connect(self._resume_case)
+            self.resume_button.setEnabled(False)
             row.addWidget(_ribbon_group("Simulation", [
-                self.run_button, self.stop_button, refresh_button, load3d_button, grid_study_button,
+                self.run_button, self.resume_button, self.stop_button,
+                refresh_button, load3d_button, grid_study_button, re_sweep_button,
             ]))
 
             self.mode_box = QtWidgets.QComboBox()
@@ -512,8 +532,10 @@ if HAS_QT:
             layout.addWidget(title)
 
             self.convergence_chart = MatplotlibChart("Convergence")
+            self.re_sweep_chart = MatplotlibChart("Cd vs Re")
             self.pressure_chart = MatplotlibChart("Pressure Field")
             layout.addWidget(self.convergence_chart, 1)
+            layout.addWidget(self.re_sweep_chart, 1)
             layout.addWidget(self.pressure_chart, 1)
             return panel
 
@@ -543,7 +565,7 @@ if HAS_QT:
             self._field_widgets: Dict[str, QtWidgets.QWidget] = {}
 
             params = self._current_params()
-            common = ["re", "steps", "u0", "backend", "collision"]
+            common = ["re", "steps", "u0", "backend", "collision", "trt_lambda", "sponge_cells", "sponge_strength", "les", "les_cs"]
             if self.config.mode == "2d":
                 fields = common + ["nx", "ny", "wall_bc", "inlet_bc", "outlet_bc", "inlet_perturbation"]
                 shape = self.config.shape_2d
@@ -552,7 +574,7 @@ if HAS_QT:
                 elif shape == "rectangle":
                     fields += ["width", "height"]
             else:
-                fields = common + ["nx", "ny", "nz", "wall_bc", "outlet_bc", "viz3d"]
+                fields = common + ["nx", "ny", "nz", "wall_bc", "outlet_bc", "viz3d", "inlet_perturbation"]
                 shape = self.config.shape_3d
                 if shape == "sphere":
                     fields += ["radius"]
@@ -560,6 +582,8 @@ if HAS_QT:
                     fields += ["width", "height", "depth"]
                 elif shape == "cylinder":
                     fields += ["radius", "length"]
+                elif shape == "mesh":
+                    fields += ["stl_path", "stl_fit", "mesh_bc", "mesh_orient"]
 
             for field in fields:
                 label = QtWidgets.QLabel(field)
@@ -579,6 +603,20 @@ if HAS_QT:
                 self.form_layout.addRow(label, widget)
                 self._field_widgets[field] = widget
 
+            if self.config.mode == "3d" and self.config.shape_3d == "mesh":
+                browse = QtWidgets.QPushButton("Browse STL…")
+                browse.clicked.connect(self._browse_stl_file)
+                self.form_layout.addRow("", browse)
+                preview_btn = QtWidgets.QPushButton("Preview mesh voxels")
+                preview_btn.clicked.connect(self._refresh_mesh_preview)
+                self.form_layout.addRow("", preview_btn)
+                self._mesh_preview_label = QtWidgets.QLabel("")
+                self._mesh_preview_label.setObjectName("panelSubtitle")
+                self._mesh_preview_label.setWordWrap(True)
+                self.form_layout.addRow("", self._mesh_preview_label)
+            else:
+                self._mesh_preview_label = None
+
             self._update_state_from_form()
             if refresh:
                 self._refresh_live_charts()
@@ -592,6 +630,97 @@ if HAS_QT:
                 return widget.currentText()
             return widget.text().strip()
 
+        def _browse_stl_file(self) -> None:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select STL mesh",
+                str(self.repo_root),
+                "STL files (*.stl *.STL);;All files (*)",
+            )
+            if not path:
+                return
+            params = self._current_params()
+            params["stl_path"] = path
+            widget = self._field_widgets.get("stl_path")
+            if isinstance(widget, QtWidgets.QLineEdit):
+                widget.setText(path)
+            self._apply_mesh_presets(params)
+            self._update_state_from_form()
+            self._refresh_mesh_preview()
+
+        def _apply_mesh_presets(self, params: dict) -> None:
+            """Sensible defaults when loading an STL for the first time."""
+            if params.get("sponge_cells", "0") in ("0", ""):
+                params["sponge_cells"] = "8"
+            if float(params.get("re", "100") or "100") > 150 and params.get("collision") == "bgk":
+                params["collision"] = "trt"
+            if float(params.get("re", "100") or "100") > 300 and params.get("les") == "0":
+                params["les"] = "1"
+
+        def _refresh_mesh_preview(self) -> None:
+            if self.config.mode != "3d" or self.config.shape_3d != "mesh":
+                return
+            params = self._current_params()
+            stl = params.get("stl_path", "")
+            if not stl:
+                if self._mesh_preview_label is not None:
+                    self._mesh_preview_label.setText("")
+                self.pressure_chart.plot_mesh_voxel_preview(
+                    np.array([]), blockage=0.0, solid_cells=0,
+                )
+                return
+            try:
+                from aero.geometry3d.mesh_preview import build_mesh_preview
+
+                preview = build_mesh_preview(
+                    stl,
+                    nz=int(params.get("nz", "64")),
+                    ny=int(params.get("ny", "64")),
+                    nx=int(params.get("nx", "128")),
+                    fit_frac=float(params.get("stl_fit", "0.35") or "0.35"),
+                    mesh_orient=params.get("mesh_orient", "auto"),
+                )
+            except (OSError, ValueError) as exc:
+                if self._mesh_preview_label is not None:
+                    self._mesh_preview_label.setText(f"Preview failed: {exc}")
+                return
+            if preview is None:
+                if self._mesh_preview_label is not None:
+                    self._mesh_preview_label.setText("STL file not found.")
+                return
+            msg = (
+                f"Voxel preview: {preview.solid_cells:,} cells · "
+                f"blockage {preview.blockage*100:.1f}% "
+                f"(y={preview.blockage_y*100:.1f}%, z={preview.blockage_z*100:.1f}%) · "
+                f"D≈{preview.reference_length:.1f}"
+            )
+            if self._mesh_preview_label is not None:
+                self._mesh_preview_label.setText(msg)
+            self.pressure_chart.plot_mesh_voxel_preview(
+                preview.midplane,
+                blockage=preview.blockage,
+                solid_cells=preview.solid_cells,
+            )
+            self._update_validation_panel()
+
+        def _refresh_checkpoint_status(self) -> None:
+            checkpoint = search_resumable_checkpoint(self.config, self.repo_root)
+            self._resume_checkpoint = checkpoint
+            if checkpoint is None:
+                self.resume_button.setEnabled(False)
+                self.resume_button.setToolTip("")
+                return
+            try:
+                step = read_checkpoint_step(checkpoint)
+                target = int(self._current_params().get("steps", "0"))
+                self.resume_button.setEnabled(True)
+                self.resume_button.setToolTip(
+                    f"Resume from step {step:,} ({checkpoint.name}) — {max(target - step, 0):,} steps remaining"
+                )
+            except (OSError, KeyError, ValueError):
+                self.resume_button.setEnabled(True)
+                self.resume_button.setToolTip(str(checkpoint))
+
         def _refresh_live_charts(self) -> None:
             manifest, fields = chart_data_from_run(self.config, self.repo_root)
             if manifest:
@@ -602,6 +731,12 @@ if HAS_QT:
                 )
             else:
                 self.convergence_chart.plot_convergence([])
+
+            if self._re_sweep_points:
+                re_vals, cd_vals = zip(*self._re_sweep_points)
+                self.re_sweep_chart.plot_re_sweep(re_vals, cd_vals)
+            else:
+                self.re_sweep_chart.plot_re_sweep([], [])
 
             if fields is not None:
                 self.pressure_chart.plot_pressure_field(fields["pressure"], fields["solid"])
@@ -715,6 +850,7 @@ if HAS_QT:
                 f"{self.config.mode.upper()} · {self.shape_box.currentText()} · "
                 f"Re={params.get('re', '?')} · steps={params.get('steps', '?')}"
             )
+            self._refresh_checkpoint_status()
 
         def _update_validation_panel(
             self,
@@ -749,11 +885,44 @@ if HAS_QT:
             if self._simulation.is_running():
                 return
             self._update_state_from_form()
+            if self.config.mode == "3d" and self.config.shape_3d == "mesh":
+                stl = Path(self._current_params().get("stl_path", ""))
+                if not stl.is_file():
+                    self.summary_label.setText("Select a valid STL file for mesh geometry.")
+                    return
             self._grid_study_active = False
+            self._re_sweep_active = False
             self._run_metrics = {}
             self.results_summary.clear_results()
             self._update_validation_panel()
             self._start_command(build_command(self.config), label="Simulation running...")
+
+        def _resume_case(self) -> None:
+            if self._simulation.is_running():
+                return
+            self._update_state_from_form()
+            checkpoint = self._resume_checkpoint or search_resumable_checkpoint(
+                self.config, self.repo_root
+            )
+            if checkpoint is None:
+                self.summary_label.setText("No checkpoint found to resume.")
+                return
+            params = self._current_params()
+            target_steps = int(params.get("steps", "5000"))
+            remaining = remaining_steps_for_resume(checkpoint, target_steps)
+            step = read_checkpoint_step(checkpoint)
+            self._grid_study_active = False
+            self._re_sweep_active = False
+            command = build_command(
+                self.config,
+                resume_from=str(checkpoint),
+                steps_override=remaining,
+                enable_checkpoints=True,
+            )
+            self._start_command(
+                command,
+                label=f"Resuming from step {step:,} ({remaining:,} steps remaining)…",
+            )
 
         def _run_grid_study(self) -> None:
             if self._simulation.is_running():
@@ -764,10 +933,28 @@ if HAS_QT:
             self._grid_study_index = 0
             self._grid_study_cds = []
             self._grid_study_active = True
+            self._re_sweep_active = False
             self.results_summary.clear_results()
             self._start_command(
                 self._grid_study_commands[0],
                 label="Grid study: running level 1/3…",
+            )
+
+        def _run_re_sweep(self) -> None:
+            if self._simulation.is_running():
+                return
+            self._update_state_from_form()
+            self._re_sweep_commands, self._re_sweep_res = build_re_sweep_commands(self.config)
+            self._re_sweep_index = 0
+            self._re_sweep_points = []
+            self._re_sweep_active = True
+            self._grid_study_active = False
+            self.results_summary.clear_results()
+            self.re_sweep_chart.plot_re_sweep([], [])
+            total = len(self._re_sweep_commands)
+            self._start_command(
+                self._re_sweep_commands[0],
+                label=f"Re sweep: run 1/{total}…",
             )
 
         def _on_sim_output(self, line: str) -> None:
@@ -810,6 +997,26 @@ if HAS_QT:
             except (TypeError, ValueError):
                 cd_val = None
 
+            if self._re_sweep_active and returncode == 0 and cd_val is not None:
+                re_val = self._re_sweep_res[self._re_sweep_index]
+                self._re_sweep_points.append((re_val, cd_val))
+                self._re_sweep_index += 1
+                if self._re_sweep_index < len(self._re_sweep_commands):
+                    level = self._re_sweep_index + 1
+                    total = len(self._re_sweep_commands)
+                    self._start_command(
+                        self._re_sweep_commands[self._re_sweep_index],
+                        label=f"Re sweep: run {level}/{total}…",
+                    )
+                    return
+                self._re_sweep_active = False
+                if self._re_sweep_points:
+                    re_vals, cd_vals = zip(*self._re_sweep_points)
+                    self.re_sweep_chart.plot_re_sweep(re_vals, cd_vals)
+                self.summary_label.setText("Re sweep complete")
+            elif self._re_sweep_active:
+                self._re_sweep_active = False
+
             if self._grid_study_active and returncode == 0 and cd_val is not None:
                 self._grid_study_cds.append(cd_val)
                 self._grid_study_index += 1
@@ -828,15 +1035,18 @@ if HAS_QT:
                     self._rebuild_form(refresh=False)
                 self._update_validation_panel(cd=cd_val, grid_cd_values=self._grid_study_cds)
                 self.summary_label.setText("Grid study complete")
-            else:
+            elif not self._re_sweep_active:
                 self._grid_study_active = False
                 self._update_validation_panel(
                     cd=cd_val,
                     grid_cd_values=self._grid_study_cds if self._grid_study_cds else None,
                 )
-                self.summary_label.setText(
-                    "Run complete" if returncode == 0 else f"Run failed ({returncode})"
-                )
+                if not self._grid_study_active:
+                    self.summary_label.setText(
+                        "Run complete" if returncode == 0 else f"Run failed ({returncode})"
+                    )
+            else:
+                self._grid_study_active = False
 
             self.results_summary.set_results(
                 mode=self.config.mode,
@@ -846,10 +1056,11 @@ if HAS_QT:
                 metrics=self._run_metrics,
             )
             self.left_tabs.setCurrentIndex(1)
-            if returncode == 0 and not self._grid_study_active:
+            if returncode == 0 and not self._grid_study_active and not self._re_sweep_active:
                 self._adopt_newest_case()
             self._refresh_live_charts()
-            if returncode == 0 and self.config.mode == "3d" and not self._grid_study_active:
+            self._refresh_checkpoint_status()
+            if returncode == 0 and self.config.mode == "3d" and not self._grid_study_active and not self._re_sweep_active:
                 QtCore.QTimer.singleShot(200, self._begin_3d_after_run)
             elif returncode == 0 and self.config.mode != "3d":
                 self.viewport.clear_scene("Run a 3D case to load the interactive wind tunnel.")

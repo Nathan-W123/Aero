@@ -30,7 +30,7 @@ import pathlib
 import time
 from typing import Callable, Optional
 
-from .d2q9 import Q, E, W, compute_macroscopic, compute_feq
+from .d2q9 import Q, E, W, OPP, compute_macroscopic, compute_feq
 from . import kernels as _kernels
 from .kernels_mrt import MRTKernel2D
 from .boundary import (
@@ -44,8 +44,24 @@ from .boundary import (
     apply_bounce_back,
     build_surface_links,
 )
-from ..forces import compute_forces, forces_to_coefficients
+from ..forces import (
+    compute_forces,
+    compute_force_split_2d,
+    forces_to_coefficients,
+    split_to_coefficients,
+)
 from ..diagnostics import check_stability, check_convergence
+from .sponge import build_sponge_sigma, apply_sponge_relaxation_2d
+from .les import (
+    strain_rate_magnitude_2d,
+    smagorinsky_nu_sgs,
+    omega_from_nu,
+    build_omega_field_2d,
+)
+from .physics import base_nu_from_omega
+from .trt2d import trt_taus
+from . import kernels_trt as _ktrt
+from .ibm_guo import apply_guo_forcing_2d
 
 
 class Solver:
@@ -66,6 +82,13 @@ class Solver:
         backend: str = "auto",
         collision: str = "bgk",
         inlet_perturbation: float = 0.0,
+        trt_lambda: float = 0.25,
+        sponge_thickness: int = 0,
+        sponge_strength: float = 0.1,
+        les: bool = False,
+        les_cs: float = 0.16,
+        ibm_enabled: bool = False,
+        phi: Optional[np.ndarray] = None,
     ):
         """
         Parameters
@@ -83,8 +106,15 @@ class Solver:
         rho_in    : float   — inlet density (only for inlet_bc="pressure")
         rho_out   : float   — outlet density (only for outlet_bc="pressure")
         backend   : "auto" | "numpy" | "numba" — compute backend
-        collision : "bgk" | "mrt" — collision operator
+        collision : "bgk" | "mrt" | "trt" — collision operator
         inlet_perturbation : float — sinusoidal uy fraction of u0 at inlet (2D shedding)
+        trt_lambda : float — TRT magic parameter (default 0.25)
+        sponge_thickness : int — outlet sponge cells (0=off)
+        sponge_strength : float — max sponge relaxation rate
+        les : bool — enable Smagorinsky LES
+        les_cs : float — Smagorinsky constant
+        ibm_enabled : bool — Guo IBM forcing
+        phi : optional signed-distance field for IBM
         """
         self.Ny = Ny
         self.Nx = Nx
@@ -100,9 +130,20 @@ class Solver:
         self.rho_in = rho_in
         self.rho_out = rho_out
         self.inlet_perturbation = max(float(inlet_perturbation), 0.0)
-        if collision not in ("bgk", "mrt"):
-            raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk' or 'mrt'.")
+        self.trt_lambda = float(trt_lambda)
+        self.sponge_thickness = int(sponge_thickness)
+        self.sponge_strength = float(sponge_strength)
+        self.les = bool(les)
+        self.les_cs = float(les_cs)
+        self.ibm_enabled = bool(ibm_enabled)
+        self.phi = phi
+        self.tau = 1.0 / omega
+        self._base_nu = base_nu_from_omega(omega)
+        if collision not in ("bgk", "mrt", "trt"):
+            raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk', 'mrt', or 'trt'.")
         self.collision = collision
+        _, self._s_minus_trt = trt_taus(omega, self.trt_lambda)
+        self._s_minus_trt = 1.0 / self._s_minus_trt
 
         # --- Backend selection ---
         if backend == "auto":
@@ -142,6 +183,11 @@ class Solver:
         if self.collision == "mrt":
             self._mrt_kernel = MRTKernel2D(omega, use_numba=self._use_numba)
 
+        self._sponge_sigma = build_sponge_sigma(self.Nx, self.sponge_thickness, self.sponge_strength)
+        self._u_wall_x = np.zeros((Ny, Nx))
+        self._u_wall_y = np.zeros((Ny, Nx))
+        self._omega_dummy = np.zeros((Ny, Nx), dtype=np.float64)
+
         # Step counter — incremented by run(); preserved across checkpoint loads
         self.step_count: int = 0
 
@@ -151,6 +197,8 @@ class Solver:
         self.uy:  Optional[np.ndarray] = None
         self.Cd_history: list = []
         self.Cl_history: list = []
+        self.Cd_p_history: list = []
+        self.Cd_v_history: list = []
 
     # ------------------------------------------------------------------
     # Private: single timestep
@@ -160,9 +208,50 @@ class Solver:
         """Execute one LBM timestep. Returns instantaneous (Cd, Cl)."""
         f = self.f
 
+        if self.ibm_enabled and self.phi is not None:
+            apply_guo_forcing_2d(
+                f, self.phi, self.tau,
+                self._u_wall_x, self._u_wall_y,
+                self._ex, self._ey, self._w, self.solid,
+            )
+
+        omega_field = self._omega_dummy
+        use_omega_field = False
+        if self.les:
+            omega_field = build_omega_field_2d(
+                f, self.solid, self.fluid, self._base_nu, self.omega, self.les_cs,
+            )
+            use_omega_field = True
+        omega_use = self.omega
+
         if self.collision == "mrt":
             f_post = np.empty_like(f)
             self._mrt_kernel.collide(f, f_post, self.solid, self._ex, self._ey, self._w)
+            f_pre = f_post.copy()
+            if self._use_numba:
+                f_new = np.empty_like(f_post)
+                _kernels.stream_kernel(f_post, f_new, self._ex, self._ey)
+                f_post = f_new
+            else:
+                for i in range(Q):
+                    f_post[i] = np.roll(f_post[i], shift=int(E[i, 1]), axis=0)
+                    f_post[i] = np.roll(f_post[i], shift=int(E[i, 0]), axis=1)
+
+        elif self.collision == "trt":
+            f_post = np.empty_like(f)
+            if self._use_numba and _ktrt._HAS_NUMBA:
+                _ktrt.trt_collision_kernel(
+                    f, f_post, self.solid, omega_use,
+                    self._ex, self._ey, self._w,
+                    OPP.astype(np.int32), self.trt_lambda,
+                    omega_field, use_omega_field,
+                )
+            else:
+                _ktrt.trt_collision_numpy(
+                    f, f_post, self.solid, omega_use,
+                    self._ex, self._ey, self._w, self.trt_lambda,
+                    omega_field if use_omega_field else None,
+                )
             f_pre = f_post.copy()
             if self._use_numba:
                 f_new = np.empty_like(f_post)
@@ -179,8 +268,9 @@ class Solver:
             # 1+2. Fused macroscopic + BGK collision
             f_post = np.empty_like(f)
             _kernels.collision_kernel(
-                f, f_post, self.solid, self.omega,
+                f, f_post, self.solid, omega_use,
                 self._ex, self._ey, self._w,
+                omega_field, use_omega_field,
             )
 
             # 3. Pre-streaming snapshot for mid-link bounce-back
@@ -203,7 +293,8 @@ class Solver:
             ux_c[self.solid] = 0.0
             uy_c[self.solid] = 0.0
             feq    = compute_feq(rho, ux_c, uy_c)
-            f_post = (1.0 - self.omega) * f + self.omega * feq
+            om = omega_field if use_omega_field else omega_use
+            f_post = (1.0 - om) * f + om * feq
 
             # 3. Pre-streaming snapshot for mid-link bounce-back
             f_pre = f_post.copy()
@@ -214,7 +305,8 @@ class Solver:
                 f_post[i] = np.roll(f_post[i], shift=int(E[i, 0]), axis=1)
 
         # 5. Boundary conditions — order matters (same for both backends)
-        apply_bounce_back(f_post, f_pre, self.surface_links)
+        if not self.ibm_enabled:
+            apply_bounce_back(f_post, f_pre, self.surface_links)
 
         if self.inlet_bc == "velocity":
             apply_inlet_zou_he(
@@ -233,6 +325,12 @@ class Solver:
         elif self.outlet_bc == "zerogradient":
             apply_outlet_zero_gradient(f_post)
 
+        if self.sponge_thickness > 0:
+            apply_sponge_relaxation_2d(
+                f_post, self._sponge_sigma, self.u0,
+                self._ex, self._ey, self._w,
+            )
+
         if self.wall_bc == "slip":
             apply_slip_walls(f_post)
         elif self.wall_bc == "noslip":
@@ -244,6 +342,10 @@ class Solver:
         # 6. Forces
         Fx_lbm, Fy_lbm = compute_forces(f_pre, f_post, self.surface_links, self.rho0, self.u0)
         Cd, Cl = forces_to_coefficients(Fx_lbm, Fy_lbm, self.rho0, self.u0, self.D)
+        fx_p, fy_p, fx_v, fy_v = compute_force_split_2d(f_pre, f_post, self.surface_links)
+        cdp, _, cdv, _ = split_to_coefficients(fx_p, fy_p, fx_v, fy_v, self.rho0, self.u0, self.D)
+        self._last_cd_p = cdp
+        self._last_cd_v = cdv
         return Cd, Cl
 
     # ------------------------------------------------------------------
@@ -288,6 +390,8 @@ class Solver:
             Cd, Cl = self._step()
             self.Cd_history.append(Cd)
             self.Cl_history.append(Cl)
+            self.Cd_p_history.append(getattr(self, "_last_cd_p", 0.0))
+            self.Cd_v_history.append(getattr(self, "_last_cd_v", 0.0))
 
             if checkpoint_every and checkpoint_dir and step % checkpoint_every == 0:
                 ckpt_path = pathlib.Path(checkpoint_dir) / f"checkpoint_{self.step_count:08d}.npz"
@@ -319,14 +423,20 @@ class Solver:
 
         Cd_arr = np.array(self.Cd_history[-avg_window:])
         Cl_arr = np.array(self.Cl_history[-avg_window:])
+        Cdp_arr = np.array(self.Cd_p_history[-avg_window:])
+        Cdv_arr = np.array(self.Cd_v_history[-avg_window:])
 
         return {
             "Cd_mean":    float(np.mean(Cd_arr)),
             "Cl_mean":    float(np.mean(Cl_arr)),
             "Cd_std":     float(np.std(Cd_arr)),
             "Cl_std":     float(np.std(Cl_arr)),
+            "Cd_p_mean":  float(np.mean(Cdp_arr)),
+            "Cd_v_mean":  float(np.mean(Cdv_arr)),
             "Cd_history": self.Cd_history,
             "Cl_history": self.Cl_history,
+            "Cd_p_history": self.Cd_p_history,
+            "Cd_v_history": self.Cd_v_history,
             "rho": rho,
             "ux":  ux,
             "uy":  uy,

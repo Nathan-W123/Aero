@@ -45,6 +45,74 @@ class TestGuiStateCommands:
         assert "--viz3d" in cmd
         assert "--export-vtk" in cmd
         assert "--check-every" in cmd
+        assert "--checkpoint-every" in cmd
+
+    def test_build_command_mesh_includes_stl(self):
+        config = GuiConfig(mode="3d")
+        config.shape_3d = "mesh"
+        config.params_3d["stl_path"] = "/tmp/wing.stl"
+        cmd = build_command(config)
+        assert "--shape" in cmd
+        assert cmd[cmd.index("--shape") + 1] == "mesh"
+        assert cmd[cmd.index("--stl-path") + 1] == "/tmp/wing.stl"
+
+    def test_build_command_resume(self, tmp_path):
+        ckpt = tmp_path / "checkpoint_00001000.npz"
+        import numpy as np
+
+        np.savez_compressed(
+            ckpt,
+            f=np.zeros((9, 4, 8)),
+            f_outlet_prev=np.zeros((9, 4)),
+            Cd_history=np.array([1.0]),
+            Cl_history=np.array([0.0]),
+            step_count=np.array(1000, dtype=np.int64),
+        )
+        config = GuiConfig(mode="2d")
+        cmd = build_command(config, resume_from=str(ckpt), steps_override=4000)
+        assert cmd[cmd.index("--resume-from") + 1] == str(ckpt)
+        assert cmd[cmd.index("--steps") + 1] == "4000"
+
+    def test_build_re_sweep_commands(self):
+        from aero.gui.state import build_re_sweep_commands, build_command
+
+        config = GuiConfig(mode="3d")
+        config.re_sweep_values = "20,100"
+        commands, re_vals = build_re_sweep_commands(config)
+        assert re_vals == [20.0, 100.0]
+        assert len(commands) == 2
+        assert isinstance(commands[0], list)
+        assert commands[0][2:4] == ["--shape", "sphere"]
+        assert build_command(config)[build_command(config).index("--re") + 1] in {"20", "20.0"}
+        assert "--checkpoint-every" not in commands[0]
+
+    def test_checkpoint_helpers(self, tmp_path):
+        from aero.gui.state import (
+            default_checkpoint_every,
+            find_latest_checkpoint,
+            read_checkpoint_step,
+            remaining_steps_for_resume,
+        )
+        import numpy as np
+
+        assert default_checkpoint_every(5000) >= 500
+        ckpt_dir = tmp_path / "run"
+        ckpt_dir.mkdir()
+        older = ckpt_dir / "checkpoint_00000500.npz"
+        newer = ckpt_dir / "checkpoint_00001000.npz"
+        for path, step in ((older, 500), (newer, 1000)):
+            np.savez_compressed(
+                path,
+                f=np.zeros((9, 4, 8)),
+                f_outlet_prev=np.zeros((9, 4)),
+                Cd_history=np.array([1.0]),
+                Cl_history=np.array([0.0]),
+                step_count=np.array(step, dtype=np.int64),
+            )
+        latest = find_latest_checkpoint(ckpt_dir, "2d")
+        assert latest == newer
+        assert read_checkpoint_step(newer) == 1000
+        assert remaining_steps_for_resume(newer, 5000) == 4000
 
     def test_progress_check_every_scales_with_run_length(self):
         from aero.gui.state import progress_check_every

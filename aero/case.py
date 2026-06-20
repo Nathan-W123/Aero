@@ -81,6 +81,9 @@ class SimulationCase:
             "elapsed_seconds": round(elapsed_seconds, 2),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         }
+        if "Cd_p_mean" in result:
+            self.results["Cd_p_mean"] = result["Cd_p_mean"]
+            self.results["Cd_v_mean"] = result["Cd_v_mean"]
         if mode == "3d":
             self.results["Cly_mean"] = result.get("Cly_mean")
             self.results["Cly_std"] = result.get("Cly_std")
@@ -169,6 +172,8 @@ class SimulationCase:
             "image_path": getattr(args, "image_path", None),
             "image_threshold": getattr(args, "image_threshold", None),
             "image_invert": getattr(args, "image_invert", None),
+            "stl_path": getattr(args, "stl_path", None),
+            "stl_fit": getattr(args, "stl_fit", None),
             # flow
             "re":       args.re,
             "u0":       args.u0,
@@ -184,6 +189,14 @@ class SimulationCase:
             "rho_out":  getattr(args, "rho_out", None),
             "backend":  getattr(args, "backend", None),
             "collision": getattr(args, "collision", None),
+            "trt_lambda": getattr(args, "trt_lambda", None),
+            "sponge_cells": getattr(args, "sponge_cells", None),
+            "sponge_strength": getattr(args, "sponge_strength", None),
+            "les": getattr(args, "les", None),
+            "les_cs": getattr(args, "les_cs", None),
+            "inlet_perturbation": getattr(args, "inlet_perturbation", None),
+            "mesh_bc": getattr(args, "mesh_bc", None),
+            "mesh_orient": getattr(args, "mesh_orient", None),
             # derived LBM params (informational)
             "D":        derived["D"],
             "nu_lbm":   derived["nu_lbm"],
@@ -215,6 +228,11 @@ class SimulationCase:
             "outlet_bc": params.get("outlet_bc"),
             "backend": params.get("backend"),
             "collision": params.get("collision"),
+            "trt_lambda": float(params.get("trt_lambda", "0.25") or "0.25"),
+            "sponge_cells": int(params.get("sponge_cells", "0") or "0"),
+            "sponge_strength": float(params.get("sponge_strength", "0.1") or "0.1"),
+            "les": params.get("les", "0") in ("1", "true", "True"),
+            "les_cs": float(params.get("les_cs", "0.16") or "0.16"),
         }
         if mode == "2d":
             case_config["inlet_bc"] = params.get("inlet_bc")
@@ -222,6 +240,12 @@ class SimulationCase:
         else:
             case_config["nz"] = int(params["nz"])
             case_config["viz3d"] = params.get("viz3d")
+            case_config["inlet_perturbation"] = float(params.get("inlet_perturbation", "0") or "0")
+            if shape == "mesh":
+                case_config["stl_path"] = params.get("stl_path")
+                case_config["stl_fit"] = float(params.get("stl_fit", "0.35") or "0.35")
+                case_config["mesh_bc"] = params.get("mesh_bc", "voxel")
+                case_config["mesh_orient"] = params.get("mesh_orient", "auto")
 
         for key in ("radius", "width", "height", "depth", "length"):
             if key in params and params[key] != "":

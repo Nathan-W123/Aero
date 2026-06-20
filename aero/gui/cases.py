@@ -119,6 +119,15 @@ def apply_case_config(gui: GuiConfig, case_config: Dict[str, Any]) -> None:
         "outlet_bc": "outlet_bc",
         "viz3d": "viz3d",
         "inlet_perturbation": "inlet_perturbation",
+        "trt_lambda": "trt_lambda",
+        "sponge_cells": "sponge_cells",
+        "sponge_strength": "sponge_strength",
+        "les": "les",
+        "les_cs": "les_cs",
+        "mesh_bc": "mesh_bc",
+        "mesh_orient": "mesh_orient",
+        "stl_path": "stl_path",
+        "stl_fit": "stl_fit",
     }
     for src, dst in field_map.items():
         if src not in case_config or case_config[src] is None:
@@ -149,6 +158,8 @@ def load_case_results(case_dir: Path) -> Dict[str, str]:
     metrics: Dict[str, str] = {
         "cd_mean": f"{data.get('Cd_mean', '—')}",
         "cd_std": f"{data.get('Cd_std', '')}",
+        "cd_p_mean": f"{data.get('Cd_p_mean', '—')}",
+        "cd_v_mean": f"{data.get('Cd_v_mean', '—')}",
         "elapsed": f"{data.get('elapsed_seconds', '—')}",
     }
     if mode == "3d":

@@ -1,18 +1,15 @@
 """
 Aerodynamic force computation via the momentum exchange method.
 
-For each obstacle surface link (i, y, x) — a fluid cell whose direction-i
-neighbour is solid — the force contribution is:
-
-  delta_F += e[i] * (f_pre[i, y, x] + f_post[opp[i], y, x])
-
-Summed over all surface links, this gives the total lattice-unit force on
-the obstacle.  Normalised by the dynamic pressure head gives Cd and Cl.
+Pressure/viscous decomposition splits each link's momentum exchange into
+equilibrium (pressure) and non-equilibrium (viscous) parts using local
+Chapman–Enskog moments — equivalent to integrating stress at the surface
+and guaranteed to sum to the total momentum-exchange force.
 """
 
 import numpy as np
 from typing import Tuple
-from .lbm.d2q9 import E, OPP
+from .lbm.d2q9 import E, OPP, compute_feq, compute_macroscopic
 
 
 def compute_forces(
@@ -22,23 +19,7 @@ def compute_forces(
     rho0: float,
     u0: float,
 ) -> Tuple[float, float]:
-    """
-    Compute instantaneous drag and lift coefficients.
-
-    Parameters
-    ----------
-    f_pre   : ndarray (9, Ny, Nx) — post-collision / pre-streaming distributions
-    f_post  : ndarray (9, Ny, Nx) — post-streaming / post-BC distributions
-    links   : ndarray int32 (N, 3) — surface links [i, y, x]
-    rho0    : float — reference density (lattice units)
-    u0      : float — inlet velocity (lattice units)
-
-    Returns
-    -------
-    Cd, Cl : float — drag and lift coefficients
-             Cd > 0 means force in +x (downstream) direction
-             Cl > 0 means force in +y direction
-    """
+    """Compute raw lattice-unit drag and lift via momentum exchange."""
     if links.shape[0] == 0:
         return 0.0, 0.0
 
@@ -47,24 +28,51 @@ def compute_forces(
     x_arr   = links[:, 2]
     opp_arr = OPP[i_arr]
 
-    # Momentum exchange
-    f_out = f_pre[i_arr,   y_arr, x_arr]   # leaving fluid toward solid
-    f_in  = f_post[opp_arr, y_arr, x_arr]  # returning after bounce-back
+    f_out = f_pre[i_arr,   y_arr, x_arr]
+    f_in  = f_post[opp_arr, y_arr, x_arr]
 
     ex = E[i_arr, 0].astype(np.float64)
     ey = E[i_arr, 1].astype(np.float64)
 
     Fx_lbm = float(np.sum(ex * (f_out + f_in)))
     Fy_lbm = float(np.sum(ey * (f_out + f_in)))
-
-    # Dynamic pressure reference (per unit depth, D is baked into link count
-    # but we need the user to supply D separately for normalisation).
-    # Here we return raw lattice forces; cli.py normalises using D.
-    # To keep this function self-contained we return a sentinel tuple that
-    # cli/solver normalises.  However, for solver.py's internal history we
-    # also need D.  We therefore accept D as an optional parameter via the
-    # module-level helper below and keep this function returning raw forces.
     return Fx_lbm, Fy_lbm
+
+
+def compute_force_split_2d(
+    f_pre: np.ndarray,
+    f_post: np.ndarray,
+    links: np.ndarray,
+) -> Tuple[float, float, float, float]:
+    """
+    Pressure and viscous force components on the obstacle (lattice units).
+
+    At each surface link the momentum exchange is split into equilibrium
+    (pressure) and non-equilibrium (viscous) contributions.
+    """
+    if links.shape[0] == 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    fx_p = fy_p = fx_v = fy_v = 0.0
+    for i, y, x in links:
+        opp = int(OPP[i])
+        ex = float(E[i, 0])
+        ey = float(E[i, 1])
+        f_out = float(f_pre[i, y, x])
+        f_in = float(f_post[opp, y, x])
+
+        rho, ux, uy = compute_macroscopic(f_pre[:, y : y + 1, x : x + 1])
+        feq = compute_feq(rho, ux, uy)
+        feq_out = float(feq[i, 0, 0])
+        feq_in = float(feq[opp, 0, 0])
+
+        mom_p = feq_out + feq_in
+        mom_v = (f_out - feq_out) + (f_in - feq_in)
+        fx_p += ex * mom_p
+        fy_p += ey * mom_p
+        fx_v += ex * mom_v
+        fy_v += ey * mom_v
+    return fx_p, fy_p, fx_v, fy_v
 
 
 def forces_to_coefficients(
@@ -74,13 +82,22 @@ def forces_to_coefficients(
     u0: float,
     D: float,
 ) -> Tuple[float, float]:
-    """
-    Convert raw lattice forces to dimensionless drag/lift coefficients.
-
-    Cd = Fx / (0.5 * rho0 * u0^2 * D)
-    Cl = Fy / (0.5 * rho0 * u0^2 * D)
-    """
     F_dyn = 0.5 * rho0 * u0 * u0 * D
     if F_dyn == 0.0:
         return 0.0, 0.0
     return Fx_lbm / F_dyn, Fy_lbm / F_dyn
+
+
+def split_to_coefficients(
+    fx_p: float,
+    fy_p: float,
+    fx_v: float,
+    fy_v: float,
+    rho0: float,
+    u0: float,
+    D: float,
+) -> Tuple[float, float, float, float]:
+    F_dyn = 0.5 * rho0 * u0 * u0 * D
+    if F_dyn == 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+    return fx_p / F_dyn, fy_p / F_dyn, fx_v / F_dyn, fy_v / F_dyn

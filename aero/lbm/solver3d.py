@@ -41,8 +41,19 @@ from .boundary3d import (
     build_surface_links_3d,
     apply_bounce_back_3d,
 )
-from ..forces3d import compute_forces_3d, forces_to_coefficients_3d
+from ..forces3d import (
+    compute_forces_3d,
+    compute_force_split_3d,
+    forces_to_coefficients_3d,
+    split_to_coefficients_3d,
+)
 from ..diagnostics import check_stability  # reuse scalar stability check
+from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
+from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
+from .physics import base_nu_from_omega
+from .trt2d import trt_taus
+from . import kernels3d_trt as _ktrt3
+from .ibm_guo import apply_guo_forcing_3d
 
 
 class Solver3D:
@@ -61,6 +72,14 @@ class Solver3D:
         outlet_bc: str = "convective",
         backend: str = "auto",
         collision: str = "bgk",
+        inlet_perturbation: float = 0.0,
+        trt_lambda: float = 0.25,
+        sponge_thickness: int = 0,
+        sponge_strength: float = 0.1,
+        les: bool = False,
+        les_cs: float = 0.16,
+        ibm_enabled: bool = False,
+        phi: Optional[np.ndarray] = None,
     ):
         """
         Parameters
@@ -75,11 +94,14 @@ class Solver3D:
         inlet_bc    : "velocity"  (only option in Phase 4)
         outlet_bc   : "convective" | "zerogradient"
         backend     : "auto" | "numpy" | "numba"
-        collision   : "bgk" | "mrt"
+        collision   : "bgk" | "mrt" | "trt"
+        inlet_perturbation : spanwise uz fraction of u0 at inlet
         """
         self.Nz = Nz
         self.Ny = Ny
         self.Nx = Nx
+        self.solid = np.ascontiguousarray(solid, dtype=np.bool_)
+        self.fluid = ~self.solid
         self.omega = omega
         self.u0 = u0
         self.D = D
@@ -87,9 +109,21 @@ class Solver3D:
         self.wall_bc = wall_bc
         self.inlet_bc = inlet_bc
         self.outlet_bc = outlet_bc
-        if collision not in ("bgk", "mrt"):
-            raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk' or 'mrt'.")
+        self.inlet_perturbation = max(float(inlet_perturbation), 0.0)
+        self.trt_lambda = float(trt_lambda)
+        self.sponge_thickness = int(sponge_thickness)
+        self.sponge_strength = float(sponge_strength)
+        self.les = bool(les)
+        self.les_cs = float(les_cs)
+        self.ibm_enabled = bool(ibm_enabled)
+        self.phi = phi
+        self.tau = 1.0 / omega
+        self._base_nu = base_nu_from_omega(omega)
+        if collision not in ("bgk", "mrt", "trt"):
+            raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk', 'mrt', or 'trt'.")
         self.collision = collision
+        _, self._s_minus_trt = trt_taus(omega, self.trt_lambda)
+        self._s_minus_trt = 1.0 / self._s_minus_trt
 
         # Backend
         if backend == "auto":
@@ -126,15 +160,39 @@ class Solver3D:
         if self.collision == "mrt":
             self._mrt_kernel = MRTKernel3D(omega, use_numba=self._use_numba)
 
+        self._sponge_sigma = build_sponge_sigma(self.Nx, self.sponge_thickness, self.sponge_strength)
+        self._u_wall_x = np.zeros((Nz, Ny, Nx))
+        self._u_wall_y = np.zeros((Nz, Ny, Nx))
+        self._u_wall_z = np.zeros((Nz, Ny, Nx))
+        self._omega_dummy = np.zeros((Nz, Ny, Nx), dtype=np.float64)
+
         self.step_count: int = 0
         self.Cd_history: List[float] = []
         self.Cly_history: List[float] = []
         self.Clz_history: List[float] = []
+        self.Cd_p_history: List[float] = []
+        self.Cd_v_history: List[float] = []
 
     # ------------------------------------------------------------------
 
     def _step(self) -> tuple:
         f = self.f
+
+        if self.ibm_enabled and self.phi is not None:
+            apply_guo_forcing_3d(
+                f, self.phi, self.tau,
+                self._u_wall_x, self._u_wall_y, self._u_wall_z,
+                self._ex, self._ey, self._ez, self._w, self.solid,
+            )
+
+        omega_field = self._omega_dummy
+        use_omega_field = False
+        if self.les:
+            omega_field = build_omega_field_3d(
+                f, self.solid, self.fluid, self._base_nu, self.omega, self.les_cs,
+            )
+            use_omega_field = True
+        omega_use = self.omega
 
         if self.collision == "mrt":
             f_post = np.empty_like(f)
@@ -145,11 +203,32 @@ class Solver3D:
             f_new = np.empty_like(f_post)
             _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
             f_post = f_new
+        elif self.collision == "trt":
+            f_post = np.empty_like(f)
+            if self._use_numba and _ktrt3._HAS_NUMBA:
+                from .d3q19 import OPP3
+                _ktrt3.trt_collision_kernel_3d(
+                    f, f_post, self.solid, omega_use,
+                    self._ex, self._ey, self._ez, self._w,
+                    OPP3.astype(np.int32), self.trt_lambda,
+                    omega_field, use_omega_field,
+                )
+            else:
+                _ktrt3.trt_collision_numpy_3d(
+                    f, f_post, self.solid, omega_use,
+                    self._ex, self._ey, self._ez, self._w, self.trt_lambda,
+                    omega_field if use_omega_field else None,
+                )
+            f_pre = f_post.copy()
+            f_new = np.empty_like(f_post)
+            _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
+            f_post = f_new
         elif self._use_numba:
             f_post = np.empty_like(f)
             _k3.collision_kernel_3d(
-                f, f_post, self.solid, self.omega,
+                f, f_post, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
+                omega_field, use_omega_field,
             )
             f_pre = f_post.copy()
             f_new = np.empty_like(f_post)
@@ -161,22 +240,35 @@ class Solver3D:
             uy[self.solid] = 0.0
             uz[self.solid] = 0.0
             feq    = compute_feq_3d(rho, ux, uy, uz)
-            f_post = (1.0 - self.omega) * f + self.omega * feq
+            om = omega_field if use_omega_field else omega_use
+            f_post = (1.0 - om) * f + om * feq
             f_pre  = f_post.copy()
             f_new  = np.empty_like(f_post)
             _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
             f_post = f_new
 
         # BCs
-        apply_bounce_back_3d(f_post, f_pre, self.surface_links)
+        if not self.ibm_enabled:
+            apply_bounce_back_3d(f_post, f_pre, self.surface_links)
 
         if self.inlet_bc == "velocity":
-            apply_inlet_zou_he_3d(f_post, self.u0)
+            apply_inlet_zou_he_3d(
+                f_post,
+                self.u0,
+                uz_amp=self.inlet_perturbation,
+                step=self.step_count + 1,
+            )
 
         if self.outlet_bc == "convective":
             apply_outlet_convective_3d(f_post, self._f_outlet_prev, self.u0)
         else:
             apply_outlet_zero_gradient_3d(f_post)
+
+        if self.sponge_thickness > 0:
+            apply_sponge_relaxation_3d(
+                f_post, self._sponge_sigma, self.u0,
+                self._ex, self._ey, self._ez, self._w,
+            )
 
         if self.wall_bc == "slip":
             apply_slip_walls_3d(f_post)
@@ -188,6 +280,12 @@ class Solver3D:
 
         Fx, Fy, Fz = compute_forces_3d(f_pre, f_post, self.surface_links)
         Cd, Cly, Clz = forces_to_coefficients_3d(Fx, Fy, Fz, self.rho0, self.u0, self.D)
+        fx_p, fy_p, fz_p, fx_v, fy_v, fz_v = compute_force_split_3d(f_pre, f_post, self.surface_links)
+        cdp, _, _, cdv, _, _ = split_to_coefficients_3d(
+            fx_p, fy_p, fz_p, fx_v, fy_v, fz_v, self.rho0, self.u0, self.D,
+        )
+        self._last_cd_p = cdp
+        self._last_cd_v = cdv
         return Cd, Cly, Clz
 
     # ------------------------------------------------------------------
@@ -221,6 +319,8 @@ class Solver3D:
             self.Cd_history.append(Cd)
             self.Cly_history.append(Cly)
             self.Clz_history.append(Clz)
+            self.Cd_p_history.append(getattr(self, "_last_cd_p", 0.0))
+            self.Cd_v_history.append(getattr(self, "_last_cd_v", 0.0))
 
             if checkpoint_every and checkpoint_dir and step % checkpoint_every == 0:
                 ckpt = pathlib.Path(checkpoint_dir) / f"checkpoint3d_{self.step_count:08d}.npz"
@@ -256,6 +356,8 @@ class Solver3D:
         Cd_arr  = np.array(self.Cd_history[-avg_window:])
         Cly_arr = np.array(self.Cly_history[-avg_window:])
         Clz_arr = np.array(self.Clz_history[-avg_window:])
+        Cdp_arr = np.array(self.Cd_p_history[-avg_window:])
+        Cdv_arr = np.array(self.Cd_v_history[-avg_window:])
 
         return {
             "Cd_mean":    float(np.mean(Cd_arr)),
@@ -264,9 +366,13 @@ class Solver3D:
             "Cd_std":     float(np.std(Cd_arr)),
             "Cly_std":    float(np.std(Cly_arr)),
             "Clz_std":    float(np.std(Clz_arr)),
+            "Cd_p_mean":  float(np.mean(Cdp_arr)),
+            "Cd_v_mean":  float(np.mean(Cdv_arr)),
             "Cd_history":  self.Cd_history,
             "Cly_history": self.Cly_history,
             "Clz_history": self.Clz_history,
+            "Cd_p_history": self.Cd_p_history,
+            "Cd_v_history": self.Cd_v_history,
             "rho": rho, "ux": ux, "uy": uy, "uz": uz,
         }
 

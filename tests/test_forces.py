@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from aero.lbm.d2q9 import compute_feq
-from aero.forces import compute_forces, forces_to_coefficients
+from aero.forces import compute_forces, forces_to_coefficients, compute_force_split_2d, split_to_coefficients
 from aero.lbm.boundary import build_surface_links
 
 
@@ -67,3 +67,19 @@ def test_symmetry_top_bottom(feq_uniform):
     _, Fy = compute_forces(f, f, links, RHO0, U0)
     # Pure equilibrium → no net lift; small floating point residual expected
     assert abs(Fy) < 1e-6
+
+
+def test_force_split_sums_to_momentum_exchange(feq_uniform):
+    """Pressure + viscous split must equal total momentum exchange."""
+    from aero.geometry.cylinder import Cylinder
+    cyl = Cylinder(radius=8, cx_frac=1 / 3, cy_frac=0.5)
+    solid = cyl.mark_solid(Ny, Nx)
+    links = build_surface_links(solid)
+    f = feq_uniform
+    Fx, Fy = compute_forces(f, f, links, RHO0, U0)
+    fx_p, fy_p, fx_v, fy_v = compute_force_split_2d(f, f, links)
+    assert abs((fx_p + fx_v) - Fx) < 1e-12
+    assert abs((fy_p + fy_v) - Fy) < 1e-12
+    cdp, _, cdv, _ = split_to_coefficients(fx_p, fy_p, fx_v, fy_v, RHO0, U0, 16.0)
+    cd, _ = forces_to_coefficients(Fx, Fy, RHO0, U0, 16.0)
+    assert abs(cdp + cdv - cd) < 1e-12
