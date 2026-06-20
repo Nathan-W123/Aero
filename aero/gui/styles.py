@@ -338,6 +338,58 @@ QListWidget#caseList::item:hover {{
     background-color: {_BG_ELEVATED};
     color: {_ACCENT};
 }}
+QFrame#runStatusFrame {{
+    background-color: {_BG_PANEL};
+    border: 1px solid {_BORDER};
+    border-radius: 8px;
+    padding: 4px;
+}}
+QSplitter#centerSplitter::handle {{
+    background-color: {_BORDER};
+    height: 4px;
+}}
+QStatusBar QProgressBar#runProgress {{
+    background-color: {_BG_INPUT};
+    border: 1px solid {_BORDER_FOCUS};
+    border-radius: 6px;
+    min-height: 20px;
+    text-align: center;
+    color: {_TEXT};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QStatusBar QProgressBar#runProgress::chunk {{
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 {_ACCENT_DEEP}, stop:1 {_ACCENT_BRIGHT}
+    );
+    border-radius: 5px;
+}}
+QProgressBar#runProgress {{
+    background-color: {_BG_INPUT};
+    border: 1px solid {_BORDER};
+    border-radius: 6px;
+    min-height: 18px;
+    text-align: center;
+    color: {_TEXT};
+    font-size: 11px;
+}}
+QProgressBar#runProgress::chunk {{
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 {_ACCENT_DEEP}, stop:1 {_ACCENT_BRIGHT}
+    );
+    border-radius: 5px;
+}}
+QPlainTextEdit#liveRunLog {{
+    background-color: {_BG_INPUT};
+    border: 1px solid {_BORDER};
+    border-radius: 6px;
+    color: {_TEXT_MUTED};
+    font-family: Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    padding: 6px;
+}}
 QLabel {{
     color: {_TEXT};
 }}

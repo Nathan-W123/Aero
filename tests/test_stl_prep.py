@@ -46,6 +46,19 @@ def test_frontal_blockage_from_sphere_voxel():
     assert blk >= by and blk >= bz
 
 
+def test_manual_rotation_about_z_swaps_xy_extent():
+    from aero.geometry3d.stl_prep import apply_mesh_rotation
+
+    tris = _axis_aligned_box(10.0, 30.0, 4.0)
+    verts = tris.reshape(-1, 3)
+    centred = (verts - verts.mean(axis=0)).reshape(-1, 3, 3)
+    rotated = apply_mesh_rotation(centred, 0.0, 0.0, 90.0)
+    ext0 = centred.reshape(-1, 3).max(axis=0) - centred.reshape(-1, 3).min(axis=0)
+    ext90 = rotated.reshape(-1, 3).max(axis=0) - rotated.reshape(-1, 3).min(axis=0)
+    assert abs(ext90[0] - ext0[1]) < 0.5
+    assert abs(ext90[1] - ext0[0]) < 0.5
+
+
 def test_mesh_mask_orient_auto(tmp_path):
     stl = tmp_path / "box.stl"
     tris = _axis_aligned_box(10.0, 30.0, 4.0)

@@ -54,6 +54,9 @@ def build_image_data(result: dict, solid3d: np.ndarray):
     grid.cell_data["uy"] = uy.ravel(order="C")
     grid.cell_data["uz"] = uz.ravel(order="C")
     grid.cell_data["umag"] = umag.ravel(order="C")
+    if result.get("scalar") is not None:
+        scalar = np.asarray(result["scalar"], dtype=np.float64)
+        grid.cell_data["scalar"] = scalar.ravel(order="C")
     grid.cell_data["solid"] = solid3d.astype(np.uint8).ravel(order="C")
     return grid
 
@@ -231,6 +234,30 @@ def build_tunnel_and_solid(grid):
     if not HAS_PYVISTA:
         raise ImportError("PyVista is not installed.")
     return build_tunnel_wireframe(grid, divisions=4), extract_solid_surface(grid)
+
+
+def build_preview_grid(solid3d: np.ndarray, *, u0: float = 0.05):
+    """
+    Minimal ImageData for geometry-only GUI preview before a run completes.
+
+    Velocity fields are placeholders; only solid geometry is visualized.
+    """
+    if not HAS_PYVISTA:
+        raise ImportError("PyVista is not installed.")
+
+    solid3d = np.ascontiguousarray(solid3d, dtype=bool)
+    Nz, Ny, Nx = solid3d.shape
+    grid = pv.ImageData(dimensions=(Nx + 1, Ny + 1, Nz + 1))
+    grid.origin = (0.0, 0.0, 0.0)
+    grid.spacing = (1.0, 1.0, 1.0)
+
+    n_cells = Nz * Ny * Nx
+    grid.cell_data["solid"] = solid3d.astype(np.uint8).ravel(order="C")
+    grid.cell_data["ux"] = np.full(n_cells, float(u0), dtype=np.float64)
+    grid.cell_data["uy"] = np.zeros(n_cells, dtype=np.float64)
+    grid.cell_data["uz"] = np.zeros(n_cells, dtype=np.float64)
+    grid.cell_data["umag"] = np.full(n_cells, float(u0), dtype=np.float64)
+    return grid
 
 
 def build_velocity_glyphs_for_grid(
@@ -530,6 +557,22 @@ def save_slices(
         ax.grid(alpha=0.3)
         fig.tight_layout()
         path = out / f"{prefix}_cd_history.png"
+        fig.savefig(path, dpi=120)
+        written.append(path)
+        plt.close(fig)
+
+    scalar = result.get("scalar")
+    if scalar is not None:
+        scalar_mid = _midplane(np.asarray(scalar, dtype=np.float64)).copy()
+        scalar_mid[solid] = np.nan
+        fig, ax = plt.subplots(figsize=(10, 5))
+        im = ax.imshow(scalar_mid, origin="lower", cmap="plasma")
+        plt.colorbar(im, ax=ax, label="Scalar")
+        ax.set_title(f"3D {shape_name} midplane scalar  Re={Re:.0f}")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        fig.tight_layout()
+        path = out / f"{prefix}_slice_scalar.png"
         fig.savefig(path, dpi=120)
         written.append(path)
         plt.close(fig)

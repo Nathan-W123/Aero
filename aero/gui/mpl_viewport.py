@@ -105,6 +105,8 @@ if HAS_QT:
             self._advect_dt = 6.0
             self._default_view = {"elev": 22.0, "azim": -58.0}
             self._load_pending = False
+            self._preview_mode = False
+            self._view_bounds: Optional[tuple] = None
 
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -193,6 +195,7 @@ if HAS_QT:
                 self.load_succeeded.emit()
                 return
 
+            self._preview_mode = False
             self._load_pending = True
             self._flow_timer.stop()
             self.status_label.setText(f"Loading {path.name}...")
@@ -230,6 +233,42 @@ if HAS_QT:
             finally:
                 self._load_pending = False
 
+        def load_geometry_preview(self, solid: np.ndarray, *, label: str = "") -> None:
+            """Show tunnel + obstacle immediately; flow arrows load after the run."""
+            if self._load_pending:
+                return
+            self._load_pending = True
+            self._flow_timer.stop()
+            self._particle_points = None
+            self._remove_quiver()
+            self._loaded_volume_path = None
+            self._preview_mode = True
+            self.status_label.setText("Updating geometry preview…")
+            QtCore.QTimer.singleShot(0, lambda: self._draw_geometry_preview(solid, label))
+
+        def _draw_geometry_preview(self, solid: np.ndarray, label: str) -> None:
+            try:
+                viz = _visualization3d()
+                grid = viz.build_preview_grid(solid)
+                tunnel, solid_mesh = viz.build_tunnel_and_solid(grid)
+                self._grid = grid
+                self._draw_scene(tunnel, solid_mesh)
+                self.play_button.setEnabled(False)
+                self.play_button.setText("Flow after run")
+                self.reset_button.setEnabled(True)
+                cells = int(np.asarray(solid, dtype=bool).sum())
+                default = (
+                    f"Geometry preview ({cells:,} solid cells) — "
+                    "flow arrows load when the run completes"
+                )
+                self.status_label.setText(label or default)
+                _log(f"geometry preview ready ({cells} solid cells, no flow)")
+            except Exception as exc:
+                _log(f"geometry preview failed: {exc}")
+                self._fail_load(str(exc))
+            finally:
+                self._load_pending = False
+
         def _configure_speed_colormap(self, grid) -> None:
             viz = _visualization3d()
             vmin, vmax = viz.fluid_speed_range(grid)
@@ -256,6 +295,7 @@ if HAS_QT:
             _plot_solid_mesh(self.ax, solid, color="#5ec8e8", alpha=0.88)
             x0, x1, y0, y1, z0, z1 = self._grid.bounds  # type: ignore[union-attr]
             pad = 0.05 * max(x1 - x0, y1 - y0, z1 - z0, 1.0)
+            self._view_bounds = (x0 - pad, x1 + pad, y0 - pad, y1 + pad, z0 - pad, z1 + pad)
             self.ax.set_xlim(x0 - pad, x1 + pad)
             self.ax.set_ylim(y0 - pad, y1 + pad)
             self.ax.set_zlim(z0 - pad, z1 + pad)
@@ -265,7 +305,7 @@ if HAS_QT:
             self.canvas.draw()
 
         def _spawn_inlet_arrows(self) -> None:
-            if self._grid is None:
+            if self._preview_mode or self._grid is None:
                 return
             viz = _visualization3d()
             self._particle_points = viz.seed_inlet_streamlets(
@@ -318,7 +358,7 @@ if HAS_QT:
             self.canvas.draw()
 
         def _advance_flow(self) -> None:
-            if self._grid is None or self._particle_points is None:
+            if self._preview_mode or self._grid is None or self._particle_points is None:
                 return
             viz = _visualization3d()
             self._particle_points, _, _ = viz.advect_particles(
@@ -346,6 +386,8 @@ if HAS_QT:
             self._grid = None
             self._loaded_volume_path = None
             self._particle_points = None
+            self._preview_mode = False
+            self._view_bounds = None
             self._remove_quiver()
             self.status_label.setText(message)
             self.reset_button.setEnabled(False)
@@ -359,8 +401,12 @@ if HAS_QT:
                 self.play_button.setText("Play Flow")
 
         def _reset_camera(self) -> None:
-            if self._grid is None:
+            if self._view_bounds is None:
                 return
+            x0, x1, y0, y1, z0, z1 = self._view_bounds
+            self.ax.set_xlim(x0, x1)
+            self.ax.set_ylim(y0, y1)
+            self.ax.set_zlim(z0, z1)
             self.ax.view_init(elev=self._default_view["elev"], azim=self._default_view["azim"])
             self.canvas.draw_idle()
 
@@ -373,6 +419,9 @@ else:
             pass
 
         def pause_animation(self) -> None:
+            pass
+
+        def load_geometry_preview(self, solid, *, label: str = "") -> None:
             pass
 
         def load_volume_file(self, path, *, force=False) -> None:

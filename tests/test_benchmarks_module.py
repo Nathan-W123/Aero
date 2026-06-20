@@ -10,14 +10,17 @@ from aero.benchmarks import (
     assess_grid_convergence,
     assess_literature,
     backward_facing_step_reattachment_length,
+    build_uncertainty_report,
     build_validation_report,
     channel_friction_coefficient,
     dean_correlation_cf,
     grid_study,
     observed_order_of_convergence,
     richardson_extrapolation,
+    run_scalar_diffusion_benchmark_2d,
     schiller_naumann_cd,
     scale_params_for_grid,
+    validate_scalar_diffusion_profile,
     validate_bc_config,
 )
 
@@ -124,3 +127,55 @@ def test_backward_facing_step_reattachment_length():
     ux[1, 11:17] = -0.05
     length = backward_facing_step_reattachment_length(ux, step_index=10)
     assert length == pytest.approx(7.0)
+
+
+def test_build_uncertainty_report_has_expected_components():
+    report = build_uncertainty_report(
+        mode="2d",
+        shape="cylinder",
+        params={
+            "re": 100.0,
+            "u0": 0.05,
+            "radius": 20.0,
+            "nx": 200,
+            "ny": 100,
+            "cx_frac": 1.0 / 3.0,
+            "wall_bc": "slip",
+            "inlet_bc": "velocity",
+            "outlet_bc": "convective",
+        },
+        result={
+            "Cd_mean": 1.4,
+            "Cd_history": [1.4 + 1e-4 * math.sin(i) for i in range(200)],
+            "Cl_history": [0.1 * math.sin(0.1 * i) for i in range(200)],
+            "grid_cd_values": [1.6, 1.48, 1.43],
+            "stop_reason": "auto_converged",
+        },
+    )
+    assert report.overall_status in {"pass", "warn", "fail", "n/a"}
+    assert set(report.components) == {
+        "discretization",
+        "blockage",
+        "domain_length",
+        "statistical",
+        "convergence",
+        "bc_sensitivity",
+    }
+    assert report.components["blockage"]["value"] > 0.0
+
+
+def test_validate_scalar_diffusion_profile_linear_field_passes():
+    ny, nx = 16, 5
+    y = np.arange(ny, dtype=float)
+    reference = 1.0 - y / (ny - 1)
+    scalar = np.repeat(reference[:, None], nx, axis=1)
+    report = validate_scalar_diffusion_profile(scalar, T_hot=1.0, T_cold=0.0, wall_axis=0)
+    assert report.status == "pass"
+    assert report.rmse < 1e-12
+
+
+def test_run_scalar_diffusion_benchmark_2d_returns_validation():
+    result = run_scalar_diffusion_benchmark_2d(Ny=24, Nx=8, steps=1500, alpha_T=0.1)
+    assert result["scalar"] is not None
+    assert result["scalar_validation"]["status"] in {"pass", "warn"}
+    assert result["scalar_validation"]["rmse"] < 0.08

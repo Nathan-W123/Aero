@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -42,6 +43,7 @@ from .charts import MatplotlibChart
 from .styles import APP_STYLESHEET
 from .mpl_viewport import MplFlowViewport
 from .flow_window import FlowViewerWindow
+from .geometry_preview import solid_mask_for_3d_config
 
 
 def _ribbon_group(title: str, widgets: List[QtWidgets.QWidget]) -> QtWidgets.QFrame:
@@ -74,10 +76,15 @@ if HAS_QT:
             self._process.readyReadStandardOutput.connect(self._read_output)
             self._process.finished.connect(self._on_finished)
             self._process.errorOccurred.connect(self._on_error)
+            self._stdout_buffer = ""
 
         def start(self, command: list[str], workdir: str) -> None:
             if self._process.state() != QtCore.QProcess.NotRunning:
                 return
+            self._stdout_buffer = ""
+            env = QtCore.QProcessEnvironment.systemEnvironment()
+            env.insert("PYTHONUNBUFFERED", "1")
+            self._process.setProcessEnvironment(env)
             self._process.setWorkingDirectory(workdir)
             self._process.setProgram(command[0])
             self._process.setArguments(command[1:])
@@ -90,11 +97,18 @@ if HAS_QT:
         def is_running(self) -> bool:
             return self._process.state() != QtCore.QProcess.NotRunning
 
-        def _read_output(self) -> None:
-            data = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
-            for line in data.splitlines():
+        def _emit_lines(self, text: str) -> None:
+            self._stdout_buffer += text
+            while "\n" in self._stdout_buffer:
+                line, self._stdout_buffer = self._stdout_buffer.split("\n", 1)
+                line = line.rstrip("\r")
                 if line:
                     self.output.emit(line)
+
+        def _read_output(self) -> None:
+            data = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
+            if data:
+                self._emit_lines(data)
 
         def _on_error(self, _error: QtCore.QProcess.ProcessError) -> None:
             if self._process.state() == QtCore.QProcess.NotRunning:
@@ -104,6 +118,9 @@ if HAS_QT:
 
         def _on_finished(self, exit_code: int, _status: QtCore.QProcess.ExitStatus) -> None:
             self._read_output()
+            if self._stdout_buffer.strip():
+                self.output.emit(self._stdout_buffer.strip())
+                self._stdout_buffer = ""
             self.finished.emit(int(exit_code))
 
     class ResultsSummaryPanel(QtWidgets.QFrame):
@@ -256,14 +273,16 @@ if HAS_QT:
             self._re_sweep_index = 0
             self._re_sweep_points: List[tuple[float, float]] = []
             self._resume_checkpoint: Optional[Path] = None
+            self._run_total_steps: int = 0
+            self._run_started_at: Optional[float] = None
 
             self.setWindowTitle("Aero CFD Studio")
             self.resize(1680, 980)
             self.setStyleSheet(APP_STYLESHEET)
 
             self._build_menu()
-            self._build_ui()
             self._build_status_bar()
+            self._build_ui()
 
             self._shape_options = {
                 "2d": ["cylinder", "rectangle"],
@@ -315,7 +334,18 @@ if HAS_QT:
             self.status_bar = self.statusBar()
             self.summary_label = QtWidgets.QLabel("Ready")
             self.summary_label.setObjectName("statusLabel")
-            self.status_bar.addWidget(self.summary_label)
+            self.status_bar.addWidget(self.summary_label, 1)
+
+            self.run_progress = QtWidgets.QProgressBar()
+            self.run_progress.setObjectName("runProgress")
+            self.run_progress.setRange(0, 100)
+            self.run_progress.setValue(0)
+            self.run_progress.setTextVisible(True)
+            self.run_progress.setFormat("Ready")
+            self.run_progress.setMinimumWidth(300)
+            self.run_progress.setMaximumWidth(480)
+            self.run_progress.setFixedHeight(22)
+            self.status_bar.addPermanentWidget(self.run_progress)
 
         def _build_ui(self) -> None:
             root = QtWidgets.QWidget()
@@ -497,8 +527,101 @@ if HAS_QT:
             self.viewport.load_failed.connect(self._on_3d_load_failed)
             self.viewport.load_succeeded.connect(self._on_3d_load_succeeded)
             frame_layout.addWidget(self.viewport)
-            layout.addWidget(frame, 1)
+
+            run_status = QtWidgets.QFrame()
+            run_status.setObjectName("runStatusFrame")
+            run_status_layout = QtWidgets.QVBoxLayout(run_status)
+            run_status_layout.setContentsMargins(0, 4, 0, 0)
+            run_status_layout.setSpacing(4)
+
+            progress_header = QtWidgets.QLabel("Simulation Progress")
+            progress_header.setObjectName("panelTitle")
+            run_status_layout.addWidget(progress_header)
+
+            self.run_progress_detail = QtWidgets.QLabel(
+                "Run a simulation to see live progress in the status bar below."
+            )
+            self.run_progress_detail.setObjectName("panelSubtitle")
+            self.run_progress_detail.setWordWrap(True)
+            run_status_layout.addWidget(self.run_progress_detail)
+
+            live_log_label = QtWidgets.QLabel("Live Run Log")
+            live_log_label.setObjectName("panelSubtitle")
+            run_status_layout.addWidget(live_log_label)
+
+            self.live_log_output = QtWidgets.QPlainTextEdit()
+            self.live_log_output.setObjectName("liveRunLog")
+            self.live_log_output.setReadOnly(True)
+            self.live_log_output.setMaximumBlockCount(500)
+            self.live_log_output.setMinimumHeight(120)
+            run_status_layout.addWidget(self.live_log_output, 1)
+
+            self._center_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+            self._center_splitter.setObjectName("centerSplitter")
+            self._center_splitter.setChildrenCollapsible(False)
+            self._center_splitter.addWidget(frame)
+            self._center_splitter.addWidget(run_status)
+            self._center_splitter.setStretchFactor(0, 3)
+            self._center_splitter.setStretchFactor(1, 1)
+            run_status.setMinimumHeight(180)
+            self._center_splitter.setSizes([520, 200])
+
+            layout.addWidget(self._center_splitter, 1)
             return panel
+
+        def _append_log_line(self, line: str) -> None:
+            self.log_output.appendPlainText(line)
+            self.live_log_output.appendPlainText(line)
+            for editor in (self.log_output, self.live_log_output):
+                scrollbar = editor.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+
+        def _reset_run_progress(self, *, total_steps: int, label: str) -> None:
+            self._run_total_steps = max(int(total_steps), 1)
+            self._run_started_at = time.perf_counter()
+            self.run_progress.setRange(0, 0)
+            self.run_progress.setFormat("Starting…")
+            self.run_progress_detail.setText(
+                f"{label}  ·  progress bar is in the bottom status bar"
+            )
+            self.live_log_output.clear()
+            if hasattr(self, "_center_splitter"):
+                sizes = self._center_splitter.sizes()
+                total = max(sum(sizes), 1)
+                self._center_splitter.setSizes([int(total * 0.62), int(total * 0.38)])
+
+        def _update_run_progress(self, progress) -> None:
+            pct = int(100 * progress.step / max(progress.total_steps, 1))
+            self.run_progress.setRange(0, 100)
+            self.run_progress.setValue(min(max(pct, 0), 100))
+            self.run_progress.setFormat(
+                f"Step {progress.step:,} / {progress.total_steps:,} ({pct}%)"
+            )
+            eta_text = ""
+            if progress.steps_per_sec > 0:
+                remaining = max(progress.total_steps - progress.step, 0)
+                eta_sec = remaining / progress.steps_per_sec
+                if eta_sec >= 3600:
+                    eta_text = f" · ETA ~{eta_sec / 3600:.1f} h"
+                elif eta_sec >= 60:
+                    eta_text = f" · ETA ~{eta_sec / 60:.0f} min"
+                else:
+                    eta_text = f" · ETA ~{eta_sec:.0f} s"
+            self.run_progress_detail.setText(
+                f"{progress.steps_per_sec:,} steps/s · "
+                f"Cd={progress.cd:+.4f} · Cl={progress.cl:+.4f}{eta_text}"
+            )
+
+        def _finish_run_progress(self, *, success: bool, message: str) -> None:
+            if success:
+                self.run_progress.setRange(0, 100)
+                self.run_progress.setValue(100)
+                self.run_progress.setFormat("Complete")
+            else:
+                self.run_progress.setRange(0, 100)
+                self.run_progress.setValue(0)
+                self.run_progress.setFormat("Failed")
+            self.run_progress_detail.setText(message)
 
         def _on_3d_load_succeeded(self) -> None:
             self.summary_label.setText("Interactive 3D wind tunnel — drag to rotate")
@@ -583,7 +706,7 @@ if HAS_QT:
                 elif shape == "cylinder":
                     fields += ["radius", "length"]
                 elif shape == "mesh":
-                    fields += ["stl_path", "stl_fit", "mesh_bc", "mesh_orient"]
+                    fields += ["stl_path", "stl_fit", "mesh_bc", "mesh_orient", "mesh_rot_x", "mesh_rot_y", "mesh_rot_z"]
 
             for field in fields:
                 label = QtWidgets.QLabel(field)
@@ -614,6 +737,13 @@ if HAS_QT:
                 self._mesh_preview_label.setObjectName("panelSubtitle")
                 self._mesh_preview_label.setWordWrap(True)
                 self.form_layout.addRow("", self._mesh_preview_label)
+                rot_hint = QtWidgets.QLabel(
+                    "Rotation (deg): mesh_rot_x = roll (flow), mesh_rot_y = yaw, mesh_rot_z = pitch. "
+                    "Applied after mesh_orient."
+                )
+                rot_hint.setObjectName("panelSubtitle")
+                rot_hint.setWordWrap(True)
+                self.form_layout.addRow("", rot_hint)
             else:
                 self._mesh_preview_label = None
 
@@ -679,6 +809,9 @@ if HAS_QT:
                     nx=int(params.get("nx", "128")),
                     fit_frac=float(params.get("stl_fit", "0.35") or "0.35"),
                     mesh_orient=params.get("mesh_orient", "auto"),
+                    mesh_rot_x=float(params.get("mesh_rot_x", "0") or "0"),
+                    mesh_rot_y=float(params.get("mesh_rot_y", "0") or "0"),
+                    mesh_rot_z=float(params.get("mesh_rot_z", "0") or "0"),
                 )
             except (OSError, ValueError) as exc:
                 if self._mesh_preview_label is not None:
@@ -869,17 +1002,38 @@ if HAS_QT:
             )
             self.results_summary.set_validation(report)
 
-        def _start_command(self, command: List[str], *, label: str) -> None:
+        def _start_command(self, command: List[str], *, label: str, total_steps: Optional[int] = None) -> None:
             self.log_output.clear()
             self._live_cd_history = []
             self._live_cl_history = []
             self.convergence_chart.plot_convergence([], running=True)
-            self.left_tabs.setCurrentIndex(2)
             self.run_button.setEnabled(False)
             self.stop_button.setEnabled(True)
             self.summary_label.setText(label)
-            self.viewport.pause_animation()
+            if total_steps is None:
+                params = self._current_params()
+                total_steps = int(params.get("steps", "500"))
+            self._reset_run_progress(total_steps=total_steps, label=label)
+            if self.config.mode == "3d":
+                self._show_run_geometry_preview()
+            else:
+                self.viewport.pause_animation()
             self._simulation.start(command, str(self.repo_root))
+
+        def _show_run_geometry_preview(self) -> None:
+            solid = solid_mask_for_3d_config(self.config)
+            if solid is None:
+                self.viewport.pause_animation()
+                return
+            shape = self.config.shape_3d
+            cells = int(np.asarray(solid, dtype=bool).sum())
+            self.viewport.load_geometry_preview(
+                solid,
+                label=(
+                    f"Running {shape} ({cells:,} solid cells) — "
+                    "flow arrows load when the run completes"
+                ),
+            )
 
         def _run_case(self) -> None:
             if self._simulation.is_running():
@@ -922,6 +1076,7 @@ if HAS_QT:
             self._start_command(
                 command,
                 label=f"Resuming from step {step:,} ({remaining:,} steps remaining)…",
+                total_steps=remaining,
             )
 
         def _run_grid_study(self) -> None:
@@ -958,7 +1113,15 @@ if HAS_QT:
             )
 
         def _on_sim_output(self, line: str) -> None:
-            self.log_output.appendPlainText(line)
+            self._append_log_line(line)
+            if "Running 3D simulation" in line or "Running simulation" in line:
+                self.run_progress.setRange(0, 0)
+                self.run_progress.setFormat("Solver running…")
+            if line.startswith("[X]") or line.startswith("[simulation error"):
+                self._finish_run_progress(
+                    success=False,
+                    message=line.removeprefix("[X] ").strip() or "Simulation failed.",
+                )
             progress = parse_progress_line(line)
             if progress is None:
                 return
@@ -970,6 +1133,7 @@ if HAS_QT:
                 step=progress.step,
                 total_steps=progress.total_steps,
             )
+            self._update_run_progress(progress)
             pct = int(100 * progress.step / max(progress.total_steps, 1))
             self.summary_label.setText(
                 f"Running step {progress.step:,}/{progress.total_steps:,} "
@@ -982,10 +1146,11 @@ if HAS_QT:
             self.run_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.summary_label.setText("Simulation stopped.")
-            self.log_output.appendPlainText("\n[simulation stopped by user]")
+            self._finish_run_progress(success=False, message="Simulation stopped by user.")
+            self._append_log_line("\n[simulation stopped by user]")
 
         def _on_run_finished(self, returncode: int) -> None:
-            self.log_output.appendPlainText(f"\n[process exited with code {returncode}]")
+            self._append_log_line(f"\n[process exited with code {returncode}]")
             self.run_button.setEnabled(True)
             self.stop_button.setEnabled(False)
 
@@ -1064,6 +1229,23 @@ if HAS_QT:
                 QtCore.QTimer.singleShot(200, self._begin_3d_after_run)
             elif returncode == 0 and self.config.mode != "3d":
                 self.viewport.clear_scene("Run a 3D case to load the interactive wind tunnel.")
+            if not self._grid_study_active and not self._re_sweep_active:
+                if returncode == 0:
+                    detail = "Run complete"
+                    if cd_val is not None:
+                        detail += f" · Cd={cd_val:.4f}"
+                    elapsed = self._run_metrics.get("elapsed")
+                    sps = self._run_metrics.get("steps_per_sec")
+                    if elapsed:
+                        detail += f" · {elapsed}s"
+                    if sps:
+                        detail += f" · {sps} steps/s"
+                    self._finish_run_progress(success=True, message=detail)
+                else:
+                    self._finish_run_progress(
+                        success=False,
+                        message=f"Run failed (exit code {returncode}). See log for details.",
+                    )
             self._restore_window()
 
 

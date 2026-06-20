@@ -35,12 +35,14 @@ from . import kernels as _kernels
 from .kernels_mrt import MRTKernel2D
 from .boundary import (
     apply_inlet_zou_he,
+    apply_inlet_velocity_field,
     apply_inlet_zou_he_pressure,
     apply_outlet_convective,
     apply_outlet_zero_gradient,
     apply_outlet_zou_he_pressure,
     apply_slip_walls,
     apply_noslip_walls,
+    apply_moving_walls,
     apply_bounce_back,
     apply_bounce_back_bouzidi,
     build_surface_links,
@@ -48,10 +50,14 @@ from .boundary import (
 from ..forces import (
     compute_forces,
     compute_force_split_2d,
+    compute_force_moment_2d,
+    force_profile_2d,
     forces_to_coefficients,
+    moment_to_coefficient_2d,
     split_to_coefficients,
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
+from ..observables import coefficient_spectrum
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_2d
 from .les import (
     strain_rate_magnitude_2d,
@@ -88,11 +94,25 @@ class Solver:
         sponge_strength: float = 0.1,
         les: bool = False,
         les_cs: float = 0.16,
+        les_model: str = "smagorinsky",
         ibm_enabled: bool = False,
         phi: Optional[np.ndarray] = None,
         bouzidi: bool = False,
         van_driest: bool = False,
         van_driest_A: float = 25.0,
+        wall_velocity_top: float = 0.0,
+        wall_velocity_bottom: float = 0.0,
+        synthetic_inflow: bool = False,
+        synthetic_inflow_intensity: float = 0.03,
+        synthetic_inflow_seed: int = 12345,
+        thermal: bool = False,
+        T_hot: float = 1.0,
+        T_cold: float = 0.0,
+        alpha_T: float = 1e-3,
+        buoyancy: bool = False,
+        g_gravity: float = 0.0,
+        beta: float = 1e-3,
+        T_ref: float = 0.5,
     ):
         """
         Parameters
@@ -139,11 +159,28 @@ class Solver:
         self.sponge_strength = float(sponge_strength)
         self.les = bool(les)
         self.les_cs = float(les_cs)
+        if les_model not in ("smagorinsky", "wale"):
+            raise ValueError("les_model must be 'smagorinsky' or 'wale'.")
+        self.les_model = str(les_model)
         self.ibm_enabled = bool(ibm_enabled)
         self.phi = phi
         self.bouzidi = bool(bouzidi)
         self.van_driest = bool(van_driest)
         self.van_driest_A = float(van_driest_A)
+        self.wall_velocity_top = float(wall_velocity_top)
+        self.wall_velocity_bottom = float(wall_velocity_bottom)
+        self.synthetic_inflow = bool(synthetic_inflow)
+        self.synthetic_inflow_intensity = float(synthetic_inflow_intensity)
+        self._rng = np.random.default_rng(int(synthetic_inflow_seed))
+        self.thermal = bool(thermal)
+        self.T_hot = float(T_hot)
+        self.T_cold = float(T_cold)
+        self.alpha_T = float(alpha_T)
+        self.omega_T = float(1.0 / (3.0 * alpha_T + 0.5))
+        self.buoyancy = bool(buoyancy)
+        self.g_gravity = float(g_gravity)
+        self.beta = float(beta)
+        self.T_ref = float(T_ref)
         self.tau = 1.0 / omega
         self._base_nu = base_nu_from_omega(omega)
         if collision not in ("bgk", "mrt", "trt"):
@@ -195,9 +232,16 @@ class Solver:
         self._u_wall_x = np.zeros((Ny, Nx))
         self._u_wall_y = np.zeros((Ny, Nx))
         self._omega_dummy = np.zeros((Ny, Nx), dtype=np.float64)
+        self._inlet_uy_field = np.zeros(Ny, dtype=np.float64)
 
         # Step counter — incremented by run(); preserved across checkpoint loads
         self.step_count: int = 0
+
+        # Thermal distribution
+        self.g: Optional[np.ndarray] = None
+        if self.thermal:
+            from .thermal import init_g_2d
+            self.g = init_g_2d(self.T_ref, Ny, Nx, self._w, self._ex, self._ey)
 
         # State available after run()
         self.rho: Optional[np.ndarray] = None
@@ -205,8 +249,25 @@ class Solver:
         self.uy:  Optional[np.ndarray] = None
         self.Cd_history: list = []
         self.Cl_history: list = []
+        self.Cm_history: list = []
         self.Cd_p_history: list = []
         self.Cd_v_history: list = []
+        solid_y, solid_x = np.where(self.solid)
+        self._ref_center_y = float(np.mean(solid_y)) if solid_y.size else 0.5 * (Ny - 1)
+        self._ref_center_x = float(np.mean(solid_x)) if solid_x.size else 0.5 * (Nx - 1)
+
+    def _update_synthetic_inflow(self) -> np.ndarray:
+        if not self.synthetic_inflow:
+            return np.zeros(self.Ny, dtype=np.float64)
+        noise = self._rng.standard_normal(self.Ny)
+        filtered = (noise + np.roll(noise, 1) + np.roll(noise, -1)) / 3.0
+        self._inlet_uy_field = 0.75 * self._inlet_uy_field + 0.25 * filtered
+        self._inlet_uy_field -= float(np.mean(self._inlet_uy_field))
+        rms = float(np.sqrt(np.mean(self._inlet_uy_field ** 2)))
+        target = self.synthetic_inflow_intensity * self.u0
+        if rms > 1e-12 and target > 0.0:
+            self._inlet_uy_field *= target / rms
+        return self._inlet_uy_field.copy()
 
     # ------------------------------------------------------------------
     # Private: single timestep
@@ -228,6 +289,7 @@ class Solver:
         if self.les:
             omega_field = build_omega_field_2d(
                 f, self.solid, self.fluid, self._base_nu, self.omega, self.les_cs,
+                les_model=self.les_model,
                 phi=self.phi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             )
             use_omega_field = True
@@ -321,12 +383,19 @@ class Solver:
                 apply_bounce_back(f_post, f_pre, self.surface_links)
 
         if self.inlet_bc == "velocity":
-            apply_inlet_zou_he(
-                f_post,
-                self.u0,
-                uy_amp=self.inlet_perturbation,
-                step=self.step_count + 1,
-            )
+            if self.synthetic_inflow:
+                apply_inlet_velocity_field(
+                    f_post,
+                    np.full(self.Ny, self.u0, dtype=np.float64),
+                    self._update_synthetic_inflow(),
+                )
+            else:
+                apply_inlet_zou_he(
+                    f_post,
+                    self.u0,
+                    uy_amp=self.inlet_perturbation,
+                    step=self.step_count + 1,
+                )
         elif self.inlet_bc == "pressure":
             apply_inlet_zou_he_pressure(f_post, self.rho_in)
 
@@ -347,6 +416,31 @@ class Solver:
             apply_slip_walls(f_post)
         elif self.wall_bc == "noslip":
             apply_noslip_walls(f_post)
+        elif self.wall_bc == "moving":
+            apply_moving_walls(
+                f_post,
+                u_top=self.wall_velocity_top,
+                u_bottom=self.wall_velocity_bottom,
+            )
+
+        # Thermal step
+        if self.thermal and self.g is not None:
+            from .thermal import (
+                collide_g_2d, stream_g_2d, extract_T,
+                apply_temperature_bc_2d, guo_buoyancy_force_2d,
+            )
+            rho_now, ux_now, uy_now = compute_macroscopic(f_post)
+            T_now = extract_T(self.g)
+            if self.buoyancy:
+                F_b = guo_buoyancy_force_2d(
+                    rho_now, T_now, self.T_ref,
+                    self.g_gravity, self.beta, self._ey, self._w,
+                )
+                f_post = f_post + F_b
+            g_post = collide_g_2d(self.g, ux_now, uy_now, T_now, self.omega_T, self.solid)
+            g_post = stream_g_2d(g_post, self._ex, self._ey)
+            apply_temperature_bc_2d(g_post, self.T_hot, self.T_cold, self._w, self._ex, self._ey)
+            self.g = g_post
 
         self.f = f_post
         self.step_count += 1
@@ -358,6 +452,15 @@ class Solver:
         cdp, _, cdv, _ = split_to_coefficients(fx_p, fy_p, fx_v, fy_v, self.rho0, self.u0, self.D)
         self._last_cd_p = cdp
         self._last_cd_v = cdv
+        _, _, mz = compute_force_moment_2d(
+            f_pre,
+            f_post,
+            self.surface_links,
+            center_x=self._ref_center_x,
+            center_y=self._ref_center_y,
+        )
+        self._last_cm = moment_to_coefficient_2d(mz, self.rho0, self.u0, self.D)
+        self._last_force_profile = force_profile_2d(f_pre, f_post, self.surface_links, ny=self.Ny)
         return Cd, Cl
 
     # ------------------------------------------------------------------
@@ -415,6 +518,7 @@ class Solver:
             Cd, Cl = self._step()
             self.Cd_history.append(Cd)
             self.Cl_history.append(Cl)
+            self.Cm_history.append(getattr(self, "_last_cm", 0.0))
             self.Cd_p_history.append(getattr(self, "_last_cd_p", 0.0))
             self.Cd_v_history.append(getattr(self, "_last_cd_v", 0.0))
 
@@ -424,8 +528,10 @@ class Solver:
 
             if hdf5_writer and hdf5_every and step % hdf5_every == 0:
                 from ..lbm.d2q9 import compute_macroscopic as _cm2
+                from .thermal import extract_T as _extract_T
                 _rho, _ux, _uy = _cm2(self.f)
-                hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, rho=_rho)
+                _scalar = _extract_T(self.g) if (self.thermal and self.g is not None) else None
+                hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, rho=_rho, scalar=_scalar)
 
             if step % check_every == 0:
                 rho, ux, uy = compute_macroscopic(self.f)
@@ -441,7 +547,8 @@ class Solver:
                     print(
                         f"  step {step:6d}/{steps}  "
                         f"Cd={Cd_avg:+.4f}  Cl={Cl_avg:+.4f}  "
-                        f"[{steps_per_sec:.0f} steps/s]"
+                        f"[{steps_per_sec:.0f} steps/s]",
+                        flush=True,
                     )
 
                 if callback is not None:
@@ -468,22 +575,51 @@ class Solver:
 
         Cd_arr = np.array(self.Cd_history[-avg_window:])
         Cl_arr = np.array(self.Cl_history[-avg_window:])
+        Cm_arr = np.array(self.Cm_history[-avg_window:]) if self.Cm_history else np.zeros(1)
         Cdp_arr = np.array(self.Cd_p_history[-avg_window:])
         Cdv_arr = np.array(self.Cd_v_history[-avg_window:])
+        scalar = None
+        scalar_stats = None
+        if self.thermal and self.g is not None:
+            from .thermal import extract_T
+            scalar = extract_T(self.g)
+            scalar_stats = {
+                "enabled": True,
+                "mean": float(np.mean(scalar)),
+                "std": float(np.std(scalar)),
+                "min": float(np.min(scalar)),
+                "max": float(np.max(scalar)),
+                "wall_hot": float(self.T_hot),
+                "wall_cold": float(self.T_cold),
+                "diffusivity": float(self.alpha_T),
+                "buoyancy": bool(self.buoyancy),
+                "gravity": float(self.g_gravity),
+                "beta": float(self.beta),
+                "reference": float(self.T_ref),
+            }
 
         if hdf5_writer:
             hdf5_writer.close()
         return {
             "Cd_mean":    float(np.mean(Cd_arr)),
             "Cl_mean":    float(np.mean(Cl_arr)),
+            "Cm_mean":    float(np.mean(Cm_arr)),
             "Cd_std":     float(np.std(Cd_arr)),
             "Cl_std":     float(np.std(Cl_arr)),
+            "Cm_std":     float(np.std(Cm_arr)),
             "Cd_p_mean":  float(np.mean(Cdp_arr)),
             "Cd_v_mean":  float(np.mean(Cdv_arr)),
             "Cd_history": self.Cd_history,
             "Cl_history": self.Cl_history,
+            "Cm_history": self.Cm_history,
             "Cd_p_history": self.Cd_p_history,
             "Cd_v_history": self.Cd_v_history,
+            "observables": {
+                "cd_spectrum": coefficient_spectrum(self.Cd_history),
+                "cl_spectrum": coefficient_spectrum(self.Cl_history),
+                "cm_spectrum": coefficient_spectrum(self.Cm_history),
+                "force_profile_last": getattr(self, "_last_force_profile", None),
+            },
             "steps_completed": self.step_count,
             "stop_reason": stop_reason,
             "convergence_report": last_convergence,
@@ -491,6 +627,8 @@ class Solver:
             "rho": rho,
             "ux":  ux,
             "uy":  uy,
+            "scalar": scalar,
+            "scalar_stats": scalar_stats,
         }
 
     # ------------------------------------------------------------------
@@ -513,7 +651,20 @@ class Solver:
             inlet_perturbation=self.inlet_perturbation, trt_lambda=self.trt_lambda,
             sponge_thickness=self.sponge_thickness, sponge_strength=self.sponge_strength,
             les=self.les, les_cs=self.les_cs, ibm_enabled=self.ibm_enabled,
+            les_model=self.les_model,
             bouzidi=self.bouzidi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            wall_velocity_top=self.wall_velocity_top,
+            wall_velocity_bottom=self.wall_velocity_bottom,
+            synthetic_inflow=self.synthetic_inflow,
+            synthetic_inflow_intensity=self.synthetic_inflow_intensity,
+            thermal=self.thermal,
+            T_hot=self.T_hot,
+            T_cold=self.T_cold,
+            alpha_T=self.alpha_T,
+            buoyancy=self.buoyancy,
+            g_gravity=self.g_gravity,
+            beta=self.beta,
+            T_ref=self.T_ref,
             collision=self.collision, backend=self.backend,
         )
         kwargs: dict = dict(
@@ -522,6 +673,7 @@ class Solver:
             solid=self.solid,
             Cd_history=np.array(self.Cd_history, dtype=np.float64),
             Cl_history=np.array(self.Cl_history, dtype=np.float64),
+            Cm_history=np.array(self.Cm_history, dtype=np.float64),
             step_count=np.array(self.step_count, dtype=np.int64),
             surface_links=self.surface_links,
             q_vals=self.q_vals,
@@ -529,6 +681,8 @@ class Solver:
         )
         if self.phi is not None:
             kwargs["phi"] = self.phi
+        if self.g is not None:
+            kwargs["g"] = self.g
         np.savez_compressed(path, **kwargs)
 
     def load_checkpoint(self, path: str) -> None:
@@ -543,7 +697,11 @@ class Solver:
         self._f_outlet_prev   = data["f_outlet_prev"]
         self.Cd_history       = list(data["Cd_history"])
         self.Cl_history       = list(data["Cl_history"])
+        if "Cm_history" in data:
+            self.Cm_history = list(data["Cm_history"])
         self.step_count       = int(data["step_count"])
+        if "g" in data:
+            self.g = data["g"]
         # Restore pre-computed link tables so geometry doesn't need rebuilding
         if "surface_links" in data:
             self.surface_links = data["surface_links"]

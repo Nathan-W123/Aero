@@ -195,6 +195,26 @@ def plot_coefficient_history(
     plt.close(fig)
 
 
+def plot_scalar(
+    scalar: np.ndarray,
+    solid: np.ndarray,
+    Re: float,
+    step: int,
+    out_path: pathlib.Path,
+) -> None:
+    """Passive scalar / temperature field colormap."""
+    scalar_plot = _mask_solid(scalar, solid)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    im = ax.imshow(scalar_plot, origin="lower", cmap="plasma", aspect="equal")
+    plt.colorbar(im, ax=ax, label="Scalar")
+    ax.set_title(f"Scalar field — Re={Re:.0f}  step={step}", fontsize=10)
+    ax.set_xlabel("x (lattice cells)")
+    ax.set_ylabel("y (lattice cells)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def save_coefficients(
     out_path: pathlib.Path,
     shape: str,
@@ -270,6 +290,11 @@ def save_all(
         out / f"{tag}_history.png",
     )
     print(f"  Saved: {out / f'{tag}_history.png'}")
+
+    scalar = result.get("scalar")
+    if scalar is not None:
+        plot_scalar(scalar, solid, Re, steps, out / f"{tag}_scalar.png")
+        print(f"  Saved: {out / f'{tag}_scalar.png'}")
 
     save_coefficients(
         out / f"{tag}_coefficients.txt",

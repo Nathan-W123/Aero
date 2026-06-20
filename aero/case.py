@@ -23,6 +23,8 @@ import pathlib
 import datetime
 from typing import Optional
 
+from .benchmarks import build_uncertainty_report, build_validation_report
+
 
 class SimulationCase:
     """
@@ -73,25 +75,71 @@ class SimulationCase:
         Write results.json. Stores scalar outputs and coefficient history sidecar.
         """
         mode = self.config.get("mode", "2d")
+        shape = self.config.get("shape", "unknown")
+        validation = build_validation_report(
+            mode=mode,
+            shape=shape,
+            params=self.config,
+            cd=result.get("Cd_mean"),
+            grid_cd_values=result.get("grid_cd_values"),
+        )
+        uncertainty = build_uncertainty_report(
+            mode=mode,
+            shape=shape,
+            params=self.config,
+            result=result,
+        )
         self.results = {
             "mode": mode,
+            "shape": shape,
             "Cd_mean": result["Cd_mean"],
             "Cd_std": result["Cd_std"],
             "steps_run": len(result.get("Cd_history", [])),
+            "steps_completed": int(result.get("steps_completed", len(result.get("Cd_history", [])))),
             "elapsed_seconds": round(elapsed_seconds, 2),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "stop_reason": result.get("stop_reason", "max_steps"),
+            "validation_report": {
+                "benchmark_status": validation.benchmark_status,
+                "benchmark_message": validation.benchmark_message,
+                "grid_status": validation.grid_status,
+                "grid_message": validation.grid_message,
+                "bc_warnings": list(validation.bc_warnings),
+                "collision_status": validation.collision_status,
+                "collision_message": validation.collision_message,
+                "overall_ok": validation.overall_ok,
+            },
+            "uncertainty_report": {
+                "overall_status": uncertainty.overall_status,
+                "summary": uncertainty.summary,
+                "components": uncertainty.components,
+            },
         }
         if "Cd_p_mean" in result:
             self.results["Cd_p_mean"] = result["Cd_p_mean"]
             self.results["Cd_v_mean"] = result["Cd_v_mean"]
+        if "Cm_mean" in result:
+            self.results["Cm_mean"] = result["Cm_mean"]
+            self.results["Cm_std"] = result.get("Cm_std")
         if mode == "3d":
             self.results["Cly_mean"] = result.get("Cly_mean")
             self.results["Cly_std"] = result.get("Cly_std")
             self.results["Clz_mean"] = result.get("Clz_mean")
             self.results["Clz_std"] = result.get("Clz_std")
+            for key in ("Cmx_mean", "Cmy_mean", "Cmz_mean", "Cmx_std", "Cmy_std", "Cmz_std"):
+                if key in result:
+                    self.results[key] = result.get(key)
         else:
             self.results["Cl_mean"] = result.get("Cl_mean")
             self.results["Cl_std"] = result.get("Cl_std")
+        if "observables" in result:
+            self.results["observables"] = result["observables"]
+        if result.get("scalar_stats") is not None:
+            self.results["scalar_stats"] = result["scalar_stats"]
+        if result.get("scalar_validation") is not None:
+            self.results["scalar_validation"] = result["scalar_validation"]
+        if result.get("autoconfig_report") is not None:
+            self.results["autoconfig_report"] = result["autoconfig_report"]
 
         self.case_dir.mkdir(parents=True, exist_ok=True)
         with open(self.results_path, "w") as fh:
@@ -101,8 +149,33 @@ class SimulationCase:
         if mode == "3d":
             history["Cly_history"] = [float(x) for x in result.get("Cly_history", [])]
             history["Clz_history"] = [float(x) for x in result.get("Clz_history", [])]
+            for key in ("Cmx_history", "Cmy_history", "Cmz_history"):
+                if key in result:
+                    history[key] = [float(x) for x in result.get(key, [])]
         else:
             history["Cl_history"] = [float(x) for x in result.get("Cl_history", [])]
+            if "Cm_history" in result:
+                history["Cm_history"] = [float(x) for x in result.get("Cm_history", [])]
+        if result.get("convergence_report") is not None:
+            history["convergence_report"] = {
+                "converged": bool(result["convergence_report"].converged),
+                "window": int(result["convergence_report"].window),
+                "ratio": float(result["convergence_report"].ratio),
+                "mean_abs": float(result["convergence_report"].mean_abs),
+                "std": float(result["convergence_report"].std),
+                "threshold": float(result["convergence_report"].threshold),
+            }
+        if result.get("strouhal_report") is not None:
+            report = result["strouhal_report"]
+            history["strouhal_report"] = {
+                "strouhal": None if report.strouhal is None else float(report.strouhal),
+                "peak_frequency": None if report.peak_frequency is None else float(report.peak_frequency),
+                "peak_amplitude": float(report.peak_amplitude),
+                "sample_count": int(report.sample_count),
+                "window": int(report.window),
+                "stationary": bool(report.stationary),
+                "relative_drift": None if report.relative_drift is None else float(report.relative_drift),
+            }
         history_path = self.case_dir / "history.json"
         with open(history_path, "w") as fh:
             json.dump(history, fh, indent=2)
@@ -182,10 +255,10 @@ class SimulationCase:
             "ny":       args.ny,
             # run
             "steps":    args.steps,
-            "wall_bc":  getattr(args, "wall_bc", None),
-            "inlet_bc": getattr(args, "inlet_bc", None),
-            "outlet_bc": getattr(args, "outlet_bc", None),
-            "streamwise_bc": getattr(args, "streamwise_bc", None),
+            "wall_bc":  getattr(args, "wall_bc", None) or "slip",
+            "inlet_bc": getattr(args, "inlet_bc", None) or "velocity",
+            "outlet_bc": getattr(args, "outlet_bc", None) or "convective",
+            "streamwise_bc": getattr(args, "streamwise_bc", None) or "open",
             "rho_in":   getattr(args, "rho_in", None),
             "rho_out":  getattr(args, "rho_out", None),
             "backend":  getattr(args, "backend", None),
@@ -195,13 +268,30 @@ class SimulationCase:
             "sponge_strength": getattr(args, "sponge_strength", None),
             "les": getattr(args, "les", None),
             "les_cs": getattr(args, "les_cs", None),
+            "les_model": getattr(args, "les_model", None),
             "inlet_perturbation": getattr(args, "inlet_perturbation", None),
             "mesh_bc": getattr(args, "mesh_bc", None),
             "mesh_orient": getattr(args, "mesh_orient", None),
+            "mesh_rot_x": getattr(args, "mesh_rot_x", None),
+            "mesh_rot_y": getattr(args, "mesh_rot_y", None),
+            "mesh_rot_z": getattr(args, "mesh_rot_z", None),
             "body_force_x": getattr(args, "body_force_x", None),
             "body_force_y": getattr(args, "body_force_y", None),
             "body_force_z": getattr(args, "body_force_z", None),
             "auto_stop": getattr(args, "auto_stop", None),
+            "wall_velocity_top": getattr(args, "wall_velocity_top", None),
+            "wall_velocity_bottom": getattr(args, "wall_velocity_bottom", None),
+            "synthetic_inflow": getattr(args, "synthetic_inflow", None),
+            "synthetic_inflow_intensity": getattr(args, "synthetic_inflow_intensity", None),
+            "autoconfigure": getattr(args, "autoconfigure", None),
+            "thermal": getattr(args, "thermal", None),
+            "T_hot": getattr(args, "T_hot", None),
+            "T_cold": getattr(args, "T_cold", None),
+            "alpha_T": getattr(args, "alpha_T", None),
+            "buoyancy": getattr(args, "buoyancy", None),
+            "g_gravity": getattr(args, "g_gravity", None),
+            "beta": getattr(args, "beta", None),
+            "T_ref": getattr(args, "T_ref", None),
             # derived LBM params (informational)
             "D":        derived["D"],
             "nu_lbm":   derived["nu_lbm"],
@@ -238,6 +328,19 @@ class SimulationCase:
             "sponge_strength": float(params.get("sponge_strength", "0.1") or "0.1"),
             "les": params.get("les", "0") in ("1", "true", "True"),
             "les_cs": float(params.get("les_cs", "0.16") or "0.16"),
+            "les_model": params.get("les_model", "smagorinsky"),
+            "wall_velocity_top": float(params.get("wall_velocity_top", "0") or "0"),
+            "wall_velocity_bottom": float(params.get("wall_velocity_bottom", "0") or "0"),
+            "synthetic_inflow": params.get("synthetic_inflow", "0") in ("1", "true", "True"),
+            "synthetic_inflow_intensity": float(params.get("synthetic_inflow_intensity", "0.03") or "0.03"),
+            "thermal": params.get("thermal", "0") in ("1", "true", "True"),
+            "T_hot": float(params.get("T_hot", "1.0") or "1.0"),
+            "T_cold": float(params.get("T_cold", "0.0") or "0.0"),
+            "alpha_T": float(params.get("alpha_T", "1e-3") or "1e-3"),
+            "buoyancy": params.get("buoyancy", "0") in ("1", "true", "True"),
+            "g_gravity": float(params.get("g_gravity", "0.0") or "0.0"),
+            "beta": float(params.get("beta", "1e-3") or "1e-3"),
+            "T_ref": float(params.get("T_ref", "0.5") or "0.5"),
         }
         if mode == "2d":
             case_config["inlet_bc"] = params.get("inlet_bc")
@@ -251,6 +354,9 @@ class SimulationCase:
                 case_config["stl_fit"] = float(params.get("stl_fit", "0.35") or "0.35")
                 case_config["mesh_bc"] = params.get("mesh_bc", "voxel")
                 case_config["mesh_orient"] = params.get("mesh_orient", "auto")
+                case_config["mesh_rot_x"] = float(params.get("mesh_rot_x", "0") or "0")
+                case_config["mesh_rot_y"] = float(params.get("mesh_rot_y", "0") or "0")
+                case_config["mesh_rot_z"] = float(params.get("mesh_rot_z", "0") or "0")
 
         for key in ("radius", "width", "height", "depth", "length"):
             if key in params and params[key] != "":

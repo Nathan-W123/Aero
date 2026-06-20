@@ -22,6 +22,8 @@ from typing import Tuple
 from aero.geometry3d.sphere import Sphere
 from aero.geometry3d.box import Box
 from aero.geometry3d.cylinder3d import Cylinder3D
+from aero.benchmarks import build_uncertainty_report, build_validation_report
+from aero.autoconfig import autoconfigure_3d
 from aero.lbm.solver3d import Solver3D
 from aero.case import SimulationCase
 from aero.visualization3d import save_all_3d, HAS_PYVISTA
@@ -55,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max cross-stream mesh extent as fraction of min(Ny,Nz)")
     p.add_argument("--mesh-orient", choices=["auto", "none"], default="auto",
                    help="Auto-orient STL: stream +x, span +y, thin +z (PCA)")
+    p.add_argument("--mesh-rot-x", type=float, default=0.0,
+                   help="Extra mesh rotation about stream +x axis (degrees)")
+    p.add_argument("--mesh-rot-y", type=float, default=0.0,
+                   help="Extra mesh rotation about vertical +y axis (degrees)")
+    p.add_argument("--mesh-rot-z", type=float, default=0.0,
+                   help="Extra mesh rotation about span +z axis (degrees)")
     p.add_argument("--cx-frac", type=float, default=1.0/3.0,
                    help="Obstacle centre x as fraction of Nx")
     p.add_argument("--cy-frac", type=float, default=0.5)
@@ -70,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nz", type=int, default=64,  help="Spanwise cells (periodic)")
 
     # BCs
-    p.add_argument("--wall-bc", choices=["slip", "noslip"], default="slip")
+    p.add_argument("--wall-bc", choices=["slip", "noslip", "moving"], default="slip")
     p.add_argument("--outlet-bc", choices=["convective", "zerogradient"], default="convective")
     p.add_argument("--streamwise-bc", choices=["open", "periodic", "recycling"], default="open")
 
@@ -84,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sponge-strength", type=float, default=0.1)
     p.add_argument("--les", action="store_true")
     p.add_argument("--les-cs", type=float, default=0.16)
+    p.add_argument("--les-model", choices=["smagorinsky", "wale"], default="smagorinsky")
     p.add_argument("--bouzidi", action="store_true", help="Use Bouzidi 2nd-order curved bounce-back")
     p.add_argument("--van-driest", action="store_true", help="Van Driest wall damping for LES (requires --les)")
     p.add_argument("--van-driest-A", type=float, default=25.0, help="Van Driest A+ constant (default 25)")
@@ -97,8 +106,45 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Uniform streamwise body force for periodic/internal-flow cases")
     p.add_argument("--body-force-y", type=float, default=0.0)
     p.add_argument("--body-force-z", type=float, default=0.0)
+    p.add_argument("--wall-velocity-top", type=float, default=0.0)
+    p.add_argument("--wall-velocity-bottom", type=float, default=0.0)
+    p.add_argument("--synthetic-inflow", action="store_true",
+                   help="Use filtered synthetic inlet fluctuations on the open inlet")
+    p.add_argument("--synthetic-inflow-intensity", type=float, default=0.03)
+    p.add_argument("--scalar", "--thermal", dest="thermal", action="store_true",
+                   help="Enable passive scalar / thermal transport")
+    p.add_argument("--scalar-hot", dest="T_hot", type=float, default=1.0,
+                   help="Bottom-wall scalar value")
+    p.add_argument("--scalar-cold", dest="T_cold", type=float, default=0.0,
+                   help="Top-wall scalar value")
+    p.add_argument("--scalar-diffusivity", dest="alpha_T", type=float, default=1e-3,
+                   help="Passive scalar diffusivity")
+    p.add_argument("--scalar-ref", dest="T_ref", type=float, default=0.5,
+                   help="Reference scalar for buoyancy coupling")
+    p.add_argument("--buoyancy", action="store_true",
+                   help="Enable Boussinesq buoyancy coupling on the scalar field")
+    p.add_argument("--gravity", dest="g_gravity", type=float, default=0.0,
+                   help="Buoyancy gravity magnitude")
+    p.add_argument("--beta", type=float, default=1e-3,
+                   help="Buoyancy expansion coefficient")
+    # SEM synthetic turbulence inlet
+    p.add_argument("--sem-inlet", action="store_true",
+                   help="Enable Synthetic Eddy Method turbulent inlet")
+    p.add_argument("--sem-tu", type=float, default=0.05,
+                   help="SEM turbulence intensity (RMS/u0, default 0.05)")
+    p.add_argument("--sem-lint", type=float, default=10.0,
+                   help="SEM integral length scale in lattice units (default 10)")
+    p.add_argument("--sem-n", type=int, default=200,
+                   help="Number of SEM synthetic eddies (default 200)")
     p.add_argument("--allow-high-blockage", action="store_true",
                    help="Allow very confined runs (>30% frontal blockage)")
+    p.add_argument("--autoconfigure", choices=["off", "safe"], default="off",
+                   help="Automatically adjust recoverable preflight settings")
+    # Multi-block static z-refinement
+    p.add_argument("--refine-z-lo", type=int, default=None,
+                   help="Start of 2× refined z-slab (coarse grid index)")
+    p.add_argument("--refine-z-hi", type=int, default=None,
+                   help="End of 2× refined z-slab (exclusive, coarse grid index)")
 
     # Run control
     p.add_argument("--steps", type=int, default=20000)
@@ -192,6 +238,12 @@ def main() -> int:
     ibm_enabled = False
     mesh_blockage_tuple = None
 
+    autoconfig_report = autoconfigure_3d(args, policy=args.autoconfigure)
+    if autoconfig_report is not None and autoconfig_report.applied:
+        print(f"[i] Autoconfigure ({autoconfig_report.policy}) applied {len(autoconfig_report.changes)} change(s):")
+        for item in autoconfig_report.changes:
+            print(f"    - {item.field}: {item.old} -> {item.new} ({item.reason})")
+
     # Derived LBM parameters (D may come from voxelized mesh)
     if args.shape == "mesh":
         if not args.stl_path:
@@ -209,6 +261,9 @@ def main() -> int:
             cz_frac=args.cz_frac,
             fit_frac=args.stl_fit,
             mesh_orient=args.mesh_orient,
+            mesh_rot_x=args.mesh_rot_x,
+            mesh_rot_y=args.mesh_rot_y,
+            mesh_rot_z=args.mesh_rot_z,
         )
         solid = geom.mark_solid(args.nz, args.ny, args.nx)
         ibm_enabled = args.mesh_bc == "ibm"
@@ -218,6 +273,9 @@ def main() -> int:
                 tris, args.nz, args.ny, args.nx,
                 args.cx_frac, args.cy_frac, args.cz_frac, args.stl_fit,
                 args.mesh_orient,
+                mesh_rot_x=args.mesh_rot_x,
+                mesh_rot_y=args.mesh_rot_y,
+                mesh_rot_z=args.mesh_rot_z,
             )
             solid = phi_field <= 0.0
         D = geom.reference_length()
@@ -332,8 +390,9 @@ def main() -> int:
     else:
         phi_for_solver = None
 
-    # Solver
-    solver = Solver3D(
+    # Collect common Solver3D kwargs to allow multiblock reuse
+    _use_multiblock = (args.refine_z_lo is not None and args.refine_z_hi is not None)
+    _solver_kw = dict(
         Nz=args.nz, Ny=args.ny, Nx=args.nx,
         solid=solid,
         omega=omega,
@@ -351,6 +410,7 @@ def main() -> int:
         sponge_strength=args.sponge_strength,
         les=args.les,
         les_cs=args.les_cs,
+        les_model=args.les_model,
         bouzidi=args.bouzidi,
         van_driest=args.van_driest,
         van_driest_A=args.van_driest_A,
@@ -359,8 +419,37 @@ def main() -> int:
         body_force_x=args.body_force_x,
         body_force_y=args.body_force_y,
         body_force_z=args.body_force_z,
+        wall_velocity_top=args.wall_velocity_top,
+        wall_velocity_bottom=args.wall_velocity_bottom,
+        synthetic_inflow=args.synthetic_inflow,
+        synthetic_inflow_intensity=args.synthetic_inflow_intensity,
+        sem_inlet=args.sem_inlet,
+        sem_Tu=args.sem_tu,
+        sem_L_int=args.sem_lint,
+        sem_N=args.sem_n,
+        thermal=args.thermal,
+        T_hot=args.T_hot,
+        T_cold=args.T_cold,
+        alpha_T=args.alpha_T,
+        buoyancy=args.buoyancy,
+        g_gravity=args.g_gravity,
+        beta=args.beta,
+        T_ref=args.T_ref,
     )
-    print(f"Surf links: {solver.surface_links.shape[0]}")
+    if _use_multiblock:
+        from aero.lbm.multiblock import MultiblockSolver3D
+        _mb_kw = {k: v for k, v in _solver_kw.items() if k not in ("Nz", "Ny", "Nx", "solid")}
+        solver = MultiblockSolver3D(
+            Nz=args.nz, Ny=args.ny, Nx=args.nx,
+            solid=solid,
+            refine_z_lo=args.refine_z_lo,
+            refine_z_hi=args.refine_z_hi,
+            **_mb_kw,
+        )
+        print(f"Multi-block: refined z=[{args.refine_z_lo},{args.refine_z_hi})")
+    else:
+        solver = Solver3D(**_solver_kw)
+        print(f"Surf links: {solver.surface_links.shape[0]}")
     print()
 
     if args.resume_from:
@@ -388,6 +477,8 @@ def main() -> int:
         hdf5_every=args.hdf5_every or args.check_every,
     )
     elapsed = time.perf_counter() - t0
+    if autoconfig_report is not None:
+        result["autoconfig_report"] = autoconfig_report.as_dict()
 
     print()
     print("  === RESULTS ===")
@@ -399,6 +490,12 @@ def main() -> int:
     print(f"  Cl_z  (mean) = {result['Clz_mean']:.4f}  ±  {result['Clz_std']:.4f}")
     print(f"  Elapsed      = {elapsed:.1f} s  ({args.steps/elapsed:.0f} steps/s)")
     print(f"  Stop reason  = {result.get('stop_reason', 'max_steps')}")
+    if result.get("scalar_stats"):
+        scalar_stats = result["scalar_stats"]
+        print(
+            f"  Scalar       = mean {scalar_stats['mean']:.4f}  "
+            f"range [{scalar_stats['min']:.4f}, {scalar_stats['max']:.4f}]"
+        )
     if args.shape == "sphere":
         if abs(args.re - 20.0) < 1e-12:
             print(f"  Expected Cd  ≈ 2–5  (sphere Re=20; confinement can inflate drag)")
@@ -426,6 +523,19 @@ def main() -> int:
         )
 
     from aero.run_manifest import write_run_manifest
+    validation = build_validation_report(
+        mode="3d",
+        shape=args.shape,
+        params=vars(args),
+        cd=result.get("Cd_mean"),
+        grid_cd_values=result.get("grid_cd_values"),
+    )
+    uncertainty = build_uncertainty_report(
+        mode="3d",
+        shape=args.shape,
+        params=vars(args),
+        result=result,
+    )
     write_run_manifest(
         output_dir,
         {
@@ -440,10 +550,31 @@ def main() -> int:
             "Cly_std": float(result["Cly_std"]),
             "Clz_mean": float(result["Clz_mean"]),
             "Clz_std": float(result["Clz_std"]),
+            "Cmx_mean": float(result.get("Cmx_mean", 0.0)),
+            "Cmy_mean": float(result.get("Cmy_mean", 0.0)),
+            "Cmz_mean": float(result.get("Cmz_mean", 0.0)),
             "Cd_history": [float(x) for x in result.get("Cd_history", [])],
             "Cly_history": [float(x) for x in result.get("Cly_history", [])],
             "Clz_history": [float(x) for x in result.get("Clz_history", [])],
+            "Cmx_history": [float(x) for x in result.get("Cmx_history", [])],
+            "Cmy_history": [float(x) for x in result.get("Cmy_history", [])],
+            "Cmz_history": [float(x) for x in result.get("Cmz_history", [])],
             "volume_file": f"{args.shape}_re{args.re:.0f}_volume.vti" if args.export_vtk else None,
+            "stop_reason": result.get("stop_reason", "max_steps"),
+            "observables": result.get("observables"),
+            "scalar_stats": result.get("scalar_stats"),
+            "autoconfig_report": None if autoconfig_report is None else autoconfig_report.as_dict(),
+            "validation_report": {
+                "benchmark_status": validation.benchmark_status,
+                "grid_status": validation.grid_status,
+                "collision_status": validation.collision_status,
+                "overall_ok": validation.overall_ok,
+            },
+            "uncertainty_report": {
+                "overall_status": uncertainty.overall_status,
+                "summary": uncertainty.summary,
+                "components": uncertainty.components,
+            },
         },
     )
 

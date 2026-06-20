@@ -9,7 +9,7 @@ h5py is optional — when absent every method is a no-op and `HAS_HDF5 = False`.
 Usage (from solver or post-processing script)::
 
     writer = HDF5Writer("run.h5", Nz=Nz, Ny=Ny, Nx=Nx, dims=3)
-    writer.write_step(step=100, ux=ux, uy=uy, uz=uz, rho=rho)
+    writer.write_step(step=100, ux=ux, uy=uy, uz=uz, rho=rho, scalar=T)
     writer.close()   # finalises the XDMF file
 
 For 2D pass dims=2 and omit uz.
@@ -42,9 +42,25 @@ _XDMF_FOOTER = """\
 """
 
 
-def _xdmf_grid_3d(h5_basename: str, step: int, Nz: int, Ny: int, Nx: int) -> str:
+def _xdmf_grid_3d(
+    h5_basename: str,
+    step: int,
+    Nz: int,
+    Ny: int,
+    Nx: int,
+    include_scalar: bool = False,
+) -> str:
     grp = f"step_{step:08d}"
     dims = f"{Nz} {Ny} {Nx}"
+    scalar_attribute = ""
+    if include_scalar:
+        scalar_attribute = f"""\
+        <Attribute Name="scalar" AttributeType="Scalar" Center="Node">
+          <DataItem Format="HDF" DataType="Float" Precision="8" Dimensions="{dims}">
+            {h5_basename}:/{grp}/scalar
+          </DataItem>
+        </Attribute>
+"""
     return f"""\
       <Grid Name="{grp}" GridType="Uniform">
         <Time Value="{step}"/>
@@ -73,13 +89,29 @@ def _xdmf_grid_3d(h5_basename: str, step: int, Nz: int, Ny: int, Nx: int) -> str
             {h5_basename}:/{grp}/rho
           </DataItem>
         </Attribute>
+{scalar_attribute}\
       </Grid>
 """
 
 
-def _xdmf_grid_2d(h5_basename: str, step: int, Ny: int, Nx: int) -> str:
+def _xdmf_grid_2d(
+    h5_basename: str,
+    step: int,
+    Ny: int,
+    Nx: int,
+    include_scalar: bool = False,
+) -> str:
     grp = f"step_{step:08d}"
     dims = f"{Ny} {Nx}"
+    scalar_attribute = ""
+    if include_scalar:
+        scalar_attribute = f"""\
+        <Attribute Name="scalar" AttributeType="Scalar" Center="Node">
+          <DataItem Format="HDF" DataType="Float" Precision="8" Dimensions="{dims}">
+            {h5_basename}:/{grp}/scalar
+          </DataItem>
+        </Attribute>
+"""
     return f"""\
       <Grid Name="{grp}" GridType="Uniform">
         <Time Value="{step}"/>
@@ -103,6 +135,7 @@ def _xdmf_grid_2d(h5_basename: str, step: int, Ny: int, Nx: int) -> str:
             {h5_basename}:/{grp}/rho
           </DataItem>
         </Attribute>
+{scalar_attribute}\
       </Grid>
 """
 
@@ -148,6 +181,7 @@ class HDF5Writer:
         uy: np.ndarray,
         rho: np.ndarray,
         uz: Optional[np.ndarray] = None,
+        scalar: Optional[np.ndarray] = None,
     ) -> None:
         """Write one time step. uz is required for 3D."""
         if not self._active:
@@ -158,12 +192,31 @@ class HDF5Writer:
         grp.create_dataset("rho", data=rho.astype(np.float64), compression="gzip", compression_opts=4)
         if self._dims == 3 and uz is not None:
             grp.create_dataset("uz", data=uz.astype(np.float64), compression="gzip", compression_opts=4)
+        if scalar is not None:
+            grp.create_dataset("scalar", data=scalar.astype(np.float64), compression="gzip", compression_opts=4)
         grp.attrs["step"] = step
 
         if self._dims == 3:
-            self._grids.append(_xdmf_grid_3d(self._h5_basename, step, self._Nz, self._Ny, self._Nx))
+            self._grids.append(
+                _xdmf_grid_3d(
+                    self._h5_basename,
+                    step,
+                    self._Nz,
+                    self._Ny,
+                    self._Nx,
+                    include_scalar=scalar is not None,
+                )
+            )
         else:
-            self._grids.append(_xdmf_grid_2d(self._h5_basename, step, self._Ny, self._Nx))
+            self._grids.append(
+                _xdmf_grid_2d(
+                    self._h5_basename,
+                    step,
+                    self._Ny,
+                    self._Nx,
+                    include_scalar=scalar is not None,
+                )
+            )
 
     def close(self) -> None:
         """Flush HDF5 and write the companion XDMF file."""

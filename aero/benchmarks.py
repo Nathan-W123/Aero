@@ -41,6 +41,23 @@ class GridStudyResult:
     message: str
 
 
+@dataclass
+class UncertaintyReport:
+    overall_status: str
+    summary: str
+    components: Dict[str, Dict[str, Any]]
+
+
+@dataclass
+class ScalarValidationResult:
+    status: str
+    message: str
+    rmse: float
+    max_error: float
+    mean_profile: List[float]
+    reference_profile: List[float]
+
+
 def schiller_naumann_cd(re: float) -> float:
     """Drag coefficient for a sphere (Schiller–Naumann correlation)."""
     re = max(float(re), 1e-6)
@@ -209,16 +226,16 @@ def validate_bc_config(
     inlet_perturbation: float = 0.0,
 ) -> List[str]:
     warnings: List[str] = []
-    wall_bc = wall_bc.lower()
-    outlet_bc = outlet_bc.lower()
-    inlet_bc = inlet_bc.lower()
+    wall_bc = (wall_bc or "slip").lower()
+    outlet_bc = (outlet_bc or "convective").lower()
+    inlet_bc = (inlet_bc or "velocity").lower()
 
     if outlet_bc not in {"convective", "zerogradient"}:
         warnings.append(f"Unknown outlet_bc '{outlet_bc}' — use convective or zerogradient.")
 
     if mode == "2d":
-        if wall_bc not in {"slip", "noslip"}:
-            warnings.append(f"Unknown wall_bc '{wall_bc}' — use slip or noslip.")
+        if wall_bc not in {"slip", "noslip", "moving"}:
+            warnings.append(f"Unknown wall_bc '{wall_bc}' — use slip, noslip, or moving.")
         if inlet_bc not in {"velocity", "pressure"}:
             warnings.append(f"Unknown inlet_bc '{inlet_bc}' — use velocity or pressure.")
         if re > 47 and inlet_perturbation <= 0 and wall_bc == "slip":
@@ -227,8 +244,8 @@ def validate_bc_config(
                 "vortex shedding may not trigger; try inlet_perturbation ≥ 0.02 or noslip walls."
             )
     else:
-        if wall_bc not in {"slip", "noslip"}:
-            warnings.append(f"Unknown wall_bc '{wall_bc}' — use slip or noslip.")
+        if wall_bc not in {"slip", "noslip", "moving"}:
+            warnings.append(f"Unknown wall_bc '{wall_bc}' — use slip, noslip, or moving.")
         if re > 47 and inlet_perturbation <= 0 and wall_bc == "slip":
             warnings.append(
                 "Re > 47 with slip walls and no inlet perturbation — "
@@ -309,13 +326,15 @@ def build_validation_report(
 
     bc_warnings = validate_bc_config(
         mode=mode,
-        wall_bc=params.get("wall_bc", "slip"),
-        outlet_bc=params.get("outlet_bc", "convective"),
-        inlet_bc=params.get("inlet_bc", "velocity"),
+        wall_bc=params.get("wall_bc") or "slip",
+        outlet_bc=params.get("outlet_bc") or "convective",
+        inlet_bc=params.get("inlet_bc") or "velocity",
         re=re,
         inlet_perturbation=float(params.get("inlet_perturbation", "0") or "0"),
     )
-    c_status, c_msg = assess_collision(re=re, tau=tau, collision=params.get("collision", "bgk"))
+    c_status, c_msg = assess_collision(
+        re=re, tau=tau, collision=params.get("collision") or "bgk",
+    )
 
     bc_warnings = list(bc_warnings)
     les_enabled = str(params.get("les", "false")).lower() in ("true", "1", "yes")
@@ -393,3 +412,314 @@ def backward_facing_step_reattachment_length(
         if line[x] > 0.0:
             return float(x - step_index)
     return None
+
+
+def validate_scalar_diffusion_profile(
+    scalar: np.ndarray,
+    *,
+    T_hot: float,
+    T_cold: float,
+    wall_axis: int = -2,
+    solid: Optional[np.ndarray] = None,
+    pass_rmse: float = 0.03,
+    warn_rmse: float = 0.06,
+) -> ScalarValidationResult:
+    """
+    Validate a wall-bounded passive-scalar diffusion profile against the linear steady solution.
+
+    This benchmark corresponds to pure diffusion between two isothermal/isoconcentration walls.
+    For 2D fields `(Ny, Nx)`, use `wall_axis=0`. For 3D fields `(Nz, Ny, Nx)`, use `wall_axis=1`.
+    """
+    field = np.asarray(scalar, dtype=np.float64)
+    if field.ndim not in (2, 3):
+        raise ValueError("scalar must be a 2D or 3D field.")
+    axis = wall_axis if wall_axis >= 0 else field.ndim + wall_axis
+    if axis < 0 or axis >= field.ndim:
+        raise ValueError("wall_axis out of bounds for scalar field.")
+
+    if solid is not None:
+        mask = np.asarray(solid, dtype=bool)
+        if mask.shape != field.shape:
+            raise ValueError("solid mask must match scalar field shape.")
+        field = field.copy()
+        field[mask] = np.nan
+
+    reduce_axes = tuple(i for i in range(field.ndim) if i != axis)
+    profile = np.nanmean(field, axis=reduce_axes)
+    coords = np.arange(profile.size, dtype=np.float64)
+    reference = float(T_hot) + (float(T_cold) - float(T_hot)) * coords / max(profile.size - 1, 1)
+    interior = slice(1, -1) if profile.size > 2 else slice(0, profile.size)
+    error = np.asarray(profile[interior] - reference[interior], dtype=np.float64)
+    rmse = float(np.sqrt(np.mean(error * error))) if error.size else 0.0
+    max_error = float(np.max(np.abs(error))) if error.size else 0.0
+
+    if rmse <= pass_rmse:
+        status = "pass"
+    elif rmse <= warn_rmse:
+        status = "warn"
+    else:
+        status = "fail"
+
+    return ScalarValidationResult(
+        status=status,
+        message=f"Scalar diffusion RMSE={rmse:.4f}, max error={max_error:.4f} against linear steady profile.",
+        rmse=rmse,
+        max_error=max_error,
+        mean_profile=[float(x) for x in profile],
+        reference_profile=[float(x) for x in reference],
+    )
+
+
+def run_scalar_diffusion_benchmark_2d(
+    *,
+    Ny: int = 32,
+    Nx: int = 8,
+    omega: float = 1.5,
+    alpha_T: float = 0.1,
+    steps: int = 3000,
+    T_hot: float = 1.0,
+    T_cold: float = 0.0,
+    backend: str = "numpy",
+) -> Dict[str, Any]:
+    """
+    Run the canonical 2D passive-scalar diffusion benchmark.
+
+    The reference solution is linear in the wall-normal direction for zero flow,
+    with prescribed bottom/top scalar values.
+    """
+    from .lbm.solver import Solver
+
+    solid = np.zeros((int(Ny), int(Nx)), dtype=bool)
+    solver = Solver(
+        Ny=int(Ny),
+        Nx=int(Nx),
+        solid=solid,
+        omega=float(omega),
+        u0=0.0,
+        D=max(float(Ny) / 2.0, 1.0),
+        backend=backend,
+        inlet_bc="pressure",
+        outlet_bc="pressure",
+        thermal=True,
+        T_hot=float(T_hot),
+        T_cold=float(T_cold),
+        alpha_T=float(alpha_T),
+        buoyancy=False,
+    )
+    result = solver.run(steps=int(steps), check_every=max(int(steps), 1), verbose=False)
+    scalar_validation = validate_scalar_diffusion_profile(
+        result["scalar"],
+        T_hot=T_hot,
+        T_cold=T_cold,
+        wall_axis=0,
+        solid=solid,
+    )
+    result["scalar_validation"] = _json_ready_report(scalar_validation)
+    return result
+
+
+def _status_rank(status: str) -> int:
+    return {"pass": 0, "n/a": 1, "warn": 2, "fail": 3}.get(str(status).lower(), 2)
+
+
+def _combine_statuses(statuses: List[str]) -> str:
+    if not statuses:
+        return "n/a"
+    return max(statuses, key=_status_rank)
+
+
+def _json_ready_report(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if hasattr(value, "__dataclass_fields__"):
+        return {key: _json_ready_report(getattr(value, key)) for key in value.__dataclass_fields__}
+    if isinstance(value, dict):
+        return {str(key): _json_ready_report(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready_report(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _blockage_component(mode: str, shape: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    d = reference_length_cells(mode, shape, params)
+    ny = max(float(params.get("ny", 1) or 1), 1.0)
+    if mode == "3d":
+        nz = max(float(params.get("nz", ny) or ny), 1.0)
+        ratio_y = d / ny
+        ratio_z = d / nz
+        ratio = max(ratio_y, ratio_z)
+        detail = f"Cross-stream blockage y={ratio_y*100:.1f}%, z={ratio_z*100:.1f}%."
+    else:
+        ratio = d / ny
+        detail = f"Blockage ratio D/Ny={ratio*100:.1f}%."
+    if ratio < 0.10:
+        status = "pass"
+    elif ratio < 0.20:
+        status = "warn"
+    else:
+        status = "fail"
+    return {
+        "status": status,
+        "value": float(ratio),
+        "message": detail,
+    }
+
+
+def _domain_length_component(mode: str, shape: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    nx = max(float(params.get("nx", 1) or 1), 1.0)
+    d = max(reference_length_cells(mode, shape, params), 1.0)
+    cx_frac = float(params.get("cx_frac", 1.0 / 3.0) or (1.0 / 3.0))
+    center_x = cx_frac * nx
+    upstream = center_x / d
+    downstream = max(nx - center_x, 0.0) / d
+    if upstream >= 5.0 and downstream >= 15.0:
+        status = "pass"
+    elif upstream >= 3.0 and downstream >= 8.0:
+        status = "warn"
+    else:
+        status = "fail"
+    return {
+        "status": status,
+        "value": {"upstream_D": float(upstream), "downstream_D": float(downstream)},
+        "message": f"Upstream length={upstream:.1f}D, downstream length={downstream:.1f}D.",
+    }
+
+
+def _statistical_component(mode: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    cd_history = np.asarray(result.get("Cd_history", []), dtype=np.float64)
+    if cd_history.size == 0:
+        return {"status": "n/a", "value": None, "message": "No coefficient history available."}
+    window = max(int(min(cd_history.size, max(cd_history.size // 5, 20))), 1)
+    tail = cd_history[-window:]
+    cd_mean = float(np.mean(tail))
+    cd_std = float(np.std(tail, ddof=1)) if tail.size > 1 else 0.0
+    cd_sem95 = 1.96 * cd_std / max(np.sqrt(tail.size), 1.0)
+    lift_key = "Cl_history" if mode == "2d" else "Cly_history"
+    lift_history = np.asarray(result.get(lift_key, []), dtype=np.float64)
+    lift_tail = lift_history[-window:] if lift_history.size else np.asarray([], dtype=np.float64)
+    lift_sem95 = 0.0
+    if lift_tail.size > 1:
+        lift_sem95 = float(1.96 * np.std(lift_tail, ddof=1) / np.sqrt(lift_tail.size))
+    rel_cd = abs(cd_sem95) / max(abs(cd_mean), 1e-12)
+    if rel_cd < 0.01:
+        status = "pass"
+    elif rel_cd < 0.05:
+        status = "warn"
+    else:
+        status = "fail"
+    return {
+        "status": status,
+        "value": {
+            "window": int(window),
+            "cd_sem95": float(cd_sem95),
+            "cd_relative_sem95": float(rel_cd),
+            "lift_sem95": float(lift_sem95),
+        },
+        "message": f"Trailing-window 95% Cd uncertainty is {rel_cd*100:.2f}% over {window} samples.",
+    }
+
+
+def _discretization_component(result: Dict[str, Any]) -> Dict[str, Any]:
+    grid_cd_values = result.get("grid_cd_values")
+    if not grid_cd_values:
+        return {
+            "status": "n/a",
+            "value": None,
+            "message": "No grid study attached to this run.",
+        }
+    values = [float(value) for value in grid_cd_values]
+    status, message = assess_grid_convergence(values)
+    observed_order = observed_order_of_convergence(values)
+    extrapolated = richardson_extrapolation(values, observed_order=observed_order)
+    fine_error = None
+    if extrapolated is not None and values:
+        fine_error = abs(values[-1] - extrapolated) / max(abs(extrapolated), 1e-12)
+    return {
+        "status": status,
+        "value": {
+            "cd_values": values,
+            "observed_order": observed_order,
+            "extrapolated_cd": extrapolated,
+            "fine_relative_error": fine_error,
+        },
+        "message": message,
+    }
+
+
+def _convergence_component(result: Dict[str, Any]) -> Dict[str, Any]:
+    convergence = _json_ready_report(result.get("convergence_report"))
+    strouhal = _json_ready_report(result.get("strouhal_report"))
+    stop_reason = str(result.get("stop_reason", "max_steps"))
+    if convergence is None and strouhal is None:
+        return {
+            "status": "n/a",
+            "value": {"stop_reason": stop_reason},
+            "message": "No convergence metadata recorded.",
+        }
+    status = "pass" if stop_reason == "auto_converged" else "warn"
+    return {
+        "status": status,
+        "value": {
+            "stop_reason": stop_reason,
+            "convergence_report": convergence,
+            "strouhal_report": strouhal,
+        },
+        "message": f"Run stopped with reason '{stop_reason}'.",
+    }
+
+
+def _bc_sensitivity_component(mode: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    warnings = validate_bc_config(
+        mode=mode,
+        wall_bc=str(params.get("wall_bc", "slip")),
+        outlet_bc=str(params.get("outlet_bc", "convective")),
+        inlet_bc=str(params.get("inlet_bc", "velocity")),
+        re=float(params.get("re", 100.0) or 100.0),
+        inlet_perturbation=float(params.get("inlet_perturbation", 0.0) or 0.0),
+    )
+    streamwise_bc = str(params.get("streamwise_bc", "") or "")
+    if streamwise_bc in {"periodic", "recycling"}:
+        warnings.append(
+            f"Streamwise BC '{streamwise_bc}' is configured; compare against alternate inlet/outlet treatments for sensitivity."
+        )
+    status = "pass" if not warnings else "warn"
+    return {
+        "status": status,
+        "value": {"warnings": warnings, "streamwise_bc": streamwise_bc or None},
+        "message": "No obvious BC sensitivity concerns." if not warnings else "Boundary-condition sensitivity review recommended.",
+    }
+
+
+def build_uncertainty_report(
+    *,
+    mode: str,
+    shape: str,
+    params: Dict[str, Any],
+    result: Dict[str, Any],
+) -> UncertaintyReport:
+    """
+    Build a JSON-ready uncertainty budget from one completed run.
+
+    This focuses on the major research-review axes already visible in the codebase:
+    discretization, blockage, domain extent, statistical uncertainty, convergence,
+    and boundary-condition sensitivity.
+    """
+    components = {
+        "discretization": _discretization_component(result),
+        "blockage": _blockage_component(mode, shape, params),
+        "domain_length": _domain_length_component(mode, shape, params),
+        "statistical": _statistical_component(mode, result),
+        "convergence": _convergence_component(result),
+        "bc_sensitivity": _bc_sensitivity_component(mode, params),
+    }
+    overall_status = _combine_statuses([component["status"] for component in components.values()])
+    summary = "; ".join(
+        f"{name}={component['status']}" for name, component in components.items()
+    )
+    return UncertaintyReport(
+        overall_status=overall_status,
+        summary=summary,
+        components=components,
+    )

@@ -29,6 +29,34 @@ def orient_mesh_for_tunnel(triangles: np.ndarray) -> np.ndarray:
     return rotated.reshape(-1, 3, 3)
 
 
+def rotation_matrix_xyz(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    """Rotation about tunnel axes x→stream, y→vertical, z→span (degrees)."""
+    rx, ry, rz = np.deg2rad([rx_deg, ry_deg, rz_deg])
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    rx_m = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
+    ry_m = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+    rz_m = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rx_m @ ry_m @ rz_m
+
+
+def apply_mesh_rotation(
+    triangles: np.ndarray,
+    rx_deg: float,
+    ry_deg: float,
+    rz_deg: float,
+) -> np.ndarray:
+    """Rotate mesh about its centroid using tunnel-axis angles (applied after PCA)."""
+    if max(abs(rx_deg), abs(ry_deg), abs(rz_deg)) < 1e-12:
+        return triangles
+    verts = triangles.reshape(-1, 3)
+    centre = verts.mean(axis=0)
+    xc = verts - centre
+    rot = rotation_matrix_xyz(rx_deg, ry_deg, rz_deg)
+    return (xc @ rot).reshape(-1, 3, 3)
+
+
 def scale_and_place_mesh(
     triangles: np.ndarray,
     Nz: int,
@@ -75,13 +103,20 @@ def prepare_mesh_triangles(
     fit_frac: float = 0.35,
     mesh_orient: str = "auto",
     manual_scale: float | None = None,
+    mesh_rot_x: float = 0.0,
+    mesh_rot_y: float = 0.0,
+    mesh_rot_z: float = 0.0,
 ) -> tuple[np.ndarray, float]:
-    """Orient (optional), scale, and place triangles on the LBM grid."""
+    """Orient (optional), rotate, scale, and place triangles on the LBM grid."""
     tris = triangles
     if mesh_orient == "auto":
         tris = orient_mesh_for_tunnel(tris)
     elif mesh_orient not in ("none", ""):
         raise ValueError(f"Unknown mesh_orient '{mesh_orient}'. Use 'auto' or 'none'.")
+    else:
+        verts = tris.reshape(-1, 3)
+        tris = (verts - verts.mean(axis=0)).reshape(-1, 3, 3)
+    tris = apply_mesh_rotation(tris, mesh_rot_x, mesh_rot_y, mesh_rot_z)
     return scale_and_place_mesh(
         tris, Nz, Ny, Nx, cx_frac, cy_frac, cz_frac, fit_frac, manual_scale
     )

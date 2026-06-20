@@ -75,6 +75,9 @@ class MeshMask(Geometry3D):
         fit_frac: float = 0.35,
         mesh_orient: str = "auto",
         scale: Optional[float] = None,
+        mesh_rot_x: float = 0.0,
+        mesh_rot_y: float = 0.0,
+        mesh_rot_z: float = 0.0,
     ):
         self.path = path
         self.cx_frac = cx_frac
@@ -82,6 +85,9 @@ class MeshMask(Geometry3D):
         self.cz_frac = cz_frac
         self.fit_frac = max(float(fit_frac), 0.05)
         self.mesh_orient = mesh_orient
+        self.mesh_rot_x = float(mesh_rot_x)
+        self.mesh_rot_y = float(mesh_rot_y)
+        self.mesh_rot_z = float(mesh_rot_z)
         self.manual_scale = float(scale) if scale is not None else None
         self._triangles = load_stl_triangles(path)
         self._reference_length: Optional[float] = None
@@ -100,6 +106,9 @@ class MeshMask(Geometry3D):
             self.fit_frac,
             self.mesh_orient,
             self.manual_scale,
+            self.mesh_rot_x,
+            self.mesh_rot_y,
+            self.mesh_rot_z,
         )
 
     def mark_solid(self, Nz: int, Ny: int, Nx: int) -> np.ndarray:

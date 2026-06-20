@@ -34,6 +34,9 @@ def build_mesh_preview(
     cz_frac: float = 0.5,
     fit_frac: float = 0.35,
     mesh_orient: str = "auto",
+    mesh_rot_x: float = 0.0,
+    mesh_rot_y: float = 0.0,
+    mesh_rot_z: float = 0.0,
 ) -> Optional[MeshPreviewResult]:
     path = Path(stl_path)
     if not path.is_file():
@@ -45,6 +48,9 @@ def build_mesh_preview(
         cz_frac=cz_frac,
         fit_frac=fit_frac,
         mesh_orient=mesh_orient,
+        mesh_rot_x=mesh_rot_x,
+        mesh_rot_y=mesh_rot_y,
+        mesh_rot_z=mesh_rot_z,
     )
     solid = geom.mark_solid(nz, ny, nx)
     by, bz, blk = compute_frontal_blockage(solid)

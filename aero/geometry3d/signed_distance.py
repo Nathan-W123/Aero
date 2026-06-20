@@ -161,6 +161,9 @@ def compute_phi_field(
     cz_frac: float = 0.5,
     fit_frac: float = 0.35,
     mesh_orient: str = "auto",
+    mesh_rot_x: float = 0.0,
+    mesh_rot_y: float = 0.0,
+    mesh_rot_z: float = 0.0,
     band_width: int = 3,
     far_value: float = 16.0,
 ) -> np.ndarray:
@@ -190,7 +193,8 @@ def compute_phi_field(
     """
     # 1. Orient, scale, place triangles in grid space
     tris, _ = prepare_mesh_triangles(
-        triangles, nz, ny, nx, cx_frac, cy_frac, cz_frac, fit_frac, mesh_orient
+        triangles, nz, ny, nx, cx_frac, cy_frac, cz_frac, fit_frac, mesh_orient,
+        mesh_rot_x=mesh_rot_x, mesh_rot_y=mesh_rot_y, mesh_rot_z=mesh_rot_z,
     )
 
     # 2. Build grid cell-centre coordinates  (N, 3) in (x, y, z) order

@@ -11,7 +11,14 @@ import numpy as np
 import pytest
 
 from aero.lbm.d2q9 import compute_feq
-from aero.forces import compute_forces, forces_to_coefficients, compute_force_split_2d, split_to_coefficients
+from aero.forces import (
+    compute_forces,
+    forces_to_coefficients,
+    compute_force_split_2d,
+    split_to_coefficients,
+    compute_force_moment_2d,
+    moment_to_coefficient_2d,
+)
 from aero.lbm.boundary import build_surface_links
 
 
@@ -83,3 +90,15 @@ def test_force_split_sums_to_momentum_exchange(feq_uniform):
     cdp, _, cdv, _ = split_to_coefficients(fx_p, fy_p, fx_v, fy_v, RHO0, U0, 16.0)
     cd, _ = forces_to_coefficients(Fx, Fy, RHO0, U0, 16.0)
     assert abs(cdp + cdv - cd) < 1e-12
+
+
+def test_force_moment_zero_for_uniform_equilibrium(feq_uniform):
+    solid = np.zeros((Ny, Nx), dtype=bool)
+    links, _ = build_surface_links(solid)
+    Fx, Fy, Mz = compute_force_moment_2d(
+        feq_uniform, feq_uniform, links, center_x=Nx / 2.0, center_y=Ny / 2.0
+    )
+    assert Fx == 0.0
+    assert Fy == 0.0
+    assert Mz == 0.0
+    assert moment_to_coefficient_2d(Mz, RHO0, U0, 16.0) == 0.0

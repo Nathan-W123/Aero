@@ -35,12 +35,15 @@ from .kernels3d import collision_kernel_3d_xp, stream_kernel_3d_xp
 from .kernels3d_mrt import MRTKernel3D
 from .boundary3d import (
     apply_inlet_zou_he_3d,
+    apply_inlet_sem_3d,
+    apply_inlet_velocity_field_3d,
     apply_outlet_zero_gradient_3d,
     apply_outlet_convective_3d,
     apply_streamwise_periodic_3d,
     apply_recycling_rescaling_inlet_3d,
     apply_slip_walls_3d,
     apply_noslip_walls_3d,
+    apply_moving_walls_3d,
     build_surface_links_3d,
     apply_bounce_back_3d,
     apply_bounce_back_bouzidi_3d,
@@ -48,10 +51,14 @@ from .boundary3d import (
 from ..forces3d import (
     compute_forces_3d,
     compute_force_split_3d,
+    compute_force_moment_3d,
     forces_to_coefficients_3d,
+    moments_to_coefficients_3d,
+    spanwise_force_profile_3d,
     split_to_coefficients_3d,
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
+from ..observables import coefficient_spectrum
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
 from .physics import base_nu_from_omega
@@ -83,6 +90,7 @@ class Solver3D:
         sponge_strength: float = 0.1,
         les: bool = False,
         les_cs: float = 0.16,
+        les_model: str = "smagorinsky",
         ibm_enabled: bool = False,
         phi: Optional[np.ndarray] = None,
         bouzidi: bool = False,
@@ -91,6 +99,23 @@ class Solver3D:
         body_force_x: float = 0.0,
         body_force_y: float = 0.0,
         body_force_z: float = 0.0,
+        wall_velocity_top: float = 0.0,
+        wall_velocity_bottom: float = 0.0,
+        synthetic_inflow: bool = False,
+        synthetic_inflow_intensity: float = 0.03,
+        synthetic_inflow_seed: int = 12345,
+        sem_inlet: bool = False,
+        sem_Tu: float = 0.05,
+        sem_L_int: float = 10.0,
+        sem_N: int = 200,
+        thermal: bool = False,
+        T_hot: float = 1.0,
+        T_cold: float = 0.0,
+        alpha_T: float = 1e-3,
+        buoyancy: bool = False,
+        g_gravity: float = 0.0,
+        beta: float = 1e-3,
+        T_ref: float = 0.5,
     ):
         """
         Parameters
@@ -131,6 +156,9 @@ class Solver3D:
         self.sponge_strength = float(sponge_strength)
         self.les = bool(les)
         self.les_cs = float(les_cs)
+        if les_model not in ("smagorinsky", "wale"):
+            raise ValueError("les_model must be 'smagorinsky' or 'wale'.")
+        self.les_model = str(les_model)
         self.ibm_enabled = bool(ibm_enabled)
         self.phi = phi
         self.bouzidi = bool(bouzidi)
@@ -139,6 +167,25 @@ class Solver3D:
         self.body_force_x = float(body_force_x)
         self.body_force_y = float(body_force_y)
         self.body_force_z = float(body_force_z)
+        self.wall_velocity_top = float(wall_velocity_top)
+        self.wall_velocity_bottom = float(wall_velocity_bottom)
+        self.synthetic_inflow = bool(synthetic_inflow)
+        self.synthetic_inflow_intensity = float(synthetic_inflow_intensity)
+        self._rng = np.random.default_rng(int(synthetic_inflow_seed))
+        self.sem_inlet = bool(sem_inlet)
+        self._sem = None
+        if self.sem_inlet:
+            from .sem_inlet import SEMInlet
+            self._sem = SEMInlet(Ny, Nz, u0, float(sem_Tu), float(sem_L_int), int(sem_N))
+        self.thermal = bool(thermal)
+        self.T_hot = float(T_hot)
+        self.T_cold = float(T_cold)
+        self.alpha_T = float(alpha_T)
+        self.omega_T = float(1.0 / (3.0 * alpha_T + 0.5))
+        self.buoyancy = bool(buoyancy)
+        self.g_gravity = float(g_gravity)
+        self.beta = float(beta)
+        self.T_ref = float(T_ref)
         self.tau = 1.0 / omega
         self._base_nu = base_nu_from_omega(omega)
         if collision not in ("bgk", "mrt", "trt"):
@@ -178,6 +225,11 @@ class Solver3D:
         self._ey = E3[:, 1].astype(np.int32)
         self._ez = E3[:, 2].astype(np.int32)
         self._w  = W3.copy()
+        # Keep numpy copies for thermal (needed even when CuPy overwrites above)
+        self._ex_np = E3[:, 0].astype(np.int32)
+        self._ey_np = E3[:, 1].astype(np.int32)
+        self._ez_np = E3[:, 2].astype(np.int32)
+        self._w_np  = W3.copy()
         self._mrt_kernel = None
 
         self.solid = np.ascontiguousarray(solid, dtype=np.bool_)
@@ -201,6 +253,8 @@ class Solver3D:
         self._u_wall_y = np.zeros((Nz, Ny, Nx))
         self._u_wall_z = np.zeros((Nz, Ny, Nx))
         self._omega_dummy = np.zeros((Nz, Ny, Nx), dtype=np.float64)
+        self._inlet_uy_field = np.zeros((Nz, Ny), dtype=np.float64)
+        self._inlet_uz_field = np.zeros((Nz, Ny), dtype=np.float64)
 
         # Transfer domain arrays to GPU when using CuPy
         if self._use_cupy:
@@ -220,11 +274,51 @@ class Solver3D:
             self.q_vals = xp.asarray(self.q_vals)
 
         self.step_count: int = 0
+
+        # Thermal distribution
+        self.g: Optional[np.ndarray] = None
+        if self.thermal:
+            from .thermal import init_g_3d
+            self.g = init_g_3d(self.T_ref, Nz, Ny, Nx, self._w_np, self._ex_np, self._ey_np, self._ez_np)
+
         self.Cd_history: List[float] = []
         self.Cly_history: List[float] = []
         self.Clz_history: List[float] = []
+        self.Cmx_history: List[float] = []
+        self.Cmy_history: List[float] = []
+        self.Cmz_history: List[float] = []
         self.Cd_p_history: List[float] = []
         self.Cd_v_history: List[float] = []
+        solid_z, solid_y, solid_x = np.where(self.solid)
+        self._ref_center_z = float(np.mean(solid_z)) if solid_z.size else 0.5 * (Nz - 1)
+        self._ref_center_y = float(np.mean(solid_y)) if solid_y.size else 0.5 * (Ny - 1)
+        self._ref_center_x = float(np.mean(solid_x)) if solid_x.size else 0.5 * (Nx - 1)
+
+    def _update_synthetic_inflow(self) -> tuple[np.ndarray, np.ndarray]:
+        if not self.synthetic_inflow:
+            shape = (self.Nz, self.Ny)
+            return np.zeros(shape, dtype=np.float64), np.zeros(shape, dtype=np.float64)
+        noise_y = self._rng.standard_normal((self.Nz, self.Ny))
+        noise_z = self._rng.standard_normal((self.Nz, self.Ny))
+        filt_y = (
+            noise_y + np.roll(noise_y, 1, axis=0) + np.roll(noise_y, -1, axis=0)
+            + np.roll(noise_y, 1, axis=1) + np.roll(noise_y, -1, axis=1)
+        ) / 5.0
+        filt_z = (
+            noise_z + np.roll(noise_z, 1, axis=0) + np.roll(noise_z, -1, axis=0)
+            + np.roll(noise_z, 1, axis=1) + np.roll(noise_z, -1, axis=1)
+        ) / 5.0
+        self._inlet_uy_field = 0.8 * self._inlet_uy_field + 0.2 * filt_y
+        self._inlet_uz_field = 0.8 * self._inlet_uz_field + 0.2 * filt_z
+        self._inlet_uy_field -= float(np.mean(self._inlet_uy_field))
+        self._inlet_uz_field -= float(np.mean(self._inlet_uz_field))
+        target = self.synthetic_inflow_intensity * self.u0
+        rms = float(np.sqrt(np.mean(self._inlet_uy_field ** 2 + self._inlet_uz_field ** 2)))
+        if rms > 1e-12 and target > 0.0:
+            scale = target / rms
+            self._inlet_uy_field *= scale
+            self._inlet_uz_field *= scale
+        return self._inlet_uy_field.copy(), self._inlet_uz_field.copy()
 
     # ------------------------------------------------------------------
 
@@ -243,6 +337,7 @@ class Solver3D:
         if self.les:
             omega_field = build_omega_field_3d(
                 f, self.solid, self.fluid, self._base_nu, self.omega, self.les_cs,
+                les_model=self.les_model,
                 phi=self.phi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             )
             use_omega_field = True
@@ -336,12 +431,25 @@ class Solver3D:
 
         if self.streamwise_bc == "open":
             if self.inlet_bc == "velocity":
-                apply_inlet_zou_he_3d(
-                    f_post,
-                    self.u0,
-                    uz_amp=self.inlet_perturbation,
-                    step=self.step_count + 1,
-                )
+                if self._sem is not None:
+                    self._sem.step()
+                    du, dv, dw = self._sem.fluctuation()
+                    apply_inlet_sem_3d(f_post, self.u0, du, dv, dw)
+                elif self.synthetic_inflow:
+                    uy_in, uz_in = self._update_synthetic_inflow()
+                    apply_inlet_velocity_field_3d(
+                        f_post,
+                        np.full((self.Nz, self.Ny), self.u0, dtype=np.float64),
+                        uy_in,
+                        uz_in,
+                    )
+                else:
+                    apply_inlet_zou_he_3d(
+                        f_post,
+                        self.u0,
+                        uz_amp=self.inlet_perturbation,
+                        step=self.step_count + 1,
+                    )
 
             if self.outlet_bc == "convective":
                 apply_outlet_convective_3d(f_post, self._f_outlet_prev, self.u0)
@@ -362,6 +470,37 @@ class Solver3D:
             apply_slip_walls_3d(f_post)
         elif self.wall_bc == "noslip":
             apply_noslip_walls_3d(f_post)
+        elif self.wall_bc == "moving":
+            apply_moving_walls_3d(
+                f_post,
+                u_top=self.wall_velocity_top,
+                u_bottom=self.wall_velocity_bottom,
+            )
+
+        # Thermal step (CPU only; g stays on numpy even with CuPy f)
+        if self.thermal and self.g is not None:
+            from .thermal import (
+                collide_g_3d, stream_g_3d, extract_T,
+                apply_temperature_bc_3d, guo_buoyancy_force_3d,
+            )
+            f_cpu = f_post.get() if self._use_cupy else f_post
+            rho_now, ux_now, uy_now, uz_now = compute_macroscopic_3d(f_cpu)
+            T_now = extract_T(self.g)
+            if self.buoyancy:
+                from .d3q19 import E3
+                F_b = guo_buoyancy_force_3d(
+                    rho_now, T_now, self.T_ref,
+                    self.g_gravity, self.beta, E3[:, 1], self._w_np,
+                )
+                if self._use_cupy:
+                    f_post = f_post + self._xp.asarray(F_b)
+                else:
+                    f_post = f_post + F_b
+            solid_cpu = self.solid.get() if self._use_cupy else self.solid
+            g_post = collide_g_3d(self.g, ux_now, uy_now, uz_now, T_now, self.omega_T, solid_cpu)
+            g_post = stream_g_3d(g_post, self._ex_np, self._ey_np, self._ez_np)
+            apply_temperature_bc_3d(g_post, self.T_hot, self.T_cold, self._w_np, self._ex_np, self._ey_np, self._ez_np)
+            self.g = g_post
 
         self.f = f_post
         self.step_count += 1
@@ -384,6 +523,21 @@ class Solver3D:
         )
         self._last_cd_p = cdp
         self._last_cd_v = cdv
+        _, _, _, mx, my, mz = compute_force_moment_3d(
+            f_pre_cpu,
+            f_post_cpu,
+            links_cpu,
+            center_x=self._ref_center_x,
+            center_y=self._ref_center_y,
+            center_z=self._ref_center_z,
+        )
+        cmx, cmy, cmz = moments_to_coefficients_3d(mx, my, mz, self.rho0, self.u0, self.D)
+        self._last_cmx = cmx
+        self._last_cmy = cmy
+        self._last_cmz = cmz
+        self._last_spanwise_profile = spanwise_force_profile_3d(
+            f_pre_cpu, f_post_cpu, links_cpu, nz=self.Nz
+        )
         return Cd, Cly, Clz
 
     # ------------------------------------------------------------------
@@ -433,6 +587,9 @@ class Solver3D:
             self.Cd_history.append(Cd)
             self.Cly_history.append(Cly)
             self.Clz_history.append(Clz)
+            self.Cmx_history.append(getattr(self, "_last_cmx", 0.0))
+            self.Cmy_history.append(getattr(self, "_last_cmy", 0.0))
+            self.Cmz_history.append(getattr(self, "_last_cmz", 0.0))
             self.Cd_p_history.append(getattr(self, "_last_cd_p", 0.0))
             self.Cd_v_history.append(getattr(self, "_last_cd_v", 0.0))
 
@@ -442,9 +599,11 @@ class Solver3D:
 
             if hdf5_writer and hdf5_every and step % hdf5_every == 0:
                 from ..lbm.d3q19 import compute_macroscopic_3d as _cm3
+                from .thermal import extract_T as _extract_T
                 _f_cpu = self.f.get() if self._use_cupy else self.f
                 _rho, _ux, _uy, _uz = _cm3(_f_cpu)
-                hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, uz=_uz, rho=_rho)
+                _scalar = _extract_T(self.g) if (self.thermal and self.g is not None) else None
+                hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, uz=_uz, rho=_rho, scalar=_scalar)
 
             if step % check_every == 0:
                 # Use scalar stability check on the midplane slice
@@ -465,7 +624,8 @@ class Solver3D:
                     print(
                         f"  step {step:6d}/{steps}  "
                         f"Cd={Cd_avg:+.4f}  Cl_y={Cly_avg:+.4f}  "
-                        f"[{sps:.0f} steps/s]"
+                        f"[{sps:.0f} steps/s]",
+                        flush=True,
                     )
 
                 if callback is not None:
@@ -496,8 +656,30 @@ class Solver3D:
         Cd_arr  = np.array(self.Cd_history[-avg_window:])
         Cly_arr = np.array(self.Cly_history[-avg_window:])
         Clz_arr = np.array(self.Clz_history[-avg_window:])
+        Cmx_arr = np.array(self.Cmx_history[-avg_window:]) if self.Cmx_history else np.zeros(1)
+        Cmy_arr = np.array(self.Cmy_history[-avg_window:]) if self.Cmy_history else np.zeros(1)
+        Cmz_arr = np.array(self.Cmz_history[-avg_window:]) if self.Cmz_history else np.zeros(1)
         Cdp_arr = np.array(self.Cd_p_history[-avg_window:])
         Cdv_arr = np.array(self.Cd_v_history[-avg_window:])
+        scalar = None
+        scalar_stats = None
+        if self.thermal and self.g is not None:
+            from .thermal import extract_T
+            scalar = extract_T(self.g)
+            scalar_stats = {
+                "enabled": True,
+                "mean": float(np.mean(scalar)),
+                "std": float(np.std(scalar)),
+                "min": float(np.min(scalar)),
+                "max": float(np.max(scalar)),
+                "wall_hot": float(self.T_hot),
+                "wall_cold": float(self.T_cold),
+                "diffusivity": float(self.alpha_T),
+                "buoyancy": bool(self.buoyancy),
+                "gravity": float(self.g_gravity),
+                "beta": float(self.beta),
+                "reference": float(self.T_ref),
+            }
 
         if hdf5_writer:
             hdf5_writer.close()
@@ -508,18 +690,36 @@ class Solver3D:
             "Cd_std":     float(np.std(Cd_arr)),
             "Cly_std":    float(np.std(Cly_arr)),
             "Clz_std":    float(np.std(Clz_arr)),
+            "Cmx_mean":   float(np.mean(Cmx_arr)),
+            "Cmy_mean":   float(np.mean(Cmy_arr)),
+            "Cmz_mean":   float(np.mean(Cmz_arr)),
+            "Cmx_std":    float(np.std(Cmx_arr)),
+            "Cmy_std":    float(np.std(Cmy_arr)),
+            "Cmz_std":    float(np.std(Cmz_arr)),
             "Cd_p_mean":  float(np.mean(Cdp_arr)),
             "Cd_v_mean":  float(np.mean(Cdv_arr)),
             "Cd_history":  self.Cd_history,
             "Cly_history": self.Cly_history,
             "Clz_history": self.Clz_history,
+            "Cmx_history": self.Cmx_history,
+            "Cmy_history": self.Cmy_history,
+            "Cmz_history": self.Cmz_history,
             "Cd_p_history": self.Cd_p_history,
             "Cd_v_history": self.Cd_v_history,
+            "observables": {
+                "cd_spectrum": coefficient_spectrum(self.Cd_history),
+                "cly_spectrum": coefficient_spectrum(self.Cly_history),
+                "clz_spectrum": coefficient_spectrum(self.Clz_history),
+                "cmz_spectrum": coefficient_spectrum(self.Cmz_history),
+                "spanwise_force_profile_last": getattr(self, "_last_spanwise_profile", None),
+            },
             "steps_completed": self.step_count,
             "stop_reason": stop_reason,
             "convergence_report": last_convergence,
             "strouhal_report": last_strouhal,
             "rho": rho, "ux": ux, "uy": uy, "uz": uz,
+            "scalar": scalar,
+            "scalar_stats": scalar_stats,
         }
 
     # ------------------------------------------------------------------
@@ -545,10 +745,23 @@ class Solver3D:
             collision=self.collision, inlet_perturbation=self.inlet_perturbation,
             trt_lambda=self.trt_lambda, sponge_thickness=self.sponge_thickness,
             sponge_strength=self.sponge_strength, les=self.les, les_cs=self.les_cs,
+            les_model=self.les_model,
             ibm_enabled=self.ibm_enabled, bouzidi=self.bouzidi,
             van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             body_force_x=self.body_force_x, body_force_y=self.body_force_y,
             body_force_z=self.body_force_z,
+            wall_velocity_top=self.wall_velocity_top,
+            wall_velocity_bottom=self.wall_velocity_bottom,
+            synthetic_inflow=self.synthetic_inflow,
+            synthetic_inflow_intensity=self.synthetic_inflow_intensity,
+            thermal=self.thermal,
+            T_hot=self.T_hot,
+            T_cold=self.T_cold,
+            alpha_T=self.alpha_T,
+            buoyancy=self.buoyancy,
+            g_gravity=self.g_gravity,
+            beta=self.beta,
+            T_ref=self.T_ref,
         )
         kwargs: dict = dict(
             f=f_cpu, f_outlet_prev=fp_cpu,
@@ -556,12 +769,17 @@ class Solver3D:
             Cd_history=np.array(self.Cd_history,  dtype=np.float64),
             Cly_history=np.array(self.Cly_history, dtype=np.float64),
             Clz_history=np.array(self.Clz_history, dtype=np.float64),
+            Cmx_history=np.array(self.Cmx_history, dtype=np.float64),
+            Cmy_history=np.array(self.Cmy_history, dtype=np.float64),
+            Cmz_history=np.array(self.Cmz_history, dtype=np.float64),
             step_count=np.array(self.step_count, dtype=np.int64),
             params_json=np.array(json.dumps(params)),
         )
         if self.phi is not None:
             phi_cpu = self.phi.get() if self._use_cupy else self.phi
             kwargs["phi"] = phi_cpu
+        if self.g is not None:
+            kwargs["g"] = self.g
         np.savez_compressed(path, **kwargs)
 
     def load_checkpoint(self, path: str) -> None:
@@ -579,7 +797,15 @@ class Solver3D:
         self.Cd_history  = list(data["Cd_history"])
         self.Cly_history = list(data["Cly_history"])
         self.Clz_history = list(data["Clz_history"])
+        if "Cmx_history" in data:
+            self.Cmx_history = list(data["Cmx_history"])
+        if "Cmy_history" in data:
+            self.Cmy_history = list(data["Cmy_history"])
+        if "Cmz_history" in data:
+            self.Cmz_history = list(data["Cmz_history"])
         self.step_count  = int(data["step_count"])
+        if "g" in data:
+            self.g = data["g"]
         if "surface_links" in data:
             sl = data["surface_links"]
             self.surface_links = self._xp.asarray(sl) if self._use_cupy else sl

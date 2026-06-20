@@ -29,7 +29,8 @@ class TestGuiStateCommands:
         config.shape_2d = "cylinder"
         cmd = build_command(config)
         assert cmd[0] == sys.executable
-        assert cmd[1:4] == ["cli.py", "--shape", "cylinder"]
+        cli_idx = cmd.index("cli.py")
+        assert cmd[cli_idx:cli_idx + 3] == ["cli.py", "--shape", "cylinder"]
         assert "--collision" in cmd
         assert "--radius" in cmd
         assert "--save-case" in cmd
@@ -40,7 +41,8 @@ class TestGuiStateCommands:
         config.shape_3d = "cylinder"
         cmd = build_command(config)
         assert cmd[0] == sys.executable
-        assert cmd[1:4] == ["cli3d.py", "--shape", "cylinder"]
+        cli_idx = cmd.index("cli3d.py")
+        assert cmd[cli_idx:cli_idx + 3] == ["cli3d.py", "--shape", "cylinder"]
         assert "--length" in cmd
         assert "--viz3d" in cmd
         assert "--export-vtk" in cmd
@@ -82,7 +84,8 @@ class TestGuiStateCommands:
         assert re_vals == [20.0, 100.0]
         assert len(commands) == 2
         assert isinstance(commands[0], list)
-        assert commands[0][2:4] == ["--shape", "sphere"]
+        cli_idx = next(i for i, x in enumerate(commands[0]) if x.endswith("cli3d.py"))
+        assert commands[0][cli_idx + 1:cli_idx + 3] == ["--shape", "sphere"]
         assert build_command(config)[build_command(config).index("--re") + 1] in {"20", "20.0"}
         assert "--checkpoint-every" not in commands[0]
 

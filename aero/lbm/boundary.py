@@ -45,6 +45,26 @@ def apply_inlet_zou_he(
         f[8, :, col] -= uy * 0.15
 
 
+def apply_inlet_velocity_field(
+    f: np.ndarray,
+    ux_target: np.ndarray,
+    uy_target: np.ndarray,
+) -> None:
+    """Zou-He velocity inlet with per-row target velocities at x=0."""
+    col = 0
+    ux_target = np.asarray(ux_target, dtype=np.float64)
+    uy_target = np.asarray(uy_target, dtype=np.float64)
+    rho_in = (
+        (f[0, :, col] + f[2, :, col] + f[4, :, col])
+        + 2.0 * (f[3, :, col] + f[6, :, col] + f[7, :, col])
+    ) / np.maximum(1.0 - ux_target, 1e-8)
+    cy = rho_in * uy_target
+
+    f[1, :, col] = f[3, :, col] + (2.0 / 3.0) * rho_in * ux_target
+    f[5, :, col] = f[7, :, col] - 0.5 * cy + (1.0 / 6.0) * rho_in * ux_target
+    f[8, :, col] = f[6, :, col] + 0.5 * cy + (1.0 / 6.0) * rho_in * ux_target
+
+
 def apply_outlet_zero_gradient(f: np.ndarray) -> None:
     """
     Zero-gradient (extrapolation) outlet at right wall (x=Nx-1).
@@ -185,6 +205,25 @@ def apply_slip_walls(f: np.ndarray) -> None:
     f[4, -1, :] = f[2, -1, :]
     f[8, -1, :] = f[5, -1, :]
     f[7, -1, :] = f[6, -1, :]
+
+
+def apply_moving_walls(
+    f: np.ndarray,
+    *,
+    u_top: float = 0.0,
+    u_bottom: float = 0.0,
+) -> None:
+    """Moving-wall bounce-back with tangential x-velocity at top/bottom walls."""
+    rho_bottom = np.maximum(np.sum(f[:, 0, :], axis=0), 1e-12)
+    rho_top = np.maximum(np.sum(f[:, -1, :], axis=0), 1e-12)
+
+    f[2, 0, :] = f[4, 0, :]
+    f[5, 0, :] = f[7, 0, :] + 6.0 * (1.0 / 36.0) * rho_bottom * float(u_bottom)
+    f[6, 0, :] = f[8, 0, :] - 6.0 * (1.0 / 36.0) * rho_bottom * float(u_bottom)
+
+    f[4, -1, :] = f[2, -1, :]
+    f[7, -1, :] = f[5, -1, :] - 6.0 * (1.0 / 36.0) * rho_top * float(u_top)
+    f[8, -1, :] = f[6, -1, :] + 6.0 * (1.0 / 36.0) * rho_top * float(u_top)
 
 
 from typing import Optional, Tuple

@@ -68,6 +68,75 @@ def apply_inlet_zou_he_3d(
     f[13,:,:,c]  = f[12,:,:,c] + (1.0/6.0) * rho_in * u0 + 0.5 * cz
 
 
+def apply_inlet_velocity_field_3d(
+    f: np.ndarray,
+    ux_target: np.ndarray,
+    uy_target: np.ndarray,
+    uz_target: np.ndarray,
+) -> None:
+    """3D Zou-He inlet with per-cell target velocity fields at x=0."""
+    c = 0
+    ux_target = np.asarray(ux_target, dtype=np.float64)
+    uy_target = np.asarray(uy_target, dtype=np.float64)
+    uz_target = np.asarray(uz_target, dtype=np.float64)
+    F_minus = (f[2,:,:,c] + f[8,:,:,c] + f[10,:,:,c] + f[12,:,:,c] + f[14,:,:,c])
+    F_neut  = (f[0,:,:,c] + f[3,:,:,c] + f[4,:,:,c] + f[5,:,:,c] + f[6,:,:,c]
+               + f[15,:,:,c] + f[16,:,:,c] + f[17,:,:,c] + f[18,:,:,c])
+    rho_in = (2.0 * F_minus + F_neut) / np.maximum(1.0 - ux_target, 1e-8)
+    cy = rho_in * uy_target
+    cz = rho_in * uz_target
+
+    f[1, :,:,c]  = f[2, :,:,c] + (1.0/3.0) * rho_in * ux_target
+    f[7, :,:,c]  = f[10,:,:,c] + (1.0/6.0) * rho_in * ux_target - 0.5 * cy
+    f[9, :,:,c]  = f[8, :,:,c] + (1.0/6.0) * rho_in * ux_target + 0.5 * cy
+    f[11,:,:,c]  = f[14,:,:,c] + (1.0/6.0) * rho_in * ux_target - 0.5 * cz
+    f[13,:,:,c]  = f[12,:,:,c] + (1.0/6.0) * rho_in * ux_target + 0.5 * cz
+
+
+def apply_inlet_sem_3d(
+    f: np.ndarray,
+    u0: float,
+    u_prime: np.ndarray,
+    v_prime: np.ndarray,
+    w_prime: np.ndarray,
+) -> None:
+    """
+    Zou-He 3D velocity BC at x=0 with SEM fluctuations.
+
+    Imposes (ux, uy, uz) = (u0 + u_prime, v_prime, w_prime) on the inlet face
+    using the standard Zou-He non-equilibrium bounce-back formulation.
+
+    Parameters
+    ----------
+    u_prime, v_prime, w_prime : (Nz, Ny) arrays from SEMInlet.fluctuation()
+    """
+    c = 0
+    ux_field = u0 + u_prime  # (Nz, Ny)
+
+    F_minus = (f[2,:,:,c] + f[8,:,:,c] + f[10,:,:,c]
+               + f[12,:,:,c] + f[14,:,:,c])
+    F_neut  = (f[0,:,:,c] + f[3,:,:,c] + f[4,:,:,c]
+               + f[5,:,:,c] + f[6,:,:,c]
+               + f[15,:,:,c] + f[16,:,:,c] + f[17,:,:,c] + f[18,:,:,c])
+    rho_in = (2.0 * F_minus + F_neut) / np.clip(1.0 - ux_field, 1e-10, None)
+
+    # cy_base enforces uy=0; subtract rho*v_prime to impose uy=+v_prime
+    cy = (f[3,:,:,c] - f[4,:,:,c]
+          + f[15,:,:,c] - f[16,:,:,c] + f[17,:,:,c] - f[18,:,:,c])
+    cy = cy - rho_in * v_prime
+
+    # cz_base enforces uz=0; subtract rho*w_prime to impose uz=+w_prime
+    cz = (f[5,:,:,c] - f[6,:,:,c]
+          + f[15,:,:,c] + f[16,:,:,c] - f[17,:,:,c] - f[18,:,:,c])
+    cz = cz - rho_in * w_prime
+
+    f[1, :,:,c]  = f[2, :,:,c] + (1.0/3.0) * rho_in * ux_field
+    f[7, :,:,c]  = f[10,:,:,c] + (1.0/6.0) * rho_in * ux_field - 0.5 * cy
+    f[9, :,:,c]  = f[8, :,:,c] + (1.0/6.0) * rho_in * ux_field + 0.5 * cy
+    f[11,:,:,c]  = f[14,:,:,c] + (1.0/6.0) * rho_in * ux_field - 0.5 * cz
+    f[13,:,:,c]  = f[12,:,:,c] + (1.0/6.0) * rho_in * ux_field + 0.5 * cz
+
+
 # ---------------------------------------------------------------------------
 # Outlet BCs at x=Nx-1
 # ---------------------------------------------------------------------------
@@ -176,6 +245,29 @@ def apply_noslip_walls_3d(f: np.ndarray) -> None:
     f[4,:,-1,:]  = f[3,:,-1,:]
     f[10,:,-1,:] = f[7,:,-1,:]
     f[9,:,-1,:]  = f[8,:,-1,:]
+    f[18,:,-1,:] = f[15,:,-1,:]
+    f[16,:,-1,:] = f[17,:,-1,:]
+
+
+def apply_moving_walls_3d(
+    f: np.ndarray,
+    *,
+    u_top: float = 0.0,
+    u_bottom: float = 0.0,
+) -> None:
+    """Moving-wall bounce-back with tangential x-velocity on top/bottom y-walls."""
+    rho_bottom = np.maximum(np.sum(f[:, :, 0, :], axis=0), 1e-12)
+    rho_top = np.maximum(np.sum(f[:, :, -1, :], axis=0), 1e-12)
+
+    f[3,:,0,:]  = f[4,:,0,:]
+    f[7,:,0,:]  = f[10,:,0,:] + 6.0 * (1.0 / 36.0) * rho_bottom * float(u_bottom)
+    f[8,:,0,:]  = f[9,:,0,:]  - 6.0 * (1.0 / 36.0) * rho_bottom * float(u_bottom)
+    f[15,:,0,:] = f[18,:,0,:]
+    f[17,:,0,:] = f[16,:,0,:]
+
+    f[4,:,-1,:]  = f[3,:,-1,:]
+    f[10,:,-1,:] = f[7,:,-1,:]  - 6.0 * (1.0 / 36.0) * rho_top * float(u_top)
+    f[9,:,-1,:]  = f[8,:,-1,:]  + 6.0 * (1.0 / 36.0) * rho_top * float(u_top)
     f[18,:,-1,:] = f[15,:,-1,:]
     f[16,:,-1,:] = f[17,:,-1,:]
 

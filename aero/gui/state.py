@@ -56,6 +56,9 @@ class GuiConfig:
         "stl_fit": "0.35",
         "mesh_bc": "voxel",
         "mesh_orient": "auto",
+        "mesh_rot_x": "0",
+        "mesh_rot_y": "0",
+        "mesh_rot_z": "0",
         "inlet_perturbation": "0",
         "trt_lambda": "0.25",
         "sponge_cells": "0",
@@ -234,6 +237,15 @@ def _append_physics_flags(cmd: List[str], params: Dict[str, str]) -> None:
         cmd.append("--les")
 
 
+def _append_mesh_flags(cmd: List[str], params: Dict[str, str]) -> None:
+    _append_flag(cmd, "--stl-fit", params.get("stl_fit", "0.35"))
+    _append_flag(cmd, "--mesh-bc", params.get("mesh_bc", "voxel"))
+    _append_flag(cmd, "--mesh-orient", params.get("mesh_orient", "auto"))
+    _append_flag(cmd, "--mesh-rot-x", params.get("mesh_rot_x", "0"))
+    _append_flag(cmd, "--mesh-rot-y", params.get("mesh_rot_y", "0"))
+    _append_flag(cmd, "--mesh-rot-z", params.get("mesh_rot_z", "0"))
+
+
 def build_command(
     config: GuiConfig,
     *,
@@ -246,7 +258,7 @@ def build_command(
 
     if config.mode == "2d":
         params = config.params_2d
-        cmd = [python, "cli.py", "--shape", config.shape_2d]
+        cmd = [python, "-u", "cli.py", "--shape", config.shape_2d]
         for key in ("re", "steps", "nx", "ny", "u0", "backend", "collision", "wall_bc", "inlet_bc", "outlet_bc", "inlet_perturbation"):
             _append_flag(cmd, f"--{key.replace('_', '-')}", params[key])
         steps = int(steps_override if steps_override is not None else params.get("steps", "5000"))
@@ -272,7 +284,7 @@ def build_command(
         return cmd
 
     params = config.params_3d
-    cmd = [python, "cli3d.py", "--shape", config.shape_3d]
+    cmd = [python, "-u", "cli3d.py", "--shape", config.shape_3d]
     for key in ("re", "steps", "nx", "ny", "nz", "u0", "backend", "collision", "wall_bc", "outlet_bc", "viz3d", "inlet_perturbation"):
         _append_flag(cmd, f"--{key.replace('_', '-')}", params[key])
     steps = int(steps_override if steps_override is not None else params.get("steps", "500"))
@@ -290,9 +302,7 @@ def build_command(
         _append_flag(cmd, "--length", params["length"])
     elif config.shape_3d == "mesh":
         _append_flag(cmd, "--stl-path", params.get("stl_path", ""))
-        _append_flag(cmd, "--stl-fit", params.get("stl_fit", "0.35"))
-        _append_flag(cmd, "--mesh-bc", params.get("mesh_bc", "voxel"))
-        _append_flag(cmd, "--mesh-orient", params.get("mesh_orient", "auto"))
+        _append_mesh_flags(cmd, params)
     _append_physics_flags(cmd, params)
     if ckpt_on and not resume_from:
         every = config.checkpoint_every or default_checkpoint_every(steps)

@@ -2,6 +2,7 @@
 
 import pathlib
 import tempfile
+import importlib.util
 import numpy as np
 import pytest
 
@@ -39,7 +40,7 @@ def test_hdf5_writer_no_h5py():
 
 
 @pytest.mark.skipif(
-    True,  # only runs when h5py is present; keep as documentation
+    importlib.util.find_spec("h5py") is None,
     reason="h5py not installed"
 )
 def test_hdf5_writer_creates_file():
@@ -63,6 +64,30 @@ def test_hdf5_writer_creates_file():
             np.testing.assert_allclose(f["step_00000010/ux"][:], ux)
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("h5py") is None,
+    reason="h5py not installed"
+)
+def test_hdf5_writer_scalar_dataset_and_xdmf():
+    from aero.hdf5_writer import HDF5Writer, HAS_HDF5
+    if not HAS_HDF5:
+        pytest.skip("h5py not installed")
+    import h5py
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "scalar_run.h5"
+        ux = np.zeros((8, 16))
+        uy = np.zeros((8, 16))
+        rho = np.ones((8, 16))
+        scalar = np.linspace(0.0, 1.0, 8 * 16).reshape(8, 16)
+        with HDF5Writer(str(path), Ny=8, Nx=16, dims=2) as w:
+            w.write_step(5, ux=ux, uy=uy, rho=rho, scalar=scalar)
+        with h5py.File(path, "r") as f:
+            np.testing.assert_allclose(f["step_00000005/scalar"][:], scalar)
+        xdmf_text = path.with_suffix(".xdmf").read_text()
+        assert "Name=\"scalar\"" in xdmf_text
+        assert "scalar_run.h5:/step_00000005/scalar" in xdmf_text
+
+
 def test_solver_run_hdf5_path_noop_without_h5py():
     """Passing hdf5_path when h5py is absent must not crash."""
     from aero.hdf5_writer import HAS_HDF5
@@ -72,6 +97,30 @@ def test_solver_run_hdf5_path_noop_without_h5py():
     with tempfile.TemporaryDirectory() as d:
         sol.run(steps=50, check_every=50, verbose=False,
                 hdf5_path=str(pathlib.Path(d) / "out.h5"), hdf5_every=25)
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("h5py") is None,
+    reason="h5py not installed"
+)
+def test_solver_run_hdf5_writes_scalar_when_enabled():
+    from aero.hdf5_writer import HAS_HDF5
+    if not HAS_HDF5:
+        pytest.skip("h5py not installed")
+    import h5py
+    sol = _small_solver(thermal=True, T_hot=1.0, T_cold=0.0, alpha_T=0.05)
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "solver_scalar.h5"
+        sol.run(
+            steps=20,
+            check_every=20,
+            verbose=False,
+            hdf5_path=str(path),
+            hdf5_every=10,
+        )
+        with h5py.File(path, "r") as f:
+            assert "step_00000010/scalar" in f
+            assert "step_00000020/scalar" in f
 
 
 # ---------------------------------------------------------------------------

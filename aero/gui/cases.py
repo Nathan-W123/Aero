@@ -124,8 +124,19 @@ def apply_case_config(gui: GuiConfig, case_config: Dict[str, Any]) -> None:
         "sponge_strength": "sponge_strength",
         "les": "les",
         "les_cs": "les_cs",
+        "thermal": "thermal",
+        "T_hot": "T_hot",
+        "T_cold": "T_cold",
+        "alpha_T": "alpha_T",
+        "buoyancy": "buoyancy",
+        "g_gravity": "g_gravity",
+        "beta": "beta",
+        "T_ref": "T_ref",
         "mesh_bc": "mesh_bc",
         "mesh_orient": "mesh_orient",
+        "mesh_rot_x": "mesh_rot_x",
+        "mesh_rot_y": "mesh_rot_y",
+        "mesh_rot_z": "mesh_rot_z",
         "stl_path": "stl_path",
         "stl_fit": "stl_fit",
     }
@@ -178,6 +189,11 @@ def load_case_results(case_dir: Path) -> Dict[str, str]:
             metrics["steps_per_sec"] = str(int(float(steps_run) / float(data["elapsed_seconds"])))
         except (TypeError, ValueError, ZeroDivisionError):
             pass
+    scalar_stats = data.get("scalar_stats")
+    if isinstance(scalar_stats, dict):
+        metrics["scalar_mean"] = f"{scalar_stats.get('mean', '—')}"
+        metrics["scalar_min"] = f"{scalar_stats.get('min', '—')}"
+        metrics["scalar_max"] = f"{scalar_stats.get('max', '—')}"
     return metrics
 
 
