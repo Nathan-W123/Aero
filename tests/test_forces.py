@@ -31,7 +31,7 @@ def feq_uniform():
 def test_no_force_empty_domain(feq_uniform):
     """Without any solid cells, forces must be exactly zero."""
     solid = np.zeros((Ny, Nx), dtype=bool)
-    links = build_surface_links(solid)
+    links, _ = build_surface_links(solid)
     Fx, Fy = compute_forces(feq_uniform, feq_uniform, links, RHO0, U0)
     assert Fx == 0.0
     assert Fy == 0.0
@@ -61,7 +61,7 @@ def test_symmetry_top_bottom(feq_uniform):
     from aero.geometry.cylinder import Cylinder
     cyl   = Cylinder(radius=8, cx_frac=0.5, cy_frac=0.5)
     solid = cyl.mark_solid(Ny, Nx)
-    links = build_surface_links(solid)
+    links, _ = build_surface_links(solid)
     f     = feq_uniform
 
     _, Fy = compute_forces(f, f, links, RHO0, U0)
@@ -74,7 +74,7 @@ def test_force_split_sums_to_momentum_exchange(feq_uniform):
     from aero.geometry.cylinder import Cylinder
     cyl = Cylinder(radius=8, cx_frac=1 / 3, cy_frac=0.5)
     solid = cyl.mark_solid(Ny, Nx)
-    links = build_surface_links(solid)
+    links, _ = build_surface_links(solid)
     f = feq_uniform
     Fx, Fy = compute_forces(f, f, links, RHO0, U0)
     fx_p, fy_p, fx_v, fy_v = compute_force_split_2d(f, f, links)

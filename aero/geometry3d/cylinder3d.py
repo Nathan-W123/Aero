@@ -1,6 +1,6 @@
 """Finite circular cylinder aligned with the spanwise z-axis."""
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 from .base import Geometry3D
 
 
@@ -47,3 +47,17 @@ class Cylinder3D(Geometry3D):
 
     def reference_length(self) -> float:
         return 2.0 * self.radius
+
+    def sdf_field(self, Nz: int, Ny: int, Nx: int) -> Optional[np.ndarray]:
+        cx, cy, cz = self.center(Nz, Ny, Nx)
+        x = np.arange(Nx, dtype=np.float64) + 0.5
+        y = np.arange(Ny, dtype=np.float64) + 0.5
+        z = np.arange(Nz, dtype=np.float64) + 0.5
+        zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
+        dr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) - self.radius
+        dz = np.abs(zz - cz) - self.length / 2.0
+        # Exact SDF of finite cylinder (capped)
+        return (
+            np.sqrt(np.maximum(dr, 0.0) ** 2 + np.maximum(dz, 0.0) ** 2)
+            + np.minimum(np.maximum(dr, dz), 0.0)
+        )

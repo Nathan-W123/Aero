@@ -1,7 +1,7 @@
 """Rectangular obstacle."""
 
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 from .base import Geometry
 
 
@@ -40,3 +40,16 @@ class Rectangle(Geometry):
 
     def reference_length(self) -> float:
         return self.height  # cross-stream dimension is the aerodynamic reference
+
+    def sdf_field(self, Ny: int, Nx: int) -> Optional[np.ndarray]:
+        cx, cy = self.center(Ny, Nx)
+        x = np.arange(Nx, dtype=np.float64) + 0.5
+        y = np.arange(Ny, dtype=np.float64) + 0.5
+        xx, yy = np.meshgrid(x, y)
+        dx = np.abs(xx - cx) - self.width / 2.0
+        dy = np.abs(yy - cy) - self.height / 2.0
+        # Exact SDF of axis-aligned box
+        return (
+            np.sqrt(np.maximum(dx, 0.0) ** 2 + np.maximum(dy, 0.0) ** 2)
+            + np.minimum(np.maximum(dx, dy), 0.0)
+        )

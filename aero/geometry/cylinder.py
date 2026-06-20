@@ -1,7 +1,7 @@
 """Circular cylinder obstacle."""
 
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 from .base import Geometry
 
 
@@ -33,3 +33,10 @@ class Cylinder(Geometry):
 
     def reference_length(self) -> float:
         return 2.0 * self.radius
+
+    def sdf_field(self, Ny: int, Nx: int) -> Optional[np.ndarray]:
+        cx, cy = self.center(Ny, Nx)
+        x = np.arange(Nx, dtype=np.float64) + 0.5
+        y = np.arange(Ny, dtype=np.float64) + 0.5
+        xx, yy = np.meshgrid(x, y)
+        return np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) - self.radius

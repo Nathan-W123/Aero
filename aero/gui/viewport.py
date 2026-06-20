@@ -108,6 +108,16 @@ if HAS_QT:
             self.reset_button.setEnabled(False)
             overlay.addWidget(self.reset_button)
 
+            self.zoom_in_button = self._make_button("+", self._zoom_in)
+            self.zoom_in_button.setEnabled(False)
+            self.zoom_in_button.setFixedWidth(32)
+            overlay.addWidget(self.zoom_in_button)
+
+            self.zoom_out_button = self._make_button("−", self._zoom_out)
+            self.zoom_out_button.setEnabled(False)
+            self.zoom_out_button.setFixedWidth(32)
+            overlay.addWidget(self.zoom_out_button)
+
             density_label = QtWidgets.QLabel("Flow density")
             density_label.setObjectName("viewportStatus")
             overlay.addWidget(density_label)
@@ -316,6 +326,8 @@ if HAS_QT:
             _log("rendering geometry...")
             self._plotter.render()
             self.reset_button.setEnabled(True)
+            self.zoom_in_button.setEnabled(True)
+            self.zoom_out_button.setEnabled(True)
             self.density_slider.setEnabled(True)
             self.play_button.setEnabled(True)
             self.load_succeeded.emit()
@@ -422,6 +434,8 @@ if HAS_QT:
             self._scalar_bar_shown = False
             self.status_label.setText(message)
             self.reset_button.setEnabled(False)
+            self.zoom_in_button.setEnabled(False)
+            self.zoom_out_button.setEnabled(False)
             self.density_slider.setEnabled(False)
             self.play_button.setEnabled(False)
             self.play_button.setText("Play Flow")
@@ -434,6 +448,18 @@ if HAS_QT:
             self._flow_timer.stop()
             if self.play_button.isEnabled():
                 self.play_button.setText("Play Flow")
+
+        def _zoom_in(self) -> None:
+            if self._plotter is None:
+                return
+            self._plotter.camera.zoom(1.3)
+            self._plotter.render()
+
+        def _zoom_out(self) -> None:
+            if self._plotter is None:
+                return
+            self._plotter.camera.zoom(1.0 / 1.3)
+            self._plotter.render()
 
         def _reset_camera(self) -> None:
             if self._plotter is None:

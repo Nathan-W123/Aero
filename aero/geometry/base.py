@@ -1,7 +1,7 @@
 """Abstract base class for 2D obstacle geometry."""
 
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Optional, Tuple
 import numpy as np
 
 
@@ -30,3 +30,10 @@ class Geometry(ABC):
     def reference_length(self) -> float:
         """Characteristic length in lattice cells (diameter, chord, etc.)."""
         ...
+
+    def sdf_field(self, Ny: int, Nx: int) -> Optional[np.ndarray]:
+        """
+        Signed-distance field on cell centres.  Returns None if not implemented.
+        phi < 0 inside obstacle, phi > 0 outside, |phi| = distance in lattice cells.
+        """
+        return None

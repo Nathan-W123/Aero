@@ -187,39 +187,58 @@ def apply_slip_walls(f: np.ndarray) -> None:
     f[7, -1, :] = f[6, -1, :]
 
 
-def build_surface_links(solid: np.ndarray) -> np.ndarray:
+from typing import Optional, Tuple
+
+
+def build_surface_links(
+    solid: np.ndarray,
+    phi: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Precompute surface link list for mid-link bounce-back.
+    Precompute surface link list for bounce-back.
 
     A surface link is a tuple (i, y, x) where:
       - cell (y, x) is fluid
       - cell (y + E[i,1], x + E[i,0]) is solid
 
+    Parameters
+    ----------
+    solid : (Ny, Nx) bool
+    phi   : (Ny, Nx) float64 optional signed-distance field.
+            If provided, q_vals[k] = clip(phi[y, x], 1e-4, 1.0) giving the
+            wall fraction for Bouzidi interpolated bounce-back.
+            If None, q_vals = 0.5 (exact mid-link).
+
     Returns
     -------
-    links : ndarray int32, shape (N_links, 3)  columns: [i, y, x]
+    links  : ndarray int32, shape (N_links, 3)  columns: [i, y, x]
+    q_vals : ndarray float32, shape (N_links,)  wall fractions
     """
     Ny, Nx = solid.shape
     fluid = ~solid
 
     links = []
     for i in range(1, 9):  # skip rest direction i=0
-        ey, ex = int(E[i, 1]), int(E[i, 0])
-        # Neighbour coordinates with clipping (walls handled separately)
-        yn = np.clip(np.arange(Ny) + ey, 0, Ny - 1)
-        xn = np.clip(np.arange(Nx) + ex, 0, Nx - 1)
-
-        # Meshgrid of all (y, x) positions
         y_idx, x_idx = np.meshgrid(np.arange(Ny), np.arange(Nx), indexing='ij')
-        yn_idx = np.clip(y_idx + ey, 0, Ny - 1)
-        xn_idx = np.clip(x_idx + ex, 0, Nx - 1)
-
+        yn_idx = np.clip(y_idx + int(E[i, 1]), 0, Ny - 1)
+        xn_idx = np.clip(x_idx + int(E[i, 0]), 0, Nx - 1)
         mask = fluid & solid[yn_idx, xn_idx]
         ys, xs = np.where(mask)
         for y, x in zip(ys, xs):
             links.append((i, int(y), int(x)))
 
-    return np.array(links, dtype=np.int32) if links else np.empty((0, 3), dtype=np.int32)
+    if not links:
+        return np.empty((0, 3), dtype=np.int32), np.empty(0, dtype=np.float32)
+
+    links_arr = np.array(links, dtype=np.int32)
+    if phi is not None:
+        y_arr = links_arr[:, 1]
+        x_arr = links_arr[:, 2]
+        q_vals = np.clip(phi[y_arr, x_arr].astype(np.float32), 1e-4, 1.0)
+    else:
+        q_vals = np.full(len(links_arr), 0.5, dtype=np.float32)
+
+    return links_arr, q_vals
 
 
 def apply_bounce_back(f: np.ndarray, f_pre: np.ndarray, links: np.ndarray) -> None:
@@ -240,3 +259,55 @@ def apply_bounce_back(f: np.ndarray, f_pre: np.ndarray, links: np.ndarray) -> No
     x_arr = links[:, 2]
     opp_i = OPP[i_arr]
     f[opp_i, y_arr, x_arr] = f_pre[i_arr, y_arr, x_arr]
+
+
+def apply_bounce_back_bouzidi(
+    f: np.ndarray,
+    f_pre: np.ndarray,
+    links: np.ndarray,
+    q_vals: np.ndarray,
+) -> None:
+    """
+    Bouzidi (2001) interpolated bounce-back — 2nd-order accurate at curved walls.
+
+    For each surface link (i, y, x) with wall fraction q = phi[y, x]:
+
+    q < 0.5  (wall closer than midpoint):
+        f[opp[i], y, x] = 2q * f_pre[i, y, x] + (1-2q) * f_pre[opp[i], y, x]
+
+    q >= 0.5 (wall farther than midpoint):
+        f[opp[i], y, x] = (1/2q) * f_pre[i, y, x]
+                         + (1 - 1/2q) * f_pre[i, y_nb, x_nb]
+        where (y_nb, x_nb) is the fluid neighbour in the opp[i] direction.
+
+    At q = 0.5 both cases reduce to standard mid-link bounce-back.
+    Modifies f in-place.
+    """
+    if links.shape[0] == 0:
+        return
+
+    Ny, Nx = f.shape[1], f.shape[2]
+    i_arr = links[:, 0]
+    y_arr = links[:, 1]
+    x_arr = links[:, 2]
+    opp_i = OPP[i_arr]
+    q = q_vals.astype(np.float64)
+
+    # Case 1: q < 0.5
+    m = q < 0.5
+    if m.any():
+        f[opp_i[m], y_arr[m], x_arr[m]] = (
+            2.0 * q[m] * f_pre[i_arr[m], y_arr[m], x_arr[m]]
+            + (1.0 - 2.0 * q[m]) * f_pre[opp_i[m], y_arr[m], x_arr[m]]
+        )
+
+    # Case 2: q >= 0.5 — needs neighbour node in opp direction
+    m2 = ~m
+    if m2.any():
+        yn = np.clip(y_arr[m2] + E[opp_i[m2], 1].astype(int), 0, Ny - 1)
+        xn = np.clip(x_arr[m2] + E[opp_i[m2], 0].astype(int), 0, Nx - 1)
+        inv2q = 1.0 / (2.0 * q[m2])
+        f[opp_i[m2], y_arr[m2], x_arr[m2]] = (
+            inv2q * f_pre[i_arr[m2], y_arr[m2], x_arr[m2]]
+            + (1.0 - inv2q) * f_pre[i_arr[m2], yn, xn]
+        )

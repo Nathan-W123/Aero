@@ -2,13 +2,20 @@
 
 import math
 
+import numpy as np
 import pytest
 
 from aero.benchmarks import (
     assess_collision,
     assess_grid_convergence,
     assess_literature,
+    backward_facing_step_reattachment_length,
     build_validation_report,
+    channel_friction_coefficient,
+    dean_correlation_cf,
+    grid_study,
+    observed_order_of_convergence,
+    richardson_extrapolation,
     schiller_naumann_cd,
     scale_params_for_grid,
     validate_bc_config,
@@ -79,3 +86,41 @@ def test_build_validation_report_shape():
     )
     assert report.benchmark_status in {"pass", "warn", "fail", "n/a"}
     assert report.collision_status in {"pass", "warn", "fail", "n/a"}
+
+
+def test_observed_order_and_richardson():
+    cds = [1.40, 1.20, 1.15]
+    order = observed_order_of_convergence(cds)
+    ext = richardson_extrapolation(cds, observed_order=order)
+    assert order is not None
+    assert order > 0.0
+    assert ext is not None
+    assert ext < cds[-1]
+
+
+def test_grid_study_runner_returns_summary():
+    def runner(resolution: float):
+        return {"Cd_mean": 1.0 + 0.2 / (resolution * resolution)}
+
+    study = grid_study(runner, [0.5, 1.0, 2.0])
+    assert study.status in {"pass", "warn", "fail"}
+    assert len(study.cd_values) == 3
+    assert study.observed_order is not None
+
+
+def test_dean_correlation_and_channel_cf_positive():
+    cf_ref = dean_correlation_cf(5000.0)
+    cf_meas = channel_friction_coefficient(
+        body_force_x=2.0e-5,
+        hydraulic_diameter=20.0,
+        bulk_velocity=0.08,
+    )
+    assert 0.0 < cf_ref < 0.1
+    assert cf_meas > 0.0
+
+
+def test_backward_facing_step_reattachment_length():
+    ux = np.ones((8, 40), dtype=float)
+    ux[1, 11:17] = -0.05
+    length = backward_facing_step_reattachment_length(ux, step_index=10)
+    assert length == pytest.approx(7.0)

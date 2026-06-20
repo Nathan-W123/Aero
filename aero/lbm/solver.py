@@ -42,6 +42,7 @@ from .boundary import (
     apply_slip_walls,
     apply_noslip_walls,
     apply_bounce_back,
+    apply_bounce_back_bouzidi,
     build_surface_links,
 )
 from ..forces import (
@@ -50,7 +51,7 @@ from ..forces import (
     forces_to_coefficients,
     split_to_coefficients,
 )
-from ..diagnostics import check_stability, check_convergence
+from ..diagnostics import check_stability, detect_statistical_stationarity
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_2d
 from .les import (
     strain_rate_magnitude_2d,
@@ -89,6 +90,9 @@ class Solver:
         les_cs: float = 0.16,
         ibm_enabled: bool = False,
         phi: Optional[np.ndarray] = None,
+        bouzidi: bool = False,
+        van_driest: bool = False,
+        van_driest_A: float = 25.0,
     ):
         """
         Parameters
@@ -137,6 +141,9 @@ class Solver:
         self.les_cs = float(les_cs)
         self.ibm_enabled = bool(ibm_enabled)
         self.phi = phi
+        self.bouzidi = bool(bouzidi)
+        self.van_driest = bool(van_driest)
+        self.van_driest_A = float(van_driest_A)
         self.tau = 1.0 / omega
         self._base_nu = base_nu_from_omega(omega)
         if collision not in ("bgk", "mrt", "trt"):
@@ -168,7 +175,8 @@ class Solver:
         self.solid = np.ascontiguousarray(solid, dtype=np.bool_)
 
         # Precompute surface links for bounce-back
-        self.surface_links = build_surface_links(self.solid)
+        _phi_for_q = phi if (bouzidi and phi is not None) else None
+        self.surface_links, self.q_vals = build_surface_links(self.solid, _phi_for_q)
 
         # Initialize f to equilibrium everywhere (including solid cells).
         # Must be C-contiguous float64 for Numba kernels.
@@ -220,6 +228,7 @@ class Solver:
         if self.les:
             omega_field = build_omega_field_2d(
                 f, self.solid, self.fluid, self._base_nu, self.omega, self.les_cs,
+                phi=self.phi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             )
             use_omega_field = True
         omega_use = self.omega
@@ -306,7 +315,10 @@ class Solver:
 
         # 5. Boundary conditions — order matters (same for both backends)
         if not self.ibm_enabled:
-            apply_bounce_back(f_post, f_pre, self.surface_links)
+            if self.bouzidi:
+                apply_bounce_back_bouzidi(f_post, f_pre, self.surface_links, self.q_vals)
+            else:
+                apply_bounce_back(f_post, f_pre, self.surface_links)
 
         if self.inlet_bc == "velocity":
             apply_inlet_zou_he(
@@ -360,6 +372,13 @@ class Solver:
         callback: Optional[Callable] = None,
         checkpoint_every: Optional[int] = None,
         checkpoint_dir: Optional[str] = None,
+        auto_stop: bool = False,
+        convergence_window: int = 5000,
+        convergence_tol: float = 0.01,
+        strouhal_window: int = 4096,
+        strouhal_tol: float = 0.05,
+        hdf5_path: Optional[str] = None,
+        hdf5_every: Optional[int] = None,
     ) -> dict:
         """
         Run the simulation for `steps` timesteps.
@@ -383,8 +402,14 @@ class Solver:
             print(f"  Backend   : {self.backend}")
             print(f"  Collision : {self.collision}")
 
+        from ..hdf5_writer import HDF5Writer
+        hdf5_writer = HDF5Writer(hdf5_path, Ny=self.Ny, Nx=self.Nx, dims=2) if hdf5_path else None
+
         t_start    = time.perf_counter()
         avg_window = max(1, steps // 5)   # average over last 20 % of run
+        stop_reason = "max_steps"
+        last_convergence = None
+        last_strouhal = None
 
         for step in range(1, steps + 1):
             Cd, Cl = self._step()
@@ -396,6 +421,11 @@ class Solver:
             if checkpoint_every and checkpoint_dir and step % checkpoint_every == 0:
                 ckpt_path = pathlib.Path(checkpoint_dir) / f"checkpoint_{self.step_count:08d}.npz"
                 self.save_checkpoint(str(ckpt_path))
+
+            if hdf5_writer and hdf5_every and step % hdf5_every == 0:
+                from ..lbm.d2q9 import compute_macroscopic as _cm2
+                _rho, _ux, _uy = _cm2(self.f)
+                hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, rho=_rho)
 
             if step % check_every == 0:
                 rho, ux, uy = compute_macroscopic(self.f)
@@ -417,6 +447,21 @@ class Solver:
                 if callback is not None:
                     callback(step, Cd, Cl, rho, ux, uy)
 
+                if auto_stop:
+                    last_convergence, last_strouhal, should_stop = detect_statistical_stationarity(
+                        self.Cd_history,
+                        self.Cl_history,
+                        self.D,
+                        self.u0,
+                        convergence_window=convergence_window,
+                        convergence_tol=convergence_tol,
+                        strouhal_window=strouhal_window,
+                        strouhal_tol=strouhal_tol,
+                    )
+                    if should_stop:
+                        stop_reason = "auto_converged"
+                        break
+
         # Final macroscopic state
         rho, ux, uy        = compute_macroscopic(self.f)
         self.rho, self.ux, self.uy = rho, ux, uy
@@ -426,6 +471,8 @@ class Solver:
         Cdp_arr = np.array(self.Cd_p_history[-avg_window:])
         Cdv_arr = np.array(self.Cd_v_history[-avg_window:])
 
+        if hdf5_writer:
+            hdf5_writer.close()
         return {
             "Cd_mean":    float(np.mean(Cd_arr)),
             "Cl_mean":    float(np.mean(Cl_arr)),
@@ -437,6 +484,10 @@ class Solver:
             "Cl_history": self.Cl_history,
             "Cd_p_history": self.Cd_p_history,
             "Cd_v_history": self.Cd_v_history,
+            "steps_completed": self.step_count,
+            "stop_reason": stop_reason,
+            "convergence_report": last_convergence,
+            "strouhal_report": last_strouhal,
             "rho": rho,
             "ux":  ux,
             "uy":  uy,
@@ -448,32 +499,71 @@ class Solver:
 
     def save_checkpoint(self, path: str) -> None:
         """
-        Save full solver state to a .npz file.
+        Save full solver state to a .npz file, including all init parameters.
 
-        Stores: f array, _f_outlet_prev, Cd/Cl histories, step count.
-        Does NOT store geometry or solver parameters — those come from
-        the SimulationCase config and must be used to reconstruct the
-        Solver before calling load_checkpoint().
+        The companion `from_checkpoint(path)` classmethod can reconstruct the
+        solver from scratch without requiring the caller to know any original
+        parameters.
         """
-        np.savez_compressed(
-            path,
+        import json
+        params = dict(
+            Ny=self.Ny, Nx=self.Nx, omega=self.omega, u0=self.u0, D=self.D,
+            rho0=self.rho0, wall_bc=self.wall_bc, inlet_bc=self.inlet_bc,
+            outlet_bc=self.outlet_bc, rho_in=self.rho_in, rho_out=self.rho_out,
+            inlet_perturbation=self.inlet_perturbation, trt_lambda=self.trt_lambda,
+            sponge_thickness=self.sponge_thickness, sponge_strength=self.sponge_strength,
+            les=self.les, les_cs=self.les_cs, ibm_enabled=self.ibm_enabled,
+            bouzidi=self.bouzidi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            collision=self.collision, backend=self.backend,
+        )
+        kwargs: dict = dict(
             f=self.f,
             f_outlet_prev=self._f_outlet_prev,
+            solid=self.solid,
             Cd_history=np.array(self.Cd_history, dtype=np.float64),
             Cl_history=np.array(self.Cl_history, dtype=np.float64),
             step_count=np.array(self.step_count, dtype=np.int64),
+            surface_links=self.surface_links,
+            q_vals=self.q_vals,
+            params_json=np.array(json.dumps(params)),
         )
+        if self.phi is not None:
+            kwargs["phi"] = self.phi
+        np.savez_compressed(path, **kwargs)
 
     def load_checkpoint(self, path: str) -> None:
         """
-        Restore solver state from a .npz checkpoint.
+        Restore dynamic solver state (f, histories, step) from a .npz checkpoint.
 
-        The Solver must already be constructed with the same geometry and
-        parameters as when the checkpoint was saved.  Call this before run().
+        Call this on an already-constructed Solver when you have the geometry
+        parameters at hand.  For a full stateless restart use `from_checkpoint`.
         """
-        data = np.load(path)
+        data = np.load(path, allow_pickle=False)
         self.f                = data["f"]
         self._f_outlet_prev   = data["f_outlet_prev"]
         self.Cd_history       = list(data["Cd_history"])
         self.Cl_history       = list(data["Cl_history"])
         self.step_count       = int(data["step_count"])
+        # Restore pre-computed link tables so geometry doesn't need rebuilding
+        if "surface_links" in data:
+            self.surface_links = data["surface_links"]
+        if "q_vals" in data:
+            self.q_vals = data["q_vals"]
+
+    @classmethod
+    def from_checkpoint(cls, path: str) -> "Solver":
+        """
+        Reconstruct a Solver from a checkpoint without any external parameters.
+
+        The checkpoint must have been saved with the current `save_checkpoint`
+        (which embeds all init params as JSON).  Returns a fully-initialised
+        Solver ready to continue running.
+        """
+        import json
+        data = np.load(path, allow_pickle=False)
+        params = json.loads(str(data["params_json"]))
+        solid = data["solid"]
+        phi   = data["phi"] if "phi" in data else None
+        solver = cls(solid=solid, phi=phi, **params)
+        solver.load_checkpoint(path)
+        return solver

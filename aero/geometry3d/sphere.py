@@ -1,6 +1,6 @@
 """Spherical obstacle (canonical 3D validation shape)."""
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 from .base import Geometry3D
 
 
@@ -41,3 +41,11 @@ class Sphere(Geometry3D):
 
     def reference_length(self) -> float:
         return 2.0 * self.radius  # diameter
+
+    def sdf_field(self, Nz: int, Ny: int, Nx: int) -> Optional[np.ndarray]:
+        cx, cy, cz = self.center(Nz, Ny, Nx)
+        x = np.arange(Nx, dtype=np.float64) + 0.5
+        y = np.arange(Ny, dtype=np.float64) + 0.5
+        z = np.arange(Nz, dtype=np.float64) + 0.5
+        zz, yy, xx = np.meshgrid(z, y, x, indexing='ij')
+        return np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2 + (zz - cz) ** 2) - self.radius

@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 
 
 @dataclass
@@ -26,6 +28,17 @@ class ValidationReport:
         if self.grid_status == "fail":
             return False
         return True
+
+
+@dataclass
+class GridStudyResult:
+    resolutions: List[float]
+    cd_values: List[float]
+    observed_order: Optional[float]
+    extrapolated_cd: Optional[float]
+    relative_errors: List[float]
+    status: str
+    message: str
 
 
 def schiller_naumann_cd(re: float) -> float:
@@ -108,6 +121,82 @@ def assess_grid_convergence(cd_values: List[float]) -> Tuple[str, str]:
     if finest_change < 0.10:
         return "warn", f"Nearly converged (5–10%) — {summary}"
     return "fail", f"Not grid independent (>10%) — {summary}"
+
+
+def observed_order_of_convergence(
+    cd_values: List[float],
+    refinement_ratio: float = 2.0,
+) -> Optional[float]:
+    """Observed order of convergence from coarse→medium→fine values."""
+    if len(cd_values) < 3:
+        return None
+    coarse, medium, fine = map(float, cd_values[-3:])
+    denom = medium - coarse
+    numer = fine - medium
+    if abs(denom) < 1e-12 or abs(numer) < 1e-12:
+        return None
+    ratio = abs(numer / denom)
+    if ratio <= 0.0:
+        return None
+    return float(abs(math.log(abs(denom / numer)) / math.log(float(refinement_ratio))))
+
+
+def richardson_extrapolation(
+    cd_values: List[float],
+    refinement_ratio: float = 2.0,
+    observed_order: Optional[float] = None,
+) -> Optional[float]:
+    """Richardson extrapolation using the two finest solutions."""
+    if len(cd_values) < 2:
+        return None
+    fine = float(cd_values[-1])
+    medium = float(cd_values[-2])
+    p = observed_order if observed_order is not None else observed_order_of_convergence(cd_values, refinement_ratio)
+    if p is None:
+        return None
+    denom = float(refinement_ratio) ** p - 1.0
+    if abs(denom) < 1e-12:
+        return None
+    return fine + (fine - medium) / denom
+
+
+def grid_study(
+    run_case: Callable[[float], Any],
+    resolutions: List[float],
+    *,
+    refinement_ratio: float = 2.0,
+) -> GridStudyResult:
+    """
+    Run a coarse→fine grid study via a user-supplied case runner.
+
+    `run_case(resolution)` may return a scalar Cd or a dict containing `Cd_mean`.
+    """
+    cds: List[float] = []
+    for resolution in resolutions:
+        result = run_case(float(resolution))
+        cd = float(result["Cd_mean"]) if isinstance(result, dict) else float(result)
+        cds.append(cd)
+
+    status, message = assess_grid_convergence(cds)
+    observed_order = observed_order_of_convergence(cds, refinement_ratio=refinement_ratio)
+    extrapolated_cd = richardson_extrapolation(
+        cds,
+        refinement_ratio=refinement_ratio,
+        observed_order=observed_order,
+    )
+    rel_errors: List[float] = []
+    if extrapolated_cd is not None:
+        for cd in cds:
+            rel_errors.append(abs(cd - extrapolated_cd) / max(abs(extrapolated_cd), 1e-12))
+    return GridStudyResult(
+        resolutions=[float(r) for r in resolutions],
+        cd_values=cds,
+        observed_order=observed_order,
+        extrapolated_cd=extrapolated_cd,
+        relative_errors=rel_errors,
+        status=status,
+        message=message,
+    )
 
 
 def validate_bc_config(
@@ -259,3 +348,48 @@ def scale_params_for_grid(params: Dict[str, str], factor: float, mode: str) -> D
             val = max(int(round(float(scaled[key]) * factor)), 2)
             scaled[key] = str(val)
     return scaled
+
+
+def dean_correlation_cf(re_bulk: float) -> float:
+    """Dean correlation for turbulent internal-flow skin-friction coefficient."""
+    re_bulk = max(float(re_bulk), 1.0)
+    return 0.073 * (re_bulk ** -0.25)
+
+
+def channel_friction_coefficient(
+    *,
+    body_force_x: float,
+    hydraulic_diameter: float,
+    bulk_velocity: float,
+    rho: float = 1.0,
+) -> float:
+    """Estimate Cf from a uniform streamwise body force in a periodic channel."""
+    bulk_velocity = max(abs(float(bulk_velocity)), 1e-12)
+    tau_w = abs(float(body_force_x)) * float(hydraulic_diameter) / 4.0
+    return 2.0 * tau_w / (float(rho) * bulk_velocity * bulk_velocity)
+
+
+def backward_facing_step_reattachment_length(
+    ux: np.ndarray,
+    *,
+    step_index: int,
+    wall_offset: int = 1,
+) -> Optional[float]:
+    """
+    Estimate reattachment length from the first downstream sign change of near-wall ux.
+
+    Accepts either `(Ny, Nx)` or `(Nz, Ny, Nx)` streamwise velocity fields.
+    """
+    field = np.asarray(ux, dtype=np.float64)
+    if field.ndim == 3:
+        field = np.mean(field, axis=0)
+    if field.ndim != 2:
+        raise ValueError("ux must be 2D or 3D.")
+    y = min(max(int(wall_offset), 0), field.shape[0] - 1)
+    line = field[y, :]
+    if step_index >= line.size - 1:
+        return None
+    for x in range(int(step_index) + 1, line.size):
+        if line[x] > 0.0:
+            return float(x - step_index)
+    return None

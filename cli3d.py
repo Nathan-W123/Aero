@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     # BCs
     p.add_argument("--wall-bc", choices=["slip", "noslip"], default="slip")
     p.add_argument("--outlet-bc", choices=["convective", "zerogradient"], default="convective")
+    p.add_argument("--streamwise-bc", choices=["open", "periodic", "recycling"], default="open")
 
     # Backend
     p.add_argument("--backend", choices=["auto", "numpy", "numba"], default="auto")
@@ -83,14 +84,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sponge-strength", type=float, default=0.1)
     p.add_argument("--les", action="store_true")
     p.add_argument("--les-cs", type=float, default=0.16)
+    p.add_argument("--bouzidi", action="store_true", help="Use Bouzidi 2nd-order curved bounce-back")
+    p.add_argument("--van-driest", action="store_true", help="Van Driest wall damping for LES (requires --les)")
+    p.add_argument("--van-driest-A", type=float, default=25.0, help="Van Driest A+ constant (default 25)")
+    p.add_argument("--export-hdf5", type=str, default=None, metavar="PATH",
+                   help="Write HDF5+XDMF time series to PATH (requires h5py)")
+    p.add_argument("--hdf5-every", type=int, default=None, metavar="N",
+                   help="Write HDF5 snapshot every N steps")
     p.add_argument("--mesh-bc", choices=["voxel", "ibm"], default="voxel",
                    help="STL mesh boundary: voxel bounce-back or Guo IBM")
+    p.add_argument("--body-force-x", type=float, default=0.0,
+                   help="Uniform streamwise body force for periodic/internal-flow cases")
+    p.add_argument("--body-force-y", type=float, default=0.0)
+    p.add_argument("--body-force-z", type=float, default=0.0)
     p.add_argument("--allow-high-blockage", action="store_true",
                    help="Allow very confined runs (>30% frontal blockage)")
 
     # Run control
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--check-every", type=int, default=500)
+    p.add_argument("--auto-stop", action="store_true",
+                   help="Stop when rolling Cd and Strouhal metrics become stationary")
 
     # Checkpoint
     p.add_argument("--checkpoint-every", type=int, default=None)
@@ -263,6 +277,7 @@ def main() -> int:
     print(f"  Blockage  : {blockage*100:.1f}%  (y={blockage_y*100:.1f}%, z={blockage_z*100:.1f}%, {blockage_label})")
     print(f"  Steps     : {args.steps}")
     print(f"  wall_bc   : {args.wall_bc}")
+    print(f"  x_bc      : {args.streamwise_bc}")
     print(f"  outlet_bc : {args.outlet_bc}")
     print(f"  collision : {args.collision}")
     print(f"  backend   : {args.backend}")
@@ -309,6 +324,14 @@ def main() -> int:
         solid = geom.mark_solid(args.nz, args.ny, args.nx)
         print(f"Obstacle  : {solid.sum()} solid cells")
 
+    ibm_active = args.shape == "mesh" and args.mesh_bc == "ibm"
+    if args.bouzidi and not ibm_active and args.shape != "mesh":
+        phi_for_solver = geom.sdf_field(args.nz, args.ny, args.nx)
+    elif ibm_active:
+        phi_for_solver = phi_field
+    else:
+        phi_for_solver = None
+
     # Solver
     solver = Solver3D(
         Nz=args.nz, Ny=args.ny, Nx=args.nx,
@@ -319,6 +342,7 @@ def main() -> int:
         rho0=1.0,
         wall_bc=args.wall_bc,
         outlet_bc=args.outlet_bc,
+        streamwise_bc=args.streamwise_bc,
         backend=args.backend,
         collision=args.collision,
         inlet_perturbation=args.inlet_perturbation,
@@ -327,8 +351,14 @@ def main() -> int:
         sponge_strength=args.sponge_strength,
         les=args.les,
         les_cs=args.les_cs,
-        ibm_enabled=(args.shape == "mesh" and args.mesh_bc == "ibm"),
-        phi=phi_field if args.shape == "mesh" and args.mesh_bc == "ibm" else None,
+        bouzidi=args.bouzidi,
+        van_driest=args.van_driest,
+        van_driest_A=args.van_driest_A,
+        ibm_enabled=ibm_active,
+        phi=phi_for_solver,
+        body_force_x=args.body_force_x,
+        body_force_y=args.body_force_y,
+        body_force_z=args.body_force_z,
     )
     print(f"Surf links: {solver.surface_links.shape[0]}")
     print()
@@ -353,6 +383,9 @@ def main() -> int:
         verbose=args.verbose,
         checkpoint_every=args.checkpoint_every,
         checkpoint_dir=ckpt_dir,
+        auto_stop=args.auto_stop,
+        hdf5_path=args.export_hdf5,
+        hdf5_every=args.hdf5_every or args.check_every,
     )
     elapsed = time.perf_counter() - t0
 
@@ -365,6 +398,7 @@ def main() -> int:
     print(f"  Cl_y  (mean) = {result['Cly_mean']:.4f}  ±  {result['Cly_std']:.4f}")
     print(f"  Cl_z  (mean) = {result['Clz_mean']:.4f}  ±  {result['Clz_std']:.4f}")
     print(f"  Elapsed      = {elapsed:.1f} s  ({args.steps/elapsed:.0f} steps/s)")
+    print(f"  Stop reason  = {result.get('stop_reason', 'max_steps')}")
     if args.shape == "sphere":
         if abs(args.re - 20.0) < 1e-12:
             print(f"  Expected Cd  ≈ 2–5  (sphere Re=20; confinement can inflate drag)")

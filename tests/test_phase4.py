@@ -334,7 +334,7 @@ class TestBoundaryConditions3D:
     def test_build_surface_links_sphere(self):
         s = Sphere(radius=5.0)
         solid = s.mark_solid(16, 16, 32)
-        links = build_surface_links_3d(solid)
+        links, _ = build_surface_links_3d(solid)
         assert links.shape[1] == 4
         assert links.shape[0] > 0
         # All i values must be 1..18 (no rest direction links)

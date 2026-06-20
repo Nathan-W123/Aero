@@ -11,8 +11,10 @@ Applied each timestep in this order (after streaming):
 f array layout: (Q, Nz, Ny, Nx)
 """
 
+from typing import Optional, Tuple
+
 import numpy as np
-from .d3q19 import E3, OPP3, Y_MIR3
+from .d3q19 import E3, OPP3, Y_MIR3, compute_feq_3d, compute_macroscopic_3d
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,40 @@ def apply_outlet_convective_3d(
     f_outlet_prev[:] = new_outlet
 
 
+def apply_streamwise_periodic_3d(f: np.ndarray) -> None:
+    """Explicit no-op helper for fully periodic streamwise domains."""
+    return None
+
+
+def apply_recycling_rescaling_inlet_3d(
+    f: np.ndarray,
+    target_u0: float,
+    *,
+    recycle_index: int = -2,
+    inlet_index: int = 0,
+) -> None:
+    """
+    Recycle the downstream plane to the inlet and rescale its mean ux to `target_u0`.
+
+    This preserves cross-stream structure and turbulence content better than a
+    uniform inlet while remaining lightweight enough for the current solver.
+    """
+    rho, ux, uy, uz = compute_macroscopic_3d(f)
+    recycle_rho = rho[:, :, recycle_index]
+    recycle_ux = ux[:, :, recycle_index]
+    recycle_uy = uy[:, :, recycle_index]
+    recycle_uz = uz[:, :, recycle_index]
+    mean_ux = float(np.mean(recycle_ux))
+    scale = 1.0 if abs(mean_ux) < 1e-12 else float(target_u0) / mean_ux
+    feq = compute_feq_3d(
+        recycle_rho[:, :, None],
+        (recycle_ux * scale)[:, :, None],
+        (recycle_uy * scale)[:, :, None],
+        (recycle_uz * scale)[:, :, None],
+    )
+    f[:, :, :, inlet_index] = feq[:, :, :, 0]
+
+
 # ---------------------------------------------------------------------------
 # Wall BCs: top (y=Ny-1) and bottom (y=0)
 # ---------------------------------------------------------------------------
@@ -148,22 +184,33 @@ def apply_noslip_walls_3d(f: np.ndarray) -> None:
 # Obstacle: mid-link bounce-back
 # ---------------------------------------------------------------------------
 
-def build_surface_links_3d(solid: np.ndarray) -> np.ndarray:
+def build_surface_links_3d(
+    solid: np.ndarray,
+    phi: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Precompute surface links for 3D mid-link bounce-back.
+    Precompute surface links for 3D bounce-back.
 
     A surface link (i, z, y, x) satisfies:
       - cell (z, y, x) is fluid
       - neighbour (z+ez[i], y+ey[i], x+ex[i]) is solid
 
+    Parameters
+    ----------
+    solid : (Nz, Ny, Nx) bool
+    phi   : optional (Nz, Ny, Nx) float64 signed-distance field.
+            If provided, q_vals[k] = clip(phi[z, y, x], 1e-4, 1.0).
+            If None, q_vals = 0.5 (exact mid-link).
+
     Returns
     -------
-    links : ndarray int32, shape (N_links, 4) — columns [i, z, y, x]
+    links  : ndarray int32, shape (N_links, 4) — columns [i, z, y, x]
+    q_vals : ndarray float32, shape (N_links,)
     """
     Nz, Ny, Nx = solid.shape
     fluid = ~solid
     links = []
-    for i in range(1, Q3_val := 19):
+    for i in range(1, 19):
         ex_, ey_, ez_ = int(E3[i, 0]), int(E3[i, 1]), int(E3[i, 2])
         z_g, y_g, x_g = np.meshgrid(
             np.arange(Nz), np.arange(Ny), np.arange(Nx), indexing='ij'
@@ -176,7 +223,19 @@ def build_surface_links_3d(solid: np.ndarray) -> np.ndarray:
         for z, y, x in zip(zs.tolist(), ys.tolist(), xs.tolist()):
             links.append((i, int(z), int(y), int(x)))
 
-    return np.array(links, dtype=np.int32) if links else np.empty((0, 4), dtype=np.int32)
+    if not links:
+        return np.empty((0, 4), dtype=np.int32), np.empty(0, dtype=np.float32)
+
+    links_arr = np.array(links, dtype=np.int32)
+    if phi is not None:
+        z_arr = links_arr[:, 1]
+        y_arr = links_arr[:, 2]
+        x_arr = links_arr[:, 3]
+        q_vals = np.clip(phi[z_arr, y_arr, x_arr].astype(np.float32), 1e-4, 1.0)
+    else:
+        q_vals = np.full(len(links_arr), 0.5, dtype=np.float32)
+
+    return links_arr, q_vals
 
 
 def apply_bounce_back_3d(
@@ -197,3 +256,46 @@ def apply_bounce_back_3d(
     x_arr = links[:, 3]
     opp_i = OPP3[i_arr]
     f[opp_i, z_arr, y_arr, x_arr] = f_pre[i_arr, z_arr, y_arr, x_arr]
+
+
+def apply_bounce_back_bouzidi_3d(
+    f: np.ndarray,
+    f_pre: np.ndarray,
+    links: np.ndarray,
+    q_vals: np.ndarray,
+) -> None:
+    """
+    Bouzidi (2001) interpolated bounce-back for 3D — 2nd-order at curved walls.
+
+    q < 0.5:  f[opp[i], z, y, x] = 2q*f_pre[i,z,y,x] + (1-2q)*f_pre[opp[i],z,y,x]
+    q >= 0.5: f[opp[i], z, y, x] = (1/2q)*f_pre[i,z,y,x]
+                                  + (1-1/2q)*f_pre[i, z_nb, y_nb, x_nb]
+    """
+    if links.shape[0] == 0:
+        return
+
+    Nz, Ny, Nx = f.shape[1], f.shape[2], f.shape[3]
+    i_arr = links[:, 0]
+    z_arr = links[:, 1]
+    y_arr = links[:, 2]
+    x_arr = links[:, 3]
+    opp_i = OPP3[i_arr]
+    q = q_vals.astype(np.float64)
+
+    m = q < 0.5
+    if m.any():
+        f[opp_i[m], z_arr[m], y_arr[m], x_arr[m]] = (
+            2.0 * q[m] * f_pre[i_arr[m], z_arr[m], y_arr[m], x_arr[m]]
+            + (1.0 - 2.0 * q[m]) * f_pre[opp_i[m], z_arr[m], y_arr[m], x_arr[m]]
+        )
+
+    m2 = ~m
+    if m2.any():
+        zn = np.clip(z_arr[m2] + E3[opp_i[m2], 2].astype(int), 0, Nz - 1)
+        yn = np.clip(y_arr[m2] + E3[opp_i[m2], 1].astype(int), 0, Ny - 1)
+        xn = np.clip(x_arr[m2] + E3[opp_i[m2], 0].astype(int), 0, Nx - 1)
+        inv2q = 1.0 / (2.0 * q[m2])
+        f[opp_i[m2], z_arr[m2], y_arr[m2], x_arr[m2]] = (
+            inv2q * f_pre[i_arr[m2], z_arr[m2], y_arr[m2], x_arr[m2]]
+            + (1.0 - inv2q) * f_pre[i_arr[m2], zn, yn, xn]
+        )

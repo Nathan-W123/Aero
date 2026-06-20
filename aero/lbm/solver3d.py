@@ -31,15 +31,19 @@ from typing import Callable, Optional, List
 
 from .d3q19 import Q3, E3, W3, compute_macroscopic_3d, compute_feq_3d
 from . import kernels3d as _k3
+from .kernels3d import collision_kernel_3d_xp, stream_kernel_3d_xp
 from .kernels3d_mrt import MRTKernel3D
 from .boundary3d import (
     apply_inlet_zou_he_3d,
     apply_outlet_zero_gradient_3d,
     apply_outlet_convective_3d,
+    apply_streamwise_periodic_3d,
+    apply_recycling_rescaling_inlet_3d,
     apply_slip_walls_3d,
     apply_noslip_walls_3d,
     build_surface_links_3d,
     apply_bounce_back_3d,
+    apply_bounce_back_bouzidi_3d,
 )
 from ..forces3d import (
     compute_forces_3d,
@@ -47,13 +51,13 @@ from ..forces3d import (
     forces_to_coefficients_3d,
     split_to_coefficients_3d,
 )
-from ..diagnostics import check_stability  # reuse scalar stability check
+from ..diagnostics import check_stability, detect_statistical_stationarity
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
 from .physics import base_nu_from_omega
 from .trt2d import trt_taus
 from . import kernels3d_trt as _ktrt3
-from .ibm_guo import apply_guo_forcing_3d
+from .ibm_guo import apply_guo_forcing_3d, apply_uniform_body_force_3d
 
 
 class Solver3D:
@@ -70,6 +74,7 @@ class Solver3D:
         wall_bc: str = "slip",
         inlet_bc: str = "velocity",
         outlet_bc: str = "convective",
+        streamwise_bc: str = "open",
         backend: str = "auto",
         collision: str = "bgk",
         inlet_perturbation: float = 0.0,
@@ -80,6 +85,12 @@ class Solver3D:
         les_cs: float = 0.16,
         ibm_enabled: bool = False,
         phi: Optional[np.ndarray] = None,
+        bouzidi: bool = False,
+        van_driest: bool = False,
+        van_driest_A: float = 25.0,
+        body_force_x: float = 0.0,
+        body_force_y: float = 0.0,
+        body_force_z: float = 0.0,
     ):
         """
         Parameters
@@ -109,6 +120,11 @@ class Solver3D:
         self.wall_bc = wall_bc
         self.inlet_bc = inlet_bc
         self.outlet_bc = outlet_bc
+        if streamwise_bc not in ("open", "periodic", "recycling"):
+            raise ValueError(
+                f"Unknown streamwise_bc '{streamwise_bc}'. Choose 'open', 'periodic', or 'recycling'."
+            )
+        self.streamwise_bc = streamwise_bc
         self.inlet_perturbation = max(float(inlet_perturbation), 0.0)
         self.trt_lambda = float(trt_lambda)
         self.sponge_thickness = int(sponge_thickness)
@@ -117,6 +133,12 @@ class Solver3D:
         self.les_cs = float(les_cs)
         self.ibm_enabled = bool(ibm_enabled)
         self.phi = phi
+        self.bouzidi = bool(bouzidi)
+        self.van_driest = bool(van_driest)
+        self.van_driest_A = float(van_driest_A)
+        self.body_force_x = float(body_force_x)
+        self.body_force_y = float(body_force_y)
+        self.body_force_z = float(body_force_z)
         self.tau = 1.0 / omega
         self._base_nu = base_nu_from_omega(omega)
         if collision not in ("bgk", "mrt", "trt"):
@@ -126,6 +148,8 @@ class Solver3D:
         self._s_minus_trt = 1.0 / self._s_minus_trt
 
         # Backend
+        self._xp = np
+        self._use_cupy = False
         if backend == "auto":
             self._use_numba = _k3.HAS_NUMBA
         elif backend == "numba":
@@ -134,9 +158,20 @@ class Solver3D:
             self._use_numba = True
         elif backend == "numpy":
             self._use_numba = False
+        elif backend == "cupy":
+            try:
+                import cupy as cp  # type: ignore
+                self._xp = cp
+                self._use_cupy = True
+                self._use_numba = False
+            except ImportError:
+                raise ImportError(
+                    "backend='cupy' requested but cupy is not installed. "
+                    "Install it with: pip install cupy-cudaXX"
+                )
         else:
-            raise ValueError(f"Unknown backend '{backend}'. Choose 'auto', 'numpy', or 'numba'.")
-        self.backend: str = "numba" if self._use_numba else "numpy"
+            raise ValueError(f"Unknown backend '{backend}'. Choose 'auto', 'numpy', 'numba', or 'cupy'.")
+        self.backend: str = "cupy" if self._use_cupy else ("numba" if self._use_numba else "numpy")
 
         # Pre-cast lattice arrays
         self._ex = E3[:, 0].astype(np.int32)
@@ -146,7 +181,8 @@ class Solver3D:
         self._mrt_kernel = None
 
         self.solid = np.ascontiguousarray(solid, dtype=np.bool_)
-        self.surface_links = build_surface_links_3d(self.solid)
+        _phi_for_q = phi if (bouzidi and phi is not None) else None
+        self.surface_links, self.q_vals = build_surface_links_3d(self.solid, _phi_for_q)
 
         # Initialize f to equilibrium
         rho_init = np.full((Nz, Ny, Nx), rho0)
@@ -165,6 +201,23 @@ class Solver3D:
         self._u_wall_y = np.zeros((Nz, Ny, Nx))
         self._u_wall_z = np.zeros((Nz, Ny, Nx))
         self._omega_dummy = np.zeros((Nz, Ny, Nx), dtype=np.float64)
+
+        # Transfer domain arrays to GPU when using CuPy
+        if self._use_cupy:
+            xp = self._xp
+            self.f = xp.asarray(self.f)
+            self._f_outlet_prev = xp.asarray(self._f_outlet_prev)
+            self.solid = xp.asarray(self.solid)
+            self._ex = xp.asarray(self._ex)
+            self._ey = xp.asarray(self._ey)
+            self._ez = xp.asarray(self._ez)
+            self._w  = xp.asarray(self._w)
+            self._omega_dummy = xp.asarray(self._omega_dummy)
+            self._u_wall_x = xp.asarray(self._u_wall_x)
+            self._u_wall_y = xp.asarray(self._u_wall_y)
+            self._u_wall_z = xp.asarray(self._u_wall_z)
+            self.surface_links = xp.asarray(self.surface_links)
+            self.q_vals = xp.asarray(self.q_vals)
 
         self.step_count: int = 0
         self.Cd_history: List[float] = []
@@ -190,6 +243,7 @@ class Solver3D:
         if self.les:
             omega_field = build_omega_field_3d(
                 f, self.solid, self.fluid, self._base_nu, self.omega, self.les_cs,
+                phi=self.phi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             )
             use_omega_field = True
         omega_use = self.omega
@@ -223,6 +277,18 @@ class Solver3D:
             f_new = np.empty_like(f_post)
             _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
             f_post = f_new
+        elif self._use_cupy:
+            xp = self._xp
+            f_post = xp.empty_like(f)
+            collision_kernel_3d_xp(
+                f, f_post, self.solid, omega_use,
+                self._ex, self._ey, self._ez, self._w,
+                omega_field, use_omega_field, xp=xp,
+            )
+            f_pre = f_post.copy()
+            f_new = xp.empty_like(f_post)
+            stream_kernel_3d_xp(f_post, f_new, self._ex, self._ey, self._ez, xp=xp)
+            f_post = f_new
         elif self._use_numba:
             f_post = np.empty_like(f)
             _k3.collision_kernel_3d(
@@ -247,22 +313,44 @@ class Solver3D:
             _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
             f_post = f_new
 
-        # BCs
-        if not self.ibm_enabled:
-            apply_bounce_back_3d(f_post, f_pre, self.surface_links)
-
-        if self.inlet_bc == "velocity":
-            apply_inlet_zou_he_3d(
+        if any(abs(val) > 0.0 for val in (self.body_force_x, self.body_force_y, self.body_force_z)):
+            apply_uniform_body_force_3d(
                 f_post,
-                self.u0,
-                uz_amp=self.inlet_perturbation,
-                step=self.step_count + 1,
+                self.tau,
+                self.body_force_x,
+                self.body_force_y,
+                self.body_force_z,
+                self._ex,
+                self._ey,
+                self._ez,
+                self._w,
+                self.solid,
             )
 
-        if self.outlet_bc == "convective":
-            apply_outlet_convective_3d(f_post, self._f_outlet_prev, self.u0)
-        else:
-            apply_outlet_zero_gradient_3d(f_post)
+        # BCs
+        if not self.ibm_enabled:
+            if self.bouzidi:
+                apply_bounce_back_bouzidi_3d(f_post, f_pre, self.surface_links, self.q_vals)
+            else:
+                apply_bounce_back_3d(f_post, f_pre, self.surface_links)
+
+        if self.streamwise_bc == "open":
+            if self.inlet_bc == "velocity":
+                apply_inlet_zou_he_3d(
+                    f_post,
+                    self.u0,
+                    uz_amp=self.inlet_perturbation,
+                    step=self.step_count + 1,
+                )
+
+            if self.outlet_bc == "convective":
+                apply_outlet_convective_3d(f_post, self._f_outlet_prev, self.u0)
+            else:
+                apply_outlet_zero_gradient_3d(f_post)
+        elif self.streamwise_bc == "periodic":
+            apply_streamwise_periodic_3d(f_post)
+        elif self.streamwise_bc == "recycling":
+            apply_recycling_rescaling_inlet_3d(f_post, self.u0)
 
         if self.sponge_thickness > 0:
             apply_sponge_relaxation_3d(
@@ -278,9 +366,19 @@ class Solver3D:
         self.f = f_post
         self.step_count += 1
 
-        Fx, Fy, Fz = compute_forces_3d(f_pre, f_post, self.surface_links)
+        # For force computation, bring GPU arrays to CPU if needed
+        if self._use_cupy:
+            f_pre_cpu  = f_pre.get()
+            f_post_cpu = f_post.get()
+            links_cpu  = self.surface_links.get()
+        else:
+            f_pre_cpu  = f_pre
+            f_post_cpu = f_post
+            links_cpu  = self.surface_links
+
+        Fx, Fy, Fz = compute_forces_3d(f_pre_cpu, f_post_cpu, links_cpu)
         Cd, Cly, Clz = forces_to_coefficients_3d(Fx, Fy, Fz, self.rho0, self.u0, self.D)
-        fx_p, fy_p, fz_p, fx_v, fy_v, fz_v = compute_force_split_3d(f_pre, f_post, self.surface_links)
+        fx_p, fy_p, fz_p, fx_v, fy_v, fz_v = compute_force_split_3d(f_pre_cpu, f_post_cpu, links_cpu)
         cdp, _, _, cdv, _, _ = split_to_coefficients_3d(
             fx_p, fy_p, fz_p, fx_v, fy_v, fz_v, self.rho0, self.u0, self.D,
         )
@@ -298,6 +396,13 @@ class Solver3D:
         callback: Optional[Callable] = None,
         checkpoint_every: Optional[int] = None,
         checkpoint_dir: Optional[str] = None,
+        auto_stop: bool = False,
+        convergence_window: int = 5000,
+        convergence_tol: float = 0.01,
+        strouhal_window: int = 4096,
+        strouhal_tol: float = 0.05,
+        hdf5_path: Optional[str] = None,
+        hdf5_every: Optional[int] = None,
     ) -> dict:
         """
         Run the 3D simulation for `steps` timesteps.
@@ -311,8 +416,17 @@ class Solver3D:
             print(f"  Backend   : {self.backend}  (3D D3Q19)")
             print(f"  Collision : {self.collision}")
 
+        from ..hdf5_writer import HDF5Writer
+        hdf5_writer = (
+            HDF5Writer(hdf5_path, Nz=self.Nz, Ny=self.Ny, Nx=self.Nx, dims=3)
+            if hdf5_path else None
+        )
+
         t_start    = time.perf_counter()
         avg_window = max(1, steps // 5)
+        stop_reason = "max_steps"
+        last_convergence = None
+        last_strouhal = None
 
         for step in range(1, steps + 1):
             Cd, Cly, Clz = self._step()
@@ -325,6 +439,12 @@ class Solver3D:
             if checkpoint_every and checkpoint_dir and step % checkpoint_every == 0:
                 ckpt = pathlib.Path(checkpoint_dir) / f"checkpoint3d_{self.step_count:08d}.npz"
                 self.save_checkpoint(str(ckpt))
+
+            if hdf5_writer and hdf5_every and step % hdf5_every == 0:
+                from ..lbm.d3q19 import compute_macroscopic_3d as _cm3
+                _f_cpu = self.f.get() if self._use_cupy else self.f
+                _rho, _ux, _uy, _uz = _cm3(_f_cpu)
+                hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, uz=_uz, rho=_rho)
 
             if step % check_every == 0:
                 # Use scalar stability check on the midplane slice
@@ -351,6 +471,26 @@ class Solver3D:
                 if callback is not None:
                     callback(step, Cd, Cly, Clz)
 
+                if auto_stop:
+                    lift_history = self.Cly_history
+                    if np.std(self.Clz_history[-min(len(self.Clz_history), strouhal_window):]) > np.std(
+                        self.Cly_history[-min(len(self.Cly_history), strouhal_window):]
+                    ):
+                        lift_history = self.Clz_history
+                    last_convergence, last_strouhal, should_stop = detect_statistical_stationarity(
+                        self.Cd_history,
+                        lift_history,
+                        self.D,
+                        self.u0,
+                        convergence_window=convergence_window,
+                        convergence_tol=convergence_tol,
+                        strouhal_window=strouhal_window,
+                        strouhal_tol=strouhal_tol,
+                    )
+                    if should_stop:
+                        stop_reason = "auto_converged"
+                        break
+
         rho, ux, uy, uz = compute_macroscopic_3d(self.f)
 
         Cd_arr  = np.array(self.Cd_history[-avg_window:])
@@ -359,6 +499,8 @@ class Solver3D:
         Cdp_arr = np.array(self.Cd_p_history[-avg_window:])
         Cdv_arr = np.array(self.Cd_v_history[-avg_window:])
 
+        if hdf5_writer:
+            hdf5_writer.close()
         return {
             "Cd_mean":    float(np.mean(Cd_arr)),
             "Cly_mean":   float(np.mean(Cly_arr)),
@@ -373,27 +515,98 @@ class Solver3D:
             "Clz_history": self.Clz_history,
             "Cd_p_history": self.Cd_p_history,
             "Cd_v_history": self.Cd_v_history,
+            "steps_completed": self.step_count,
+            "stop_reason": stop_reason,
+            "convergence_report": last_convergence,
+            "strouhal_report": last_strouhal,
             "rho": rho, "ux": ux, "uy": uy, "uz": uz,
         }
 
     # ------------------------------------------------------------------
 
     def save_checkpoint(self, path: str) -> None:
-        np.savez_compressed(
-            path,
-            f=self.f,
-            f_outlet_prev=self._f_outlet_prev,
+        """
+        Save full solver state including all init parameters for stateless restart.
+
+        Use `Solver3D.from_checkpoint(path)` to rebuild without any external
+        geometry or parameter knowledge.
+        """
+        import json
+        f_cpu  = self.f.get() if self._use_cupy else self.f
+        fp_cpu = self._f_outlet_prev.get() if self._use_cupy else self._f_outlet_prev
+        sl_cpu = self.surface_links.get() if self._use_cupy else self.surface_links
+        qv_cpu = self.q_vals.get() if self._use_cupy else self.q_vals
+        solid_cpu = self.solid.get() if self._use_cupy else self.solid
+        params = dict(
+            Nz=self.Nz, Ny=self.Ny, Nx=self.Nx, omega=self.omega, u0=self.u0, D=self.D,
+            rho0=self.rho0, wall_bc=self.wall_bc, inlet_bc=self.inlet_bc,
+            outlet_bc=self.outlet_bc, streamwise_bc=self.streamwise_bc,
+            backend="numpy",  # always restart on CPU; user can switch after
+            collision=self.collision, inlet_perturbation=self.inlet_perturbation,
+            trt_lambda=self.trt_lambda, sponge_thickness=self.sponge_thickness,
+            sponge_strength=self.sponge_strength, les=self.les, les_cs=self.les_cs,
+            ibm_enabled=self.ibm_enabled, bouzidi=self.bouzidi,
+            van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            body_force_x=self.body_force_x, body_force_y=self.body_force_y,
+            body_force_z=self.body_force_z,
+        )
+        kwargs: dict = dict(
+            f=f_cpu, f_outlet_prev=fp_cpu,
+            solid=solid_cpu, surface_links=sl_cpu, q_vals=qv_cpu,
             Cd_history=np.array(self.Cd_history,  dtype=np.float64),
             Cly_history=np.array(self.Cly_history, dtype=np.float64),
             Clz_history=np.array(self.Clz_history, dtype=np.float64),
             step_count=np.array(self.step_count, dtype=np.int64),
+            params_json=np.array(json.dumps(params)),
         )
+        if self.phi is not None:
+            phi_cpu = self.phi.get() if self._use_cupy else self.phi
+            kwargs["phi"] = phi_cpu
+        np.savez_compressed(path, **kwargs)
 
     def load_checkpoint(self, path: str) -> None:
-        data = np.load(path)
-        self.f               = data["f"]
-        self._f_outlet_prev  = data["f_outlet_prev"]
-        self.Cd_history      = list(data["Cd_history"])
-        self.Cly_history     = list(data["Cly_history"])
-        self.Clz_history     = list(data["Clz_history"])
-        self.step_count      = int(data["step_count"])
+        """
+        Restore dynamic state (f, histories, step, link tables) from a checkpoint.
+
+        Restores pre-computed surface links and q_vals so geometry doesn't need
+        rebuilding.  For stateless restart use `from_checkpoint` instead.
+        """
+        data = np.load(path, allow_pickle=False)
+        f_np  = data["f"]
+        fp_np = data["f_outlet_prev"]
+        self.f              = self._xp.asarray(f_np)  if self._use_cupy else f_np
+        self._f_outlet_prev = self._xp.asarray(fp_np) if self._use_cupy else fp_np
+        self.Cd_history  = list(data["Cd_history"])
+        self.Cly_history = list(data["Cly_history"])
+        self.Clz_history = list(data["Clz_history"])
+        self.step_count  = int(data["step_count"])
+        if "surface_links" in data:
+            sl = data["surface_links"]
+            self.surface_links = self._xp.asarray(sl) if self._use_cupy else sl
+        if "q_vals" in data:
+            qv = data["q_vals"]
+            self.q_vals = self._xp.asarray(qv) if self._use_cupy else qv
+
+    @classmethod
+    def from_checkpoint(cls, path: str, backend: Optional[str] = None) -> "Solver3D":
+        """
+        Reconstruct a Solver3D entirely from a checkpoint file.
+
+        No geometry objects or parameter knowledge needed.  The checkpoint must
+        have been written by the current `save_checkpoint` (embeds params as JSON).
+
+        Parameters
+        ----------
+        path    : path to the .npz checkpoint
+        backend : override the saved backend (e.g. "cupy" to restart on GPU)
+        """
+        import json
+        data = np.load(path, allow_pickle=False)
+        params = json.loads(str(data["params_json"]))
+        if backend is not None:
+            params["backend"] = backend
+        solid = data["solid"]
+        phi   = data["phi"] if "phi" in data else None
+        solver = cls(solid=solid, phi=phi, **params)
+        solver.load_checkpoint(path)
+        return solver

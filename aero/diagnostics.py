@@ -3,8 +3,30 @@ Runtime stability checks, convergence detection, and flow diagnostics.
 """
 
 import warnings
+from dataclasses import dataclass
 from typing import List, Optional
 import numpy as np
+
+
+@dataclass
+class ConvergenceReport:
+    converged: bool
+    window: int
+    ratio: float
+    mean_abs: float
+    std: float
+    threshold: float
+
+
+@dataclass
+class StrouhalReport:
+    strouhal: Optional[float]
+    peak_frequency: Optional[float]
+    peak_amplitude: float
+    sample_count: int
+    window: int
+    stationary: bool = False
+    relative_drift: Optional[float] = None
 
 
 def check_stability(
@@ -59,13 +81,43 @@ def check_convergence(
 
     Used to allow early termination when steady state is reached.
     """
-    if len(Cd_history) < window:
-        return False
-    recent = np.array(Cd_history[-window:])
-    mean = float(np.mean(np.abs(recent)))
-    if mean < 1e-12:
-        return True
-    return float(np.std(recent)) / mean < tol
+    return analyze_convergence(Cd_history, window=window, tol=tol).converged
+
+
+def analyze_convergence(
+    history: List[float],
+    window: int = 5000,
+    tol: float = 0.01,
+) -> ConvergenceReport:
+    """Return rolling-window convergence metrics for a coefficient history."""
+    window = max(int(window), 1)
+    if len(history) < window:
+        return ConvergenceReport(
+            converged=False,
+            window=window,
+            ratio=float("inf"),
+            mean_abs=0.0,
+            std=0.0,
+            threshold=float(tol),
+        )
+
+    recent = np.asarray(history[-window:], dtype=np.float64)
+    mean_abs = float(np.mean(np.abs(recent)))
+    std = float(np.std(recent))
+    if mean_abs < 1e-12:
+        ratio = 0.0
+        converged = True
+    else:
+        ratio = std / mean_abs
+        converged = ratio < tol
+    return ConvergenceReport(
+        converged=converged,
+        window=window,
+        ratio=ratio,
+        mean_abs=mean_abs,
+        std=std,
+        threshold=float(tol),
+    )
 
 
 def compute_strouhal(
@@ -95,23 +147,85 @@ def compute_strouhal(
     -------
     St : float or None
     """
-    if len(Cl_history) < 512 or u0 <= 0.0 or D <= 0.0:
-        return None
+    return analyze_strouhal(Cl_history, D=D, u0=u0).strouhal
 
-    cl = np.array(Cl_history, dtype=np.float64)
-    cl -= cl.mean()
 
-    if np.max(np.abs(cl)) < 1e-6:
-        return None   # no oscillation
+def analyze_strouhal(
+    Cl_history: List[float],
+    D: float,
+    u0: float,
+    *,
+    window: Optional[int] = None,
+    min_samples: int = 512,
+) -> StrouhalReport:
+    """
+    Estimate Strouhal data from the recent lift history.
 
-    N = len(cl)
-    fft_mag = np.abs(np.fft.rfft(cl))
-    freqs   = np.fft.rfftfreq(N, d=1.0)   # units: cycles per timestep
+    If `window` is given, only the most recent window is analysed.
+    """
+    if u0 <= 0.0 or D <= 0.0:
+        return StrouhalReport(None, None, 0.0, len(Cl_history), int(window or 0))
 
-    peak_idx = int(np.argmax(fft_mag[1:])) + 1   # skip DC component
-    f_peak   = float(freqs[peak_idx])
+    samples = np.asarray(Cl_history, dtype=np.float64)
+    if window is not None and window > 0:
+        samples = samples[-int(window):]
+    used_window = int(samples.size)
+    if used_window < max(int(min_samples), 2):
+        return StrouhalReport(None, None, 0.0, len(Cl_history), used_window)
 
-    return f_peak * D / u0
+    signal = samples - float(np.mean(samples))
+    peak_amplitude = float(np.max(np.abs(signal)))
+    if peak_amplitude < 1e-6:
+        return StrouhalReport(None, None, peak_amplitude, len(Cl_history), used_window)
+
+    fft_mag = np.abs(np.fft.rfft(signal))
+    freqs = np.fft.rfftfreq(signal.size, d=1.0)
+    if fft_mag.size <= 1:
+        return StrouhalReport(None, None, peak_amplitude, len(Cl_history), used_window)
+
+    peak_idx = int(np.argmax(fft_mag[1:])) + 1
+    peak_frequency = float(freqs[peak_idx])
+    return StrouhalReport(
+        strouhal=peak_frequency * D / u0,
+        peak_frequency=peak_frequency,
+        peak_amplitude=peak_amplitude,
+        sample_count=len(Cl_history),
+        window=used_window,
+    )
+
+
+def detect_statistical_stationarity(
+    Cd_history: List[float],
+    Cl_history: List[float],
+    D: float,
+    u0: float,
+    *,
+    convergence_window: int = 5000,
+    convergence_tol: float = 0.01,
+    strouhal_window: int = 4096,
+    strouhal_tol: float = 0.05,
+) -> tuple[ConvergenceReport, StrouhalReport, bool]:
+    """
+    Combine rolling Cd convergence with Strouhal stability on recent lift data.
+
+    Returns `(cd_report, st_report, stop_now)`.
+    """
+    cd_report = analyze_convergence(Cd_history, window=convergence_window, tol=convergence_tol)
+    st_report = analyze_strouhal(Cl_history, D=D, u0=u0, window=strouhal_window)
+
+    if st_report.strouhal is None or st_report.window < max(strouhal_window, 1024):
+        return cd_report, st_report, cd_report.converged
+
+    half_window = st_report.window // 2
+    first = analyze_strouhal(Cl_history[-st_report.window:-half_window], D=D, u0=u0, min_samples=128)
+    second = analyze_strouhal(Cl_history[-half_window:], D=D, u0=u0, min_samples=128)
+    if first.strouhal is None or second.strouhal is None:
+        return cd_report, st_report, cd_report.converged
+
+    drift = abs(second.strouhal - first.strouhal) / max(abs(first.strouhal), 1e-12)
+    st_report.stationary = drift < strouhal_tol
+    st_report.relative_drift = drift
+    return cd_report, st_report, cd_report.converged and st_report.stationary
 
 
 def validate_parameters(

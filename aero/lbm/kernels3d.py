@@ -82,22 +82,32 @@ if HAS_NUMBA:
 else:
     def collision_kernel_3d(f, f_post, solid, omega, ex, ey, ez, w, omega_field, use_omega_field):
         """NumPy fallback for collision_kernel_3d."""
-        rho = f.sum(axis=0)
-        inv_rho = np.where(rho > 0.0, 1.0 / rho, 0.0)
-        ux = inv_rho * np.einsum('i,izyx->zyx', ex.astype(np.float64), f)
-        uy = inv_rho * np.einsum('i,izyx->zyx', ey.astype(np.float64), f)
-        uz = inv_rho * np.einsum('i,izyx->zyx', ez.astype(np.float64), f)
-        ux[solid] = 0.0; uy[solid] = 0.0; uz[solid] = 0.0
-        usq = ux*ux + uy*uy + uz*uz
-        om = omega_field if use_omega_field else np.full(ux.shape, omega)
-        for i in range(19):
-            eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
-            feqi = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
-            f_post[i] = (1.0 - om) * f[i] + om * feqi
+        collision_kernel_3d_xp(f, f_post, solid, omega, ex, ey, ez, w, omega_field, use_omega_field, xp=np)
 
     def stream_kernel_3d(f_src, f_dst, ex, ey, ez):
         """NumPy fallback for stream_kernel_3d."""
-        for i in range(19):
-            tmp = np.roll(f_src[i], int(ez[i]), axis=0)
-            tmp = np.roll(tmp,      int(ey[i]), axis=1)
-            f_dst[i] = np.roll(tmp, int(ex[i]), axis=2)
+        stream_kernel_3d_xp(f_src, f_dst, ex, ey, ez, xp=np)
+
+
+def collision_kernel_3d_xp(f, f_post, solid, omega, ex, ey, ez, w, omega_field, use_omega_field, xp=np):
+    """Array-backend-agnostic BGK collision (works with numpy or cupy)."""
+    rho = f.sum(axis=0)
+    inv_rho = xp.where(rho > 0.0, 1.0 / rho, 0.0)
+    ux = inv_rho * xp.einsum('i,izyx->zyx', ex.astype(xp.float64), f)
+    uy = inv_rho * xp.einsum('i,izyx->zyx', ey.astype(xp.float64), f)
+    uz = inv_rho * xp.einsum('i,izyx->zyx', ez.astype(xp.float64), f)
+    ux[solid] = 0.0; uy[solid] = 0.0; uz[solid] = 0.0
+    usq = ux*ux + uy*uy + uz*uz
+    om = omega_field if use_omega_field else xp.full(ux.shape, omega)
+    for i in range(19):
+        eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
+        feqi = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
+        f_post[i] = (1.0 - om) * f[i] + om * feqi
+
+
+def stream_kernel_3d_xp(f_src, f_dst, ex, ey, ez, xp=np):
+    """Array-backend-agnostic streaming (works with numpy or cupy)."""
+    for i in range(19):
+        tmp = xp.roll(f_src[i], int(ez[i]), axis=0)
+        tmp = xp.roll(tmp,      int(ey[i]), axis=1)
+        f_dst[i] = xp.roll(tmp, int(ex[i]), axis=2)

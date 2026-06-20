@@ -120,14 +120,14 @@ def test_surface_links_cylinder_count():
     from aero.geometry.cylinder import Cylinder
     cyl   = Cylinder(radius=10, cx_frac=0.5, cy_frac=0.5)
     solid = cyl.mark_solid(80, 80)
-    links = build_surface_links(solid)
+    links, _ = build_surface_links(solid)
     # Perimeter ≈ 2*pi*r ≈ 63; each surface cell has ~3 links on average
     assert 100 < links.shape[0] < 400
 
 
 def test_surface_links_empty_domain():
     solid = np.zeros((20, 40), dtype=bool)
-    links = build_surface_links(solid)
+    links, _ = build_surface_links(solid)
     assert links.shape[0] == 0
 
 
@@ -135,7 +135,7 @@ def test_surface_links_all_fluid_links_point_to_solid():
     from aero.geometry.cylinder import Cylinder
     cyl   = Cylinder(radius=8, cx_frac=0.5, cy_frac=0.5)
     solid = cyl.mark_solid(60, 60)
-    links = build_surface_links(solid)
+    links, _ = build_surface_links(solid)
     for row in links:
         i, y, x = int(row[0]), int(row[1]), int(row[2])
         assert not solid[y, x], "Source cell must be fluid"

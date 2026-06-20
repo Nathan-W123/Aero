@@ -185,6 +185,7 @@ class SimulationCase:
             "wall_bc":  getattr(args, "wall_bc", None),
             "inlet_bc": getattr(args, "inlet_bc", None),
             "outlet_bc": getattr(args, "outlet_bc", None),
+            "streamwise_bc": getattr(args, "streamwise_bc", None),
             "rho_in":   getattr(args, "rho_in", None),
             "rho_out":  getattr(args, "rho_out", None),
             "backend":  getattr(args, "backend", None),
@@ -197,6 +198,10 @@ class SimulationCase:
             "inlet_perturbation": getattr(args, "inlet_perturbation", None),
             "mesh_bc": getattr(args, "mesh_bc", None),
             "mesh_orient": getattr(args, "mesh_orient", None),
+            "body_force_x": getattr(args, "body_force_x", None),
+            "body_force_y": getattr(args, "body_force_y", None),
+            "body_force_z": getattr(args, "body_force_z", None),
+            "auto_stop": getattr(args, "auto_stop", None),
             # derived LBM params (informational)
             "D":        derived["D"],
             "nu_lbm":   derived["nu_lbm"],

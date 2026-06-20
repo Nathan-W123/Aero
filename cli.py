@@ -29,7 +29,7 @@ from aero.geometry.rectangle import Rectangle
 from aero.geometry.polygon import Polygon
 from aero.geometry.image_mask import ImageMask
 from aero.lbm.solver import Solver
-from aero.diagnostics import validate_parameters, check_convergence, compute_strouhal
+from aero.diagnostics import validate_parameters, compute_strouhal
 from aero.visualization import save_all
 from aero.case import SimulationCase
 
@@ -114,6 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sponge-strength", type=float, default=0.1, help="Max sponge relaxation")
     p.add_argument("--les", action="store_true", help="Enable Smagorinsky LES")
     p.add_argument("--les-cs", type=float, default=0.16, help="Smagorinsky constant")
+    p.add_argument("--bouzidi", action="store_true", help="Use Bouzidi 2nd-order curved bounce-back")
+    p.add_argument("--van-driest", action="store_true", help="Van Driest wall damping for LES (requires --les)")
+    p.add_argument("--van-driest-A", type=float, default=25.0, help="Van Driest damping constant A+ (default 25)")
+    p.add_argument("--export-hdf5", type=str, default=None, metavar="PATH",
+                   help="Write HDF5+XDMF time series to PATH (requires h5py)")
+    p.add_argument("--hdf5-every", type=int, default=None, metavar="N",
+                   help="Write HDF5 snapshot every N steps (default: same as --check-every)")
 
     # Output / config
     p.add_argument("--output",  type=str, default="./outputs",
@@ -308,6 +315,8 @@ def main() -> int:
     solid = geom.mark_solid(args.ny, args.nx)
     print(f"Obstacle  : {solid.sum()} solid cells")
 
+    phi = geom.sdf_field(args.ny, args.nx) if args.bouzidi else None
+
     # Determine rho_in for pressure-driven inlet
     rho_in = args.rho_in
     if rho_in is None:
@@ -334,6 +343,10 @@ def main() -> int:
         sponge_strength=args.sponge_strength,
         les=args.les,
         les_cs=args.les_cs,
+        bouzidi=args.bouzidi,
+        phi=phi,
+        van_driest=args.van_driest,
+        van_driest_A=args.van_driest_a,
     )
     print(f"Surf links: {solver.surface_links.shape[0]}")
     print()
@@ -353,36 +366,17 @@ def main() -> int:
     if ckpt_dir:
         pathlib.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
-    # Early-stop callback
-    def maybe_stop(step, Cd, Cl, rho, ux, uy):
-        if args.early_stop and check_convergence(solver.Cd_history):
-            print(f"\n[Convergence at step {step}]")
-            raise StopIteration
-
     t0 = time.perf_counter()
-    try:
-        result = solver.run(
-            steps=args.steps,
-            check_every=args.check_every,
-            verbose=args.verbose,
-            callback=maybe_stop if args.early_stop else None,
-            checkpoint_every=args.checkpoint_every,
-            checkpoint_dir=ckpt_dir,
-        )
-    except StopIteration:
-        from aero.lbm.d2q9 import compute_macroscopic
-        import numpy as np
-        rho, ux, uy = compute_macroscopic(solver.f)
-        w = max(1, len(solver.Cd_history) // 5)
-        result = dict(
-            Cd_mean=float(np.mean(solver.Cd_history[-w:])),
-            Cl_mean=float(np.mean(solver.Cl_history[-w:])),
-            Cd_std =float(np.std(solver.Cd_history[-w:])),
-            Cl_std =float(np.std(solver.Cl_history[-w:])),
-            Cd_history=solver.Cd_history,
-            Cl_history=solver.Cl_history,
-            rho=rho, ux=ux, uy=uy,
-        )
+    result = solver.run(
+        steps=args.steps,
+        check_every=args.check_every,
+        verbose=args.verbose,
+        checkpoint_every=args.checkpoint_every,
+        checkpoint_dir=ckpt_dir,
+        auto_stop=args.early_stop,
+        hdf5_path=args.export_hdf5,
+        hdf5_every=args.hdf5_every or args.check_every,
+    )
     elapsed = time.perf_counter() - t0
 
     # Strouhal number (Phase 2)
@@ -397,6 +391,7 @@ def main() -> int:
         print(f"  Cd_visc   = {result['Cd_v_mean']:.4f}  (viscous drag)")
     if St is not None:
         print(f"  St        = {St:.4f}  (Strouhal — expected ~0.164 for cylinder Re=100)")
+    print(f"  Stop      = {result.get('stop_reason', 'max_steps')}")
     print(f"  Elapsed   = {elapsed:.1f} s")
     print()
 
