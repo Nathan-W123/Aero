@@ -416,6 +416,89 @@ def advect_particles(
     return next_points, vectors, speed
 
 
+def seed_object_biased(
+    grid,
+    count: int = 55,
+    inlet_fraction: float = 0.02,
+    object_frac: float = 0.72,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Seed birth points at the inlet face, ~72% clustered around the object cross-section."""
+    if not HAS_PYVISTA:
+        raise ImportError("PyVista is not installed.")
+    rng = rng or np.random.default_rng(0)
+    x0, x1, y0, y1, z0, z1 = grid.bounds
+    _, _, _, solid, _ = _flat_velocity_arrays(grid)
+    n_x, n_y, n_z = _cell_dimensions(grid)
+    solid3d = solid.reshape(n_z, n_y, n_x)
+
+    coords_y = y0 + (y1 - y0) * (np.arange(n_y) + 0.5) / max(n_y, 1)
+    coords_z = z0 + (z1 - z0) * (np.arange(n_z) + 0.5) / max(n_z, 1)
+    wy = np.any(solid3d, axis=(0, 2)).astype(np.float64)
+    wz = np.any(solid3d, axis=(1, 2)).astype(np.float64)
+    cy = float(np.average(coords_y, weights=wy + 1e-9))
+    cz = float(np.average(coords_z, weights=wz + 1e-9))
+
+    obj_ys = coords_y[np.any(solid3d, axis=(0, 2))]
+    obj_zs = coords_z[np.any(solid3d, axis=(1, 2))]
+    half_y = float(np.ptp(obj_ys)) * 0.5 if obj_ys.size > 1 else (y1 - y0) * 0.1
+    half_z = float(np.ptp(obj_zs)) * 0.5 if obj_zs.size > 1 else (z1 - z0) * 0.1
+    half_y = max(half_y, (y1 - y0) * 0.06)
+    half_z = max(half_z, (z1 - z0) * 0.06)
+    radius_y = half_y * 2.2
+    radius_z = half_z * 2.2
+
+    x_in = x0 + inlet_fraction * max(x1 - x0, 1.0)
+    n_near = int(round(count * object_frac))
+    n_far = count - n_near
+
+    near_y = np.clip(
+        rng.uniform(cy - radius_y, cy + radius_y, n_near),
+        y0 + 0.04 * (y1 - y0), y1 - 0.04 * (y1 - y0),
+    )
+    near_z = np.clip(
+        rng.uniform(cz - radius_z, cz + radius_z, n_near),
+        z0 + 0.04 * (z1 - z0), z1 - 0.04 * (z1 - z0),
+    )
+    near_pts = np.column_stack([np.full(n_near, x_in), near_y, near_z])
+
+    if n_far > 0:
+        far_y = rng.uniform(y0 + 0.08 * (y1 - y0), y1 - 0.08 * (y1 - y0), n_far)
+        far_z = rng.uniform(z0 + 0.08 * (z1 - z0), z1 - 0.08 * (z1 - z0), n_far)
+        far_pts = np.column_stack([np.full(n_far, x_in), far_y, far_z])
+        return np.vstack([near_pts, far_pts])
+    return near_pts
+
+
+def step_particle(
+    grid,
+    point: np.ndarray,
+    dt: float,
+) -> Tuple[np.ndarray, bool]:
+    """Advect one particle a single step without auto-respawning.
+
+    Returns (new_point, still_valid). still_valid is False when the particle
+    has left the domain or entered a solid cell.
+    """
+    if not HAS_PYVISTA:
+        raise ImportError("PyVista is not installed.")
+    pts = point.reshape(1, 3)
+    vectors, _, solid_now = sample_velocity(grid, pts)
+    if bool(solid_now[0]):
+        return point.copy(), False
+    new_pt = point + dt * vectors[0]
+    x0, x1, y0, y1, z0, z1 = grid.bounds
+    in_bounds = (
+        x0 <= float(new_pt[0]) <= x1
+        and y0 <= float(new_pt[1]) <= y1
+        and z0 <= float(new_pt[2]) <= z1
+    )
+    if not in_bounds:
+        return new_pt, False
+    _, _, solid_next = sample_velocity(grid, new_pt.reshape(1, 3))
+    return new_pt, not bool(solid_next[0])
+
+
 def build_particle_glyphs(points: np.ndarray, vectors: np.ndarray, speed: np.ndarray, scale_factor: float = 18.0):
     if not HAS_PYVISTA:
         raise ImportError("PyVista is not installed.")

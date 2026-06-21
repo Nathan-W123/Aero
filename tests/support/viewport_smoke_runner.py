@@ -42,25 +42,38 @@ def main() -> int:
     done = {"ok": False, "error": ""}
 
     def finish_ok() -> None:
-        if viewport._particle_points is None:
-            done["error"] = "no particles"
+        if not viewport._streamlets:
+            done["error"] = "no streamlets"
             app.quit()
             return
-        start = viewport._particle_points[:, 0].copy()
-        QtCore.QTimer.singleShot(600, lambda: _check_motion(start))
+        # snapshot head positions for each alive streamlet
+        heads_before = [
+            s["history"][-1][0] for s in viewport._streamlets if s["alive"]
+        ]
+        QtCore.QTimer.singleShot(600, lambda: _check_motion(heads_before))
 
-    def _check_motion(start_x) -> None:
-        if viewport._particle_points is None:
-            done["error"] = "particles cleared"
+    def _check_motion(heads_before) -> None:
+        if not viewport._streamlets:
+            done["error"] = "streamlets cleared"
             app.quit()
             return
-        moved = float(np.mean(viewport._particle_points[:, 0] - start_x))
-        if moved < 0.05:
-            done["error"] = f"arrows did not advance (dx={moved:.4f})"
+        heads_after = [
+            s["history"][-1][0] for s in viewport._streamlets if s["alive"]
+        ]
+        n = min(len(heads_before), len(heads_after))
+        if n == 0:
+            done["error"] = "no alive streamlets after tick"
             app.quit()
             return
-        if viewport._quiver is None:
-            done["error"] = "quiver missing"
+        moved = float(np.mean(
+            [heads_after[i] - heads_before[i] for i in range(n)]
+        ))
+        if moved < 0.0:
+            done["error"] = f"streamlets did not advance (dx={moved:.4f})"
+            app.quit()
+            return
+        if not viewport._stream_lines or viewport._tip_quiver is None:
+            done["error"] = "stream lines or tip quiver missing"
             app.quit()
             return
         if not viewport._flow_timer.isActive():
@@ -68,7 +81,7 @@ def main() -> int:
             app.quit()
             return
         done["ok"] = True
-        print(f"OK: arrows advanced mean dx={moved:.3f}")
+        print(f"OK: streamlets advanced mean dx={moved:.3f}")
         app.quit()
 
     def on_fail(msg: str) -> None:

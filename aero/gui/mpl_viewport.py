@@ -23,8 +23,11 @@ except ImportError:
 
 from .styles import VIEWPORT_STYLESHEET
 
-_DEFAULT_ARROW_COUNT = 160
-_FLOW_INTERVAL_MS = 80
+_N_STREAMLETS = 20
+_MAX_BODY_LEN = 14       # positions before tail starts following
+_STREAMLET_WIDTH = 1.8   # line width
+_FLOW_INTERVAL_MS = 40
+_TIP_UPDATE_EVERY = 4    # redraw quiver tip only every N frames
 
 
 def _log(message: str) -> None:
@@ -97,12 +100,14 @@ if HAS_QT:
 
             self._grid = None
             self._loaded_volume_path: Optional[Path] = None
-            self._particle_points = None
             self._rng = None
-            self._quiver = None
             self._speed_norm: Optional[Normalize] = None
-            self._arrow_length = 1.0
             self._advect_dt = 6.0
+            self._tip_length = 1.0
+            self._tip_frame = 0
+            self._streamlets: list = []
+            self._stream_lines: list = []
+            self._tip_quiver = None
             self._default_view = {"elev": 22.0, "azim": -58.0}
             self._load_pending = False
             self._preview_mode = False
@@ -174,7 +179,7 @@ if HAS_QT:
                 0.5,
                 0.38,
                 "Drag to rotate · scroll to zoom · right-drag to pan\n"
-                "Flow arrows stream from the inlet around the body and into the wake",
+                "Streamlets grow from the inlet, sweep around the body, then fade out",
                 transform=self.ax.transAxes,
                 ha="center",
                 va="center",
@@ -211,21 +216,19 @@ if HAS_QT:
                 self._grid = grid
                 self._loaded_volume_path = path
                 self._rng = _np_random()
-                self._advect_dt = viz.compute_flow_advect_dt(grid)
+                self._advect_dt = viz.compute_flow_advect_dt(grid) * 0.5
                 self._configure_speed_colormap(grid)
-                x0, x1, _, _, _, _ = grid.bounds
-                self._arrow_length = 0.045 * max(float(x1 - x0), 1.0)
                 _log("drawing 3D scene...")
                 self._draw_scene(tunnel, solid)
-                self._spawn_inlet_arrows()
+                self._spawn_streamlets()
                 self.play_button.setText("Pause Flow")
                 self.play_button.setEnabled(True)
                 self.reset_button.setEnabled(True)
                 self._flow_timer.start()
                 self.status_label.setText(
-                    "Flow arrows streaming from inlet — drag to rotate the view"
+                    "Streamlets flowing from inlet — drag to rotate the view"
                 )
-                _log(f"scene ready: {path.name} ({len(self._particle_points)} arrows)")
+                _log(f"scene ready: {path.name} ({len(self._streamlets)} streamlets)")
                 self.load_succeeded.emit()
             except Exception as exc:
                 _log(f"load failed: {exc}")
@@ -234,13 +237,12 @@ if HAS_QT:
                 self._load_pending = False
 
         def load_geometry_preview(self, solid: np.ndarray, *, label: str = "") -> None:
-            """Show tunnel + obstacle immediately; flow arrows load after the run."""
+            """Show tunnel + obstacle immediately; flow streamlets load after the run."""
             if self._load_pending:
                 return
             self._load_pending = True
             self._flow_timer.stop()
-            self._particle_points = None
-            self._remove_quiver()
+            self._clear_stream_artists()
             self._loaded_volume_path = None
             self._preview_mode = True
             self.status_label.setText("Updating geometry preview…")
@@ -262,7 +264,7 @@ if HAS_QT:
                     "flow arrows load when the run completes"
                 )
                 self.status_label.setText(label or default)
-                _log(f"geometry preview ready ({cells} solid cells, no flow)")
+                _log(f"geometry preview ready ({cells} solid cells — streamlets load after run)")
             except Exception as exc:
                 _log(f"geometry preview failed: {exc}")
                 self._fail_load(str(exc))
@@ -288,7 +290,7 @@ if HAS_QT:
             self.ax.set_zlabel("z", color="#8899aa", fontsize=9)
 
         def _draw_scene(self, tunnel, solid) -> None:
-            self._remove_quiver()
+            self._clear_stream_artists()
             self.figure.clf()
             self.ax = self.figure.add_subplot(111, projection="3d")
             _plot_line_mesh(self.ax, tunnel, color="#8899aa", alpha=0.55, linewidth=0.6)
@@ -304,70 +306,179 @@ if HAS_QT:
             self.figure.tight_layout(pad=0.2)
             self.canvas.draw()
 
-        def _spawn_inlet_arrows(self) -> None:
+        def _clear_stream_artists(self) -> None:
+            self._streamlets = []
+            self._stream_lines = []
+            if self._tip_quiver is not None:
+                try:
+                    self._tip_quiver.remove()
+                except Exception:
+                    pass
+                self._tip_quiver = None
+
+        def _spawn_streamlets(self) -> None:
             if self._preview_mode or self._grid is None:
                 return
             viz = _visualization3d()
-            self._particle_points = viz.seed_inlet_streamlets(
-                self._grid,
-                count=_DEFAULT_ARROW_COUNT,
-                rng=self._rng,
-            )
-            self._draw_flow_arrows()
+            births = viz.seed_object_biased(self._grid, count=_N_STREAMLETS, rng=self._rng)
+            _, speed, _ = viz.sample_velocity(self._grid, births)
+            vmin = self._speed_norm.vmin  # type: ignore[union-attr]
+            vmax = self._speed_norm.vmax  # type: ignore[union-attr]
 
-        def _remove_quiver(self) -> None:
-            if self._quiver is not None:
-                try:
-                    self._quiver.remove()
-                except Exception:
-                    pass
-                self._quiver = None
+            x0, x1 = self._grid.bounds[:2]
+            self._tip_length = 0.065 * max(float(x1 - x0), 1.0)
 
-        def _draw_flow_arrows(self) -> None:
-            if self._grid is None or self._particle_points is None:
+            # Spread initial stages so streamlets aren't all born simultaneously.
+            pre_steps = self._rng.integers(0, 22, size=_N_STREAMLETS)  # type: ignore[union-attr]
+
+            self._streamlets = []
+            self._stream_lines = []
+
+            for i in range(len(births)):
+                birth = births[i].copy()
+                t = float(np.clip(
+                    (float(speed[i]) - vmin) / max(vmax - vmin, 1e-9), 0.0, 1.0
+                ))
+                color = coolwarm(t)
+
+                history: list = [birth]
+                alive = True
+                for _ in range(int(pre_steps[i])):
+                    new_head, valid = viz.step_particle(
+                        self._grid, np.array(history[-1]), self._advect_dt
+                    )
+                    if valid:
+                        history.append(new_head)
+                        # update color to local speed at new head
+                        _, spd_arr, _ = viz.sample_velocity(
+                            self._grid, new_head.reshape(1, 3)
+                        )
+                        t2 = float(np.clip(
+                            (float(spd_arr[0]) - vmin) / max(vmax - vmin, 1e-9), 0.0, 1.0
+                        ))
+                        color = coolwarm(t2)
+                    else:
+                        alive = False
+                        break
+                tail = max(0, len(history) - _MAX_BODY_LEN)
+
+                self._streamlets.append({
+                    "history": history,
+                    "tail": tail,
+                    "alive": alive,
+                    "color": color,
+                })
+                line, = self.ax.plot(
+                    [], [], [],
+                    "-",
+                    color=color[:3],
+                    linewidth=_STREAMLET_WIDTH,
+                    alpha=0.85,
+                    solid_capstyle="round",
+                )
+                self._stream_lines.append(line)
+
+            self._draw_streamlets()
+
+        def _draw_streamlets(self) -> None:
+            if not self._streamlets or not self._stream_lines:
+                return
+
+            # Update body lines in-place.
+            hx, hy, hz, dx, dy, dz, tip_colors = [], [], [], [], [], [], []
+            for s, line in zip(self._streamlets, self._stream_lines):
+                body = s["history"][s["tail"]:]
+                if len(body) >= 2:
+                    pts = np.array(body)
+                    line.set_data_3d(pts[:, 0], pts[:, 1], pts[:, 2])
+                    line.set_color(s["color"][:3])
+                    line.set_visible(True)
+                    # collect arrowhead data
+                    direction = pts[-1] - pts[-2]
+                    norm = float(np.linalg.norm(direction))
+                    if norm > 1e-12:
+                        direction /= norm
+                    hx.append(pts[-1, 0])
+                    hy.append(pts[-1, 1])
+                    hz.append(pts[-1, 2])
+                    dx.append(direction[0])
+                    dy.append(direction[1])
+                    dz.append(direction[2])
+                    tip_colors.append(s["color"][:3])
+                else:
+                    line.set_visible(False)
+
+            # Redraw batched tip quiver only every N frames (expensive remove+recreate).
+            self._tip_frame += 1
+            if self._tip_frame >= _TIP_UPDATE_EVERY:
+                self._tip_frame = 0
+                if self._tip_quiver is not None:
+                    try:
+                        self._tip_quiver.remove()
+                    except Exception:
+                        pass
+                    self._tip_quiver = None
+                if hx:
+                    self._tip_quiver = self.ax.quiver(
+                        hx, hy, hz, dx, dy, dz,
+                        color=tip_colors,
+                        length=self._tip_length,
+                        arrow_length_ratio=1.0,
+                        linewidth=0.0,
+                        alpha=0.96,
+                    )
+
+            self.canvas.draw_idle()
+
+        def _respawn_streamlet(self, s: dict) -> None:
+            if self._grid is None:
                 return
             viz = _visualization3d()
-            vectors, speed, solid = viz.sample_velocity(self._grid, self._particle_points)
-            mask = (~solid) & (speed > 1e-9)
-            if not np.any(mask):
-                return
-
-            pts = self._particle_points[mask]
-            vecs = vectors[mask]
-            spd = speed[mask]
-            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-            norms = np.maximum(norms, 1e-12)
-            unit = vecs / norms
-
-            self._remove_quiver()
-            colors = coolwarm(self._speed_norm(spd))  # type: ignore[arg-type]
-            self._quiver = self.ax.quiver(
-                pts[:, 0],
-                pts[:, 1],
-                pts[:, 2],
-                unit[:, 0],
-                unit[:, 1],
-                unit[:, 2],
-                colors=colors,
-                length=self._arrow_length,
-                normalize=False,
-                linewidth=0.9,
-                arrow_length_ratio=0.35,
-                alpha=0.95,
-            )
-            self.canvas.draw()
+            births = viz.seed_object_biased(self._grid, count=1, rng=self._rng)
+            birth = births[0].copy()
+            _, speed, _ = viz.sample_velocity(self._grid, births)
+            vmin = self._speed_norm.vmin  # type: ignore[union-attr]
+            vmax = self._speed_norm.vmax  # type: ignore[union-attr]
+            t = float(np.clip(
+                (float(speed[0]) - vmin) / max(vmax - vmin, 1e-9), 0.0, 1.0
+            ))
+            s["history"] = [birth]
+            s["tail"] = 0
+            s["alive"] = True
+            s["color"] = coolwarm(t)
 
         def _advance_flow(self) -> None:
-            if self._preview_mode or self._grid is None or self._particle_points is None:
+            if self._preview_mode or self._grid is None or not self._streamlets:
                 return
             viz = _visualization3d()
-            self._particle_points, _, _ = viz.advect_particles(
-                self._grid,
-                self._particle_points,
-                dt=self._advect_dt,
-                rng=self._rng,
-            )
-            self._draw_flow_arrows()
+            vmin = self._speed_norm.vmin  # type: ignore[union-attr]
+            vmax = self._speed_norm.vmax  # type: ignore[union-attr]
+            for s in self._streamlets:
+                if s["alive"]:
+                    new_head, valid = viz.step_particle(
+                        self._grid, np.array(s["history"][-1]), self._advect_dt
+                    )
+                    if valid:
+                        s["history"].append(new_head)
+                        # Recolor to local speed at the head.
+                        _, spd_arr, _ = viz.sample_velocity(
+                            self._grid, new_head.reshape(1, 3)
+                        )
+                        t = float(np.clip(
+                            (float(spd_arr[0]) - vmin) / max(vmax - vmin, 1e-9), 0.0, 1.0
+                        ))
+                        s["color"] = coolwarm(t)
+                        if len(s["history"]) - s["tail"] > _MAX_BODY_LEN:
+                            s["tail"] += 1
+                    else:
+                        s["alive"] = False
+                else:
+                    s["tail"] += 1
+
+                if s["tail"] >= len(s["history"]):
+                    self._respawn_streamlet(s)
+
+            self._draw_streamlets()
 
         def _fail_load(self, message: str) -> None:
             self.status_label.setText(message)
@@ -385,10 +496,9 @@ if HAS_QT:
             self._flow_timer.stop()
             self._grid = None
             self._loaded_volume_path = None
-            self._particle_points = None
+            self._clear_stream_artists()
             self._preview_mode = False
             self._view_bounds = None
-            self._remove_quiver()
             self.status_label.setText(message)
             self.reset_button.setEnabled(False)
             self.play_button.setEnabled(False)
