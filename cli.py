@@ -109,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Backend (Phase 3)
     p.add_argument("--backend", choices=["auto", "numpy", "numba"], default="auto",
                    help="Compute backend: auto=use Numba if installed, else NumPy")
-    p.add_argument("--collision", choices=["bgk", "mrt", "trt"], default="bgk",
+    p.add_argument("--collision", choices=["bgk", "mrt", "trt", "regularized"], default="bgk",
                    help="Collision operator: BGK, MRT, or TRT")
     p.add_argument("--trt-lambda", type=float, default=0.25, help="TRT magic parameter")
     p.add_argument("--sponge-cells", type=int, default=0, help="Outlet sponge thickness (0=off)")

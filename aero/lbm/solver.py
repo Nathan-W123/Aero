@@ -71,6 +71,7 @@ from .les import (
 )
 from .physics import base_nu_from_omega
 from . import kernels_trt as _ktrt
+from . import kernels_reg as _kreg
 from .ibm_guo import ibm_acceleration_2d
 from .forcing import (
     FORCE_NONE, FORCE_UNIFORM, FORCE_FIELD,
@@ -195,8 +196,11 @@ class Solver:
         self.T_ref = float(T_ref)
         self.tau = 1.0 / omega
         self._base_nu = base_nu_from_omega(omega)
-        if collision not in ("bgk", "mrt", "trt"):
-            raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk', 'mrt', or 'trt'.")
+        if collision not in ("bgk", "mrt", "trt", "regularized"):
+            raise ValueError(
+                f"Unknown collision '{collision}'. "
+                "Choose 'bgk', 'mrt', 'trt', or 'regularized'."
+            )
         self.collision = collision
 
         # --- Backend selection ---
@@ -381,6 +385,23 @@ class Solver:
                 omega_field if use_omega_field else None,
                 acc_u, acc_f, force_mode,
             )
+
+        elif self.collision == "regularized":
+            f_pre = np.empty_like(f)
+            if self._use_numba and _kreg._HAS_NUMBA:
+                _kreg.regularized_collision_kernel(
+                    f, f_pre, self.solid, omega_use,
+                    self._ex, self._ey, self._w,
+                    omega_field, use_omega_field,
+                    acc_u, acc_f, force_mode,
+                )
+            else:
+                _kreg.regularized_collision_numpy(
+                    f, f_pre, self.solid, omega_use,
+                    self._ex, self._ey, self._w,
+                    omega_field if use_omega_field else None,
+                    self._acc_as_field(force_mode, acc_u, acc_f),
+                )
 
         elif self.collision == "trt":
             f_pre = np.empty_like(f)

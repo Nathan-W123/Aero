@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Backend
     p.add_argument("--backend", choices=["auto", "numpy", "numba"], default="auto")
-    p.add_argument("--collision", choices=["bgk", "mrt", "trt"], default="bgk")
+    p.add_argument("--collision", choices=["bgk", "mrt", "trt", "regularized"], default="bgk")
     p.add_argument("--trt-lambda", type=float, default=0.25)
     p.add_argument("--inlet-perturbation", type=float, default=0.0,
                    help="Inlet uz perturbation amplitude (fraction of u0)")

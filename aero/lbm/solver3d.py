@@ -67,6 +67,7 @@ from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
 from .physics import base_nu_from_omega
 from . import kernels3d_trt as _ktrt3
+from . import kernels3d_reg as _kreg3
 from .ibm_guo import ibm_acceleration_3d
 from .forcing import (
     FORCE_NONE, FORCE_UNIFORM, FORCE_FIELD,
@@ -196,8 +197,11 @@ class Solver3D:
         self.T_ref = float(T_ref)
         self.tau = 1.0 / omega
         self._base_nu = base_nu_from_omega(omega)
-        if collision not in ("bgk", "mrt", "trt"):
-            raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk', 'mrt', or 'trt'.")
+        if collision not in ("bgk", "mrt", "trt", "regularized"):
+            raise ValueError(
+                f"Unknown collision '{collision}'. "
+                "Choose 'bgk', 'mrt', 'trt', or 'regularized'."
+            )
         self.collision = collision
 
         # Backend
@@ -452,6 +456,23 @@ class Solver3D:
                 omega_field if use_omega_field else None,
                 acc_u, acc_f, force_mode,
             )
+        elif self.collision == "regularized":
+            f_pre = np.empty_like(f)
+            if self._use_numba and _kreg3._HAS_NUMBA:
+                _kreg3.regularized_collision_kernel_3d(
+                    f, f_pre, self.solid, omega_use,
+                    self._ex, self._ey, self._ez, self._w,
+                    omega_field, use_omega_field,
+                    acc_u, acc_f, force_mode,
+                )
+            else:
+                _kreg3.regularized_collision_numpy_3d(
+                    f, f_pre, self.solid, omega_use,
+                    self._ex, self._ey, self._ez, self._w,
+                    omega_field if use_omega_field else None,
+                    self._acc_as_field(force_mode, acc_u, acc_f),
+                )
+
         elif self.collision == "trt":
             f_pre = np.empty_like(f)
             if self._use_numba and _ktrt3._HAS_NUMBA:
