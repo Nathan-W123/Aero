@@ -26,12 +26,18 @@ separately by apply_bounce_back in boundary.py).
 
 import numpy as np
 
+from .physics import inv_positive
+
 try:
     import numba as nb
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
     nb = None  # type: ignore[assignment]
+
+# x-tile length used by the collision kernel.  Sized so one tile's worth of
+# scratch plus the Q source/destination streams stay resident in L1.
+_TILE = 64
 
 
 # ---------------------------------------------------------------------------
@@ -63,33 +69,58 @@ if HAS_NUMBA:
         """
         Q, Ny, Nx = f.shape
         for y in nb.prange(Ny):
-            for x in range(Nx):
-                # --- macroscopic ---
-                rho = 0.0
-                mx  = 0.0
-                my  = 0.0
+            # Per-row scratch: a tile of x is carried through the three passes
+            # so every inner loop walks one direction plane at unit stride
+            # instead of gathering Q strided values per cell.
+            rho_t = np.empty(_TILE)
+            ux_t = np.empty(_TILE)
+            uy_t = np.empty(_TILE)
+            usq_t = np.empty(_TILE)
+            om_t = np.empty(_TILE)
+
+            for x0 in range(0, Nx, _TILE):
+                n = Nx - x0
+                if n > _TILE:
+                    n = _TILE
+
+                # --- macroscopic moments ---
+                for k in range(n):
+                    rho_t[k] = 0.0
+                    ux_t[k] = 0.0
+                    uy_t[k] = 0.0
                 for i in range(Q):
-                    fi   = f[i, y, x]
-                    rho += fi
-                    mx  += ex[i] * fi
-                    my  += ey[i] * fi
+                    exi = ex[i]
+                    eyi = ey[i]
+                    for k in range(n):
+                        fi = f[i, y, x0 + k]
+                        rho_t[k] += fi
+                        ux_t[k] += exi * fi
+                        uy_t[k] += eyi * fi
 
-                inv_rho = 1.0 / rho if rho > 0.0 else 0.0
-                if solid[y, x]:
-                    ux = 0.0
-                    uy = 0.0
-                else:
-                    ux = mx * inv_rho
-                    uy = my * inv_rho
-
-                usq = ux * ux + uy * uy
-                om = omega_field[y, x] if use_omega_field else omega
+                for k in range(n):
+                    rho = rho_t[k]
+                    inv_rho = 1.0 / rho if rho > 0.0 else 0.0
+                    if solid[y, x0 + k]:
+                        ux_t[k] = 0.0
+                        uy_t[k] = 0.0
+                    else:
+                        ux_t[k] = ux_t[k] * inv_rho
+                        uy_t[k] = uy_t[k] * inv_rho
+                    usq_t[k] = ux_t[k] * ux_t[k] + uy_t[k] * uy_t[k]
+                    om_t[k] = omega_field[y, x0 + k] if use_omega_field else omega
 
                 # --- BGK ---
                 for i in range(Q):
-                    eu    = ex[i] * ux + ey[i] * uy
-                    feqi  = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
-                    f_post[i, y, x] = (1.0 - om) * f[i, y, x] + om * feqi
+                    exi = ex[i]
+                    eyi = ey[i]
+                    wi = w[i]
+                    for k in range(n):
+                        eu = exi * ux_t[k] + eyi * uy_t[k]
+                        feqi = wi * rho_t[k] * (
+                            1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq_t[k]
+                        )
+                        om = om_t[k]
+                        f_post[i, y, x0 + k] = (1.0 - om) * f[i, y, x0 + k] + om * feqi
 
     @nb.njit(cache=True, parallel=True)
     def stream_kernel(
@@ -104,14 +135,32 @@ if HAS_NUMBA:
         For a given direction i, the shift (ey[i], ex[i]) is a bijection on
         the periodic grid, so each output cell is written exactly once.
         prange over y rows is therefore race-free.
+
+        The row loop is the innermost one so that both source and destination
+        run at unit stride: the x shift becomes a contiguous block move plus a
+        single wrapped element, instead of a per-cell modulo and a scattered
+        write across Q planes.
         """
         Q, Ny, Nx = f_src.shape
         for y in nb.prange(Ny):
-            for x in range(Nx):
-                for i in range(Q):
-                    yn = (y + ey[i]) % Ny
-                    xn = (x + ex[i]) % Nx
-                    f_dst[i, yn, xn] = f_src[i, y, x]
+            for i in range(Q):
+                yn = (y + ey[i]) % Ny
+                exi = ex[i]
+                if exi == 0:
+                    for x in range(Nx):
+                        f_dst[i, yn, x] = f_src[i, y, x]
+                elif exi == 1:
+                    f_dst[i, yn, 0] = f_src[i, y, Nx - 1]
+                    for x in range(1, Nx):
+                        f_dst[i, yn, x] = f_src[i, y, x - 1]
+                elif exi == -1:
+                    f_dst[i, yn, Nx - 1] = f_src[i, y, 0]
+                    for x in range(Nx - 1):
+                        f_dst[i, yn, x] = f_src[i, y, x + 1]
+                else:
+                    # General |ex| > 1 fallback (unused by D2Q9)
+                    for x in range(Nx):
+                        f_dst[i, yn, (x + exi) % Nx] = f_src[i, y, x]
 
 # ---------------------------------------------------------------------------
 # Pure-NumPy fallbacks — same signatures, used when Numba is absent
@@ -130,15 +179,16 @@ else:
         use_omega_field: bool,
     ) -> None:
         """NumPy fallback for collision_kernel (used when Numba is not installed)."""
+        Q = f.shape[0]
         rho = f.sum(axis=0)
-        inv_rho = np.where(rho > 0.0, 1.0 / rho, 0.0)
+        inv_rho = inv_positive(rho)
         ux = inv_rho * np.einsum('i,iyx->yx', ex.astype(np.float64), f)
         uy = inv_rho * np.einsum('i,iyx->yx', ey.astype(np.float64), f)
         ux[solid] = 0.0
         uy[solid] = 0.0
         usq = ux * ux + uy * uy
         om = omega_field if use_omega_field else np.full(ux.shape, omega)
-        for i in range(9):
+        for i in range(Q):
             eu = ex[i] * ux + ey[i] * uy
             feqi = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
             f_post[i] = (1.0 - om) * f[i] + om * feqi
@@ -150,7 +200,7 @@ else:
         ey: np.ndarray,
     ) -> None:
         """NumPy fallback for stream_kernel (used when Numba is not installed)."""
-        for i in range(9):
+        for i in range(f_src.shape[0]):
             f_dst[i] = np.roll(
                 np.roll(f_src[i], int(ey[i]), axis=0),
                 int(ex[i]), axis=1,

@@ -2,11 +2,12 @@
 LBM D2Q9 wind tunnel solver.
 
 Timestep loop:
-  1. BGK collision (fused with macroscopic) → f_post
-  2. Save f_pre = f_post  (needed for mid-link bounce-back)
-  3. Stream: push each direction to its neighbour
-  4. Apply BCs: bounce-back → inlet → outlet → walls
-  5. Record forces via momentum exchange
+  1. Collision (fused with macroscopic) → f_pre
+  2. Stream f_pre → f_post: push each direction to its neighbour.  Streaming
+     never writes to its source, so f_pre stays available as the
+     post-collision / pre-streaming state for bounce-back and forces.
+  3. Apply BCs: bounce-back → inlet → outlet → walls
+  4. Record forces via momentum exchange
 
 BC options
 ----------
@@ -55,6 +56,7 @@ from ..forces import (
     forces_to_coefficients,
     moment_to_coefficient_2d,
     split_to_coefficients,
+    surface_diagnostics_2d,
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
 from ..observables import coefficient_spectrum
@@ -66,7 +68,6 @@ from .les import (
     build_omega_field_2d,
 )
 from .physics import base_nu_from_omega
-from .trt2d import trt_taus
 from . import kernels_trt as _ktrt
 from .ibm_guo import apply_guo_forcing_2d
 
@@ -186,8 +187,6 @@ class Solver:
         if collision not in ("bgk", "mrt", "trt"):
             raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk', 'mrt', or 'trt'.")
         self.collision = collision
-        _, self._s_minus_trt = trt_taus(omega, self.trt_lambda)
-        self._s_minus_trt = 1.0 / self._s_minus_trt
 
         # --- Backend selection ---
         if backend == "auto":
@@ -295,85 +294,57 @@ class Solver:
             use_omega_field = True
         omega_use = self.omega
 
+        # 1+2. Collision. `f_pre` is the post-collision, pre-streaming state:
+        #      streaming always reads it and writes into a separate array, so
+        #      it stays valid for mid-link bounce-back and the force
+        #      evaluation without needing a snapshot copy.
         if self.collision == "mrt":
-            f_post = np.empty_like(f)
-            self._mrt_kernel.collide(f, f_post, self.solid, self._ex, self._ey, self._w)
-            f_pre = f_post.copy()
-            if self._use_numba:
-                f_new = np.empty_like(f_post)
-                _kernels.stream_kernel(f_post, f_new, self._ex, self._ey)
-                f_post = f_new
-            else:
-                for i in range(Q):
-                    f_post[i] = np.roll(f_post[i], shift=int(E[i, 1]), axis=0)
-                    f_post[i] = np.roll(f_post[i], shift=int(E[i, 0]), axis=1)
+            f_pre = np.empty_like(f)
+            self._mrt_kernel.collide(
+                f, f_pre, self.solid, self._ex, self._ey, self._w,
+                omega_field if use_omega_field else None,
+            )
 
         elif self.collision == "trt":
-            f_post = np.empty_like(f)
+            f_pre = np.empty_like(f)
             if self._use_numba and _ktrt._HAS_NUMBA:
                 _ktrt.trt_collision_kernel(
-                    f, f_post, self.solid, omega_use,
+                    f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._w,
                     OPP.astype(np.int32), self.trt_lambda,
                     omega_field, use_omega_field,
                 )
             else:
                 _ktrt.trt_collision_numpy(
-                    f, f_post, self.solid, omega_use,
+                    f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._w, self.trt_lambda,
                     omega_field if use_omega_field else None,
                 )
-            f_pre = f_post.copy()
-            if self._use_numba:
-                f_new = np.empty_like(f_post)
-                _kernels.stream_kernel(f_post, f_new, self._ex, self._ey)
-                f_post = f_new
-            else:
-                for i in range(Q):
-                    f_post[i] = np.roll(f_post[i], shift=int(E[i, 1]), axis=0)
-                    f_post[i] = np.roll(f_post[i], shift=int(E[i, 0]), axis=1)
 
         elif self._use_numba:
-            # --- Numba fast path ---
-
-            # 1+2. Fused macroscopic + BGK collision
-            f_post = np.empty_like(f)
+            # Fused macroscopic + BGK collision
+            f_pre = np.empty_like(f)
             _kernels.collision_kernel(
-                f, f_post, self.solid, omega_use,
+                f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._w,
                 omega_field, use_omega_field,
             )
 
-            # 3. Pre-streaming snapshot for mid-link bounce-back
-            f_pre = f_post.copy()
-
-            # 4. Push streaming into a fresh array
-            f_new = np.empty_like(f_post)
-            _kernels.stream_kernel(f_post, f_new, self._ex, self._ey)
-            f_post = f_new
-
         else:
-            # --- NumPy fallback path ---
-
-            # 1. Macroscopic variables
+            # NumPy fallback: BGK collision; solid cells relax to
+            # zero-velocity equilibrium
             rho, ux, uy = compute_macroscopic(f)
-
-            # 2. BGK collision; solid cells relax to zero-velocity equilibrium
             ux_c = ux.copy()
             uy_c = uy.copy()
             ux_c[self.solid] = 0.0
             uy_c[self.solid] = 0.0
-            feq    = compute_feq(rho, ux_c, uy_c)
+            feq = compute_feq(rho, ux_c, uy_c)
             om = omega_field if use_omega_field else omega_use
-            f_post = (1.0 - om) * f + om * feq
+            f_pre = (1.0 - om) * f + om * feq
 
-            # 3. Pre-streaming snapshot for mid-link bounce-back
-            f_pre = f_post.copy()
-
-            # 4. Stream
-            for i in range(Q):
-                f_post[i] = np.roll(f_post[i], shift=int(E[i, 1]), axis=0)
-                f_post[i] = np.roll(f_post[i], shift=int(E[i, 0]), axis=1)
+        # 3. Push streaming into a fresh array (never writes to its source)
+        f_post = np.empty_like(f_pre)
+        _kernels.stream_kernel(f_pre, f_post, self._ex, self._ey)
 
         # 5. Boundary conditions — order matters (same for both backends)
         if not self.ibm_enabled:
@@ -445,22 +416,29 @@ class Solver:
         self.f = f_post
         self.step_count += 1
 
-        # 6. Forces
-        Fx_lbm, Fy_lbm = compute_forces(f_pre, f_post, self.surface_links, self.rho0, self.u0)
-        Cd, Cl = forces_to_coefficients(Fx_lbm, Fy_lbm, self.rho0, self.u0, self.D)
-        fx_p, fy_p, fx_v, fy_v = compute_force_split_2d(f_pre, f_post, self.surface_links)
-        cdp, _, cdv, _ = split_to_coefficients(fx_p, fy_p, fx_v, fy_v, self.rho0, self.u0, self.D)
-        self._last_cd_p = cdp
-        self._last_cd_v = cdv
-        _, _, mz = compute_force_moment_2d(
+        # 6. Forces — total, pressure/viscous split, moment and sectional
+        #    profile all come out of one gather over the surface links.
+        diag = surface_diagnostics_2d(
             f_pre,
             f_post,
             self.surface_links,
             center_x=self._ref_center_x,
             center_y=self._ref_center_y,
+            ny=self.Ny,
         )
-        self._last_cm = moment_to_coefficient_2d(mz, self.rho0, self.u0, self.D)
-        self._last_force_profile = force_profile_2d(f_pre, f_post, self.surface_links, ny=self.Ny)
+        Cd, Cl = forces_to_coefficients(
+            diag["fx"], diag["fy"], self.rho0, self.u0, self.D
+        )
+        cdp, _, cdv, _ = split_to_coefficients(
+            diag["fx_p"], diag["fy_p"], diag["fx_v"], diag["fy_v"],
+            self.rho0, self.u0, self.D,
+        )
+        self._last_cd_p = cdp
+        self._last_cd_v = cdv
+        self._last_cm = moment_to_coefficient_2d(
+            diag["mz"], self.rho0, self.u0, self.D
+        )
+        self._last_force_profile = diag["profile"]
         return Cd, Cl
 
     # ------------------------------------------------------------------

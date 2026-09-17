@@ -2,11 +2,12 @@
 D3Q19 3D LBM wind tunnel solver.
 
 Timestep loop:
-  1. Fused macroscopic + BGK collision → f_post
-  2. f_pre = f_post.copy()   (pre-streaming snapshot for bounce-back)
-  3. Push streaming into f_new
-  4. BCs: bounce-back → inlet → outlet → walls
-  5. Forces: momentum exchange → Cd, Cl_y, Cl_z
+  1. Fused macroscopic + collision → f_pre
+  2. Push streaming f_pre → f_post.  Streaming never writes to its source, so
+     f_pre stays available as the post-collision / pre-streaming state for
+     bounce-back and forces.
+  3. BCs: bounce-back → inlet → outlet → walls
+  4. Forces: momentum exchange → Cd, Cl_y, Cl_z
 
 Domain: (Q, Nz, Ny, Nx)
   x = streamwise, y = vertical (walls), z = spanwise (periodic default)
@@ -56,13 +57,13 @@ from ..forces3d import (
     moments_to_coefficients_3d,
     spanwise_force_profile_3d,
     split_to_coefficients_3d,
+    surface_diagnostics_3d,
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
 from ..observables import coefficient_spectrum
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
 from .physics import base_nu_from_omega
-from .trt2d import trt_taus
 from . import kernels3d_trt as _ktrt3
 from .ibm_guo import apply_guo_forcing_3d, apply_uniform_body_force_3d
 
@@ -191,8 +192,6 @@ class Solver3D:
         if collision not in ("bgk", "mrt", "trt"):
             raise ValueError(f"Unknown collision '{collision}'. Choose 'bgk', 'mrt', or 'trt'.")
         self.collision = collision
-        _, self._s_minus_trt = trt_taus(omega, self.trt_lambda)
-        self._s_minus_trt = 1.0 / self._s_minus_trt
 
         # Backend
         self._xp = np
@@ -343,70 +342,63 @@ class Solver3D:
             use_omega_field = True
         omega_use = self.omega
 
+        # Collision. `f_pre` is the post-collision, pre-streaming state:
+        # streaming always reads it and writes into a separate array, so it
+        # stays valid for mid-link bounce-back and the force evaluation
+        # without needing a snapshot copy.
+        xp = self._xp
         if self.collision == "mrt":
-            f_post = np.empty_like(f)
+            f_pre = np.empty_like(f)
             self._mrt_kernel.collide(
-                f, f_post, self.solid, self._ex, self._ey, self._ez, self._w
+                f, f_pre, self.solid, self._ex, self._ey, self._ez, self._w,
+                omega_field if use_omega_field else None,
             )
-            f_pre = f_post.copy()
-            f_new = np.empty_like(f_post)
-            _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
-            f_post = f_new
         elif self.collision == "trt":
-            f_post = np.empty_like(f)
+            f_pre = np.empty_like(f)
             if self._use_numba and _ktrt3._HAS_NUMBA:
                 from .d3q19 import OPP3
                 _ktrt3.trt_collision_kernel_3d(
-                    f, f_post, self.solid, omega_use,
+                    f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._ez, self._w,
                     OPP3.astype(np.int32), self.trt_lambda,
                     omega_field, use_omega_field,
                 )
             else:
                 _ktrt3.trt_collision_numpy_3d(
-                    f, f_post, self.solid, omega_use,
+                    f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._ez, self._w, self.trt_lambda,
                     omega_field if use_omega_field else None,
                 )
-            f_pre = f_post.copy()
-            f_new = np.empty_like(f_post)
-            _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
-            f_post = f_new
         elif self._use_cupy:
-            xp = self._xp
-            f_post = xp.empty_like(f)
+            f_pre = xp.empty_like(f)
             collision_kernel_3d_xp(
-                f, f_post, self.solid, omega_use,
+                f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field, xp=xp,
             )
-            f_pre = f_post.copy()
-            f_new = xp.empty_like(f_post)
-            stream_kernel_3d_xp(f_post, f_new, self._ex, self._ey, self._ez, xp=xp)
-            f_post = f_new
         elif self._use_numba:
-            f_post = np.empty_like(f)
+            f_pre = np.empty_like(f)
             _k3.collision_kernel_3d(
-                f, f_post, self.solid, omega_use,
+                f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
             )
-            f_pre = f_post.copy()
-            f_new = np.empty_like(f_post)
-            _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
-            f_post = f_new
         else:
             rho, ux, uy, uz = compute_macroscopic_3d(f)
             ux[self.solid] = 0.0
             uy[self.solid] = 0.0
             uz[self.solid] = 0.0
-            feq    = compute_feq_3d(rho, ux, uy, uz)
+            feq = compute_feq_3d(rho, ux, uy, uz)
             om = omega_field if use_omega_field else omega_use
-            f_post = (1.0 - om) * f + om * feq
-            f_pre  = f_post.copy()
-            f_new  = np.empty_like(f_post)
-            _k3.stream_kernel_3d(f_post, f_new, self._ex, self._ey, self._ez)
-            f_post = f_new
+            f_pre = (1.0 - om) * f + om * feq
+
+        # Push streaming into a fresh array (never writes to its source)
+        if self._use_cupy:
+            f_post = xp.empty_like(f_pre)
+            stream_kernel_3d_xp(f_pre, f_post, self._ex, self._ey, self._ez, xp=xp)
+        else:
+            f_post = np.empty_like(f_pre)
+            _k3.stream_kernel_3d(f_pre, f_post, self._ex, self._ey, self._ez)
 
         if any(abs(val) > 0.0 for val in (self.body_force_x, self.body_force_y, self.body_force_z)):
             apply_uniform_body_force_3d(
@@ -515,29 +507,34 @@ class Solver3D:
             f_post_cpu = f_post
             links_cpu  = self.surface_links
 
-        Fx, Fy, Fz = compute_forces_3d(f_pre_cpu, f_post_cpu, links_cpu)
-        Cd, Cly, Clz = forces_to_coefficients_3d(Fx, Fy, Fz, self.rho0, self.u0, self.D)
-        fx_p, fy_p, fz_p, fx_v, fy_v, fz_v = compute_force_split_3d(f_pre_cpu, f_post_cpu, links_cpu)
-        cdp, _, _, cdv, _, _ = split_to_coefficients_3d(
-            fx_p, fy_p, fz_p, fx_v, fy_v, fz_v, self.rho0, self.u0, self.D,
-        )
-        self._last_cd_p = cdp
-        self._last_cd_v = cdv
-        _, _, _, mx, my, mz = compute_force_moment_3d(
+        # Total force, pressure/viscous split, moments and the sectional
+        # profile all come out of one gather over the surface links.
+        diag = surface_diagnostics_3d(
             f_pre_cpu,
             f_post_cpu,
             links_cpu,
             center_x=self._ref_center_x,
             center_y=self._ref_center_y,
             center_z=self._ref_center_z,
+            nz=self.Nz,
         )
-        cmx, cmy, cmz = moments_to_coefficients_3d(mx, my, mz, self.rho0, self.u0, self.D)
+        Cd, Cly, Clz = forces_to_coefficients_3d(
+            diag["fx"], diag["fy"], diag["fz"], self.rho0, self.u0, self.D
+        )
+        cdp, _, _, cdv, _, _ = split_to_coefficients_3d(
+            diag["fx_p"], diag["fy_p"], diag["fz_p"],
+            diag["fx_v"], diag["fy_v"], diag["fz_v"],
+            self.rho0, self.u0, self.D,
+        )
+        self._last_cd_p = cdp
+        self._last_cd_v = cdv
+        cmx, cmy, cmz = moments_to_coefficients_3d(
+            diag["mx"], diag["my"], diag["mz"], self.rho0, self.u0, self.D
+        )
         self._last_cmx = cmx
         self._last_cmy = cmy
         self._last_cmz = cmz
-        self._last_spanwise_profile = spanwise_force_profile_3d(
-            f_pre_cpu, f_post_cpu, links_cpu, nz=self.Nz
-        )
+        self._last_spanwise_profile = diag["profile"]
         return Cd, Cly, Clz
 
     # ------------------------------------------------------------------

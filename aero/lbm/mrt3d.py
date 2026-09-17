@@ -91,6 +91,12 @@ M19 = np.array([
 M19_inv = np.linalg.pinv(M19)
 
 
+# Entries of s that carry the viscosity.  A subgrid model makes omega a
+# per-cell field, and only these rows may then vary per cell (sq is an
+# independent constant here, unlike the D2Q9 magic-parameter choice).
+VISCOUS_MODES = np.array([9, 10, 11, 12, 13], dtype=np.int64)
+
+
 def build_s3_vec(
     omega: float,
     se:  float = 1.19,

@@ -74,6 +74,9 @@ if _HAS_NUMBA:
     ) -> None:
         q, nz, ny, nx = f.shape
         for z in nb.prange(nz):
+            # Hoisted out of the cell loop: one heap allocation per cell per
+            # timestep otherwise.
+            feq = np.empty(q)
             for y in range(ny):
                 for x in range(nx):
                     rho = 0.0
@@ -94,7 +97,6 @@ if _HAS_NUMBA:
                         uy = my * inv_r
                         uz = mz * inv_r
                     usq = ux * ux + uy * uy + uz * uz
-                    feq = np.empty(q)
                     for i in range(q):
                         eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
                         feq[i] = w[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq)

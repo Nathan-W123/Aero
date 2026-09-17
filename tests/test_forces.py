@@ -102,3 +102,90 @@ def test_force_moment_zero_for_uniform_equilibrium(feq_uniform):
     assert Fy == 0.0
     assert Mz == 0.0
     assert moment_to_coefficient_2d(Mz, RHO0, U0, 16.0) == 0.0
+
+
+def _random_state(rng, shape, q, feq_fn, *fields):
+    rho = 1.0 + 0.02 * rng.standard_normal(shape)
+    us = [0.05 * rng.standard_normal(shape) for _ in range(fields[0])]
+    base = feq_fn(rho, *us)
+    return (
+        base + 1e-4 * rng.standard_normal((q, *shape)),
+        base + 1e-4 * rng.standard_normal((q, *shape)),
+    )
+
+
+def test_surface_diagnostics_2d_matches_the_individual_helpers():
+    """The fused single-gather path must agree exactly with the public helpers."""
+    from aero.forces import (
+        compute_forces, compute_force_moment_2d, force_profile_2d,
+        surface_diagnostics_2d,
+    )
+    from aero.lbm.d2q9 import compute_feq
+
+    rng = np.random.default_rng(17)
+    ny, nx = 40, 60
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    solid = ((yy - 20) ** 2 + (xx - 25) ** 2) <= 49
+    links, _ = build_surface_links(solid)
+    f_pre, f_post = _random_state(rng, (ny, nx), 9, compute_feq, 2)
+
+    diag = surface_diagnostics_2d(
+        f_pre, f_post, links, center_x=25.0, center_y=20.0, ny=ny
+    )
+    fx, fy = compute_forces(f_pre, f_post, links, 1.0, 0.05)
+    _, _, mz = compute_force_moment_2d(
+        f_pre, f_post, links, center_x=25.0, center_y=20.0
+    )
+    split = compute_force_split_2d(f_pre, f_post, links)
+    profile = force_profile_2d(f_pre, f_post, links, ny=ny)
+
+    assert diag["fx"] == fx and diag["fy"] == fy and diag["mz"] == mz
+    assert (diag["fx_p"], diag["fy_p"], diag["fx_v"], diag["fy_v"]) == split
+    assert diag["profile"] == profile
+    # the split must still reconstruct the total momentum exchange
+    assert diag["fx_p"] + diag["fx_v"] == pytest.approx(fx, rel=1e-12, abs=1e-14)
+
+
+def test_surface_diagnostics_3d_matches_the_individual_helpers():
+    from aero.forces3d import (
+        compute_forces_3d, compute_force_split_3d, compute_force_moment_3d,
+        spanwise_force_profile_3d, surface_diagnostics_3d,
+    )
+    from aero.lbm.boundary3d import build_surface_links_3d
+    from aero.lbm.d3q19 import compute_feq_3d
+
+    rng = np.random.default_rng(23)
+    nz, ny, nx = 14, 16, 20
+    zz, yy, xx = np.mgrid[0:nz, 0:ny, 0:nx]
+    solid = ((zz - 7) ** 2 + (yy - 8) ** 2 + (xx - 8) ** 2) <= 16
+    links, _ = build_surface_links_3d(solid)
+    f_pre, f_post = _random_state(rng, (nz, ny, nx), 19, compute_feq_3d, 3)
+
+    diag = surface_diagnostics_3d(
+        f_pre, f_post, links, center_x=8.0, center_y=8.0, center_z=7.0, nz=nz
+    )
+    fx, fy, fz = compute_forces_3d(f_pre, f_post, links)
+    moments = compute_force_moment_3d(
+        f_pre, f_post, links, center_x=8.0, center_y=8.0, center_z=7.0
+    )
+    split = compute_force_split_3d(f_pre, f_post, links)
+    profile = spanwise_force_profile_3d(f_pre, f_post, links, nz=nz)
+
+    assert (diag["fx"], diag["fy"], diag["fz"]) == (fx, fy, fz)
+    assert (diag["mx"], diag["my"], diag["mz"]) == moments[3:]
+    assert (
+        diag["fx_p"], diag["fy_p"], diag["fz_p"],
+        diag["fx_v"], diag["fy_v"], diag["fz_v"],
+    ) == split
+    assert diag["profile"] == profile
+
+
+def test_surface_diagnostics_handles_an_empty_link_table():
+    from aero.forces import surface_diagnostics_2d
+
+    f = np.zeros((9, 6, 6))
+    diag = surface_diagnostics_2d(
+        f, f, np.empty((0, 3), dtype=np.int32), center_x=0.0, center_y=0.0, ny=6
+    )
+    assert diag["fx"] == 0.0 and diag["mz"] == 0.0
+    assert diag["profile"]["fx"] == [0.0] * 6

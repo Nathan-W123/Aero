@@ -10,6 +10,8 @@ Lattice velocity indexing:
 import numpy as np
 from typing import Tuple
 
+from .physics import inv_positive
+
 # --- Lattice constants ---
 
 Q = 9
@@ -57,7 +59,7 @@ def compute_macroscopic(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     """
     rho = f.sum(axis=0)
     # Avoid division by zero in degenerate cells
-    inv_rho = np.where(rho > 0, 1.0 / rho, 0.0)
+    inv_rho = inv_positive(rho)
     ux = inv_rho * np.einsum('i,iyx->yx', E[:, 0].astype(np.float64), f)
     uy = inv_rho * np.einsum('i,iyx->yx', E[:, 1].astype(np.float64), f)
     return rho, ux, uy

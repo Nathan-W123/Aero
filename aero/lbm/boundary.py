@@ -255,21 +255,31 @@ def build_surface_links(
     """
     Ny, Nx = solid.shape
     fluid = ~solid
+    y_line = np.arange(Ny)
+    x_line = np.arange(Nx)
 
-    links = []
+    per_dir = []
     for i in range(1, 9):  # skip rest direction i=0
-        y_idx, x_idx = np.meshgrid(np.arange(Ny), np.arange(Nx), indexing='ij')
-        yn_idx = np.clip(y_idx + int(E[i, 1]), 0, Ny - 1)
-        xn_idx = np.clip(x_idx + int(E[i, 0]), 0, Nx - 1)
-        mask = fluid & solid[yn_idx, xn_idx]
-        ys, xs = np.where(mask)
-        for y, x in zip(ys, xs):
-            links.append((i, int(y), int(x)))
+        # Neighbour indices are clamped (not wrapped) at the domain edge, so a
+        # boundary cell never links to itself through the periodic image.
+        yn = np.clip(y_line + int(E[i, 1]), 0, Ny - 1)
+        xn = np.clip(x_line + int(E[i, 0]), 0, Nx - 1)
+        mask = fluid & solid[yn[:, None], xn[None, :]]
+        ys, xs = np.nonzero(mask)
+        if ys.size:
+            per_dir.append(
+                np.stack(
+                    (np.full(ys.size, i, dtype=np.int32),
+                     ys.astype(np.int32),
+                     xs.astype(np.int32)),
+                    axis=1,
+                )
+            )
 
-    if not links:
+    if not per_dir:
         return np.empty((0, 3), dtype=np.int32), np.empty(0, dtype=np.float32)
 
-    links_arr = np.array(links, dtype=np.int32)
+    links_arr = np.concatenate(per_dir, axis=0)
     if phi is not None:
         y_arr = links_arr[:, 1]
         x_arr = links_arr[:, 2]

@@ -6,7 +6,10 @@ prange over z slices.
 """
 
 import numpy as np
-from .mrt3d import M19, M19_inv, build_s3_vec
+from typing import Optional
+
+from .mrt3d import M19, M19_inv, build_s3_vec, VISCOUS_MODES
+from .physics import inv_positive
 
 try:
     import numba as nb
@@ -32,11 +35,27 @@ if _HAS_NUMBA:
         ey:     np.ndarray,   # (19,) int32
         ez:     np.ndarray,   # (19,) int32
         w:      np.ndarray,   # (19,) float64
+        omega_field: np.ndarray,  # (Nz, Ny, Nx) per-cell relaxation rate (LES)
+        use_omega_field: bool,
+        visc_modes: np.ndarray,   # rows of s carrying the viscosity
     ) -> None:
         Q, Nz, Ny, Nx = f.shape
         for z in nb.prange(Nz):
+            # Scratch hoisted out of the cell loop: allocating these per cell
+            # costs one heap allocation per cell per timestep.
+            feq = np.empty(Q)
+            m = np.empty(Q)
+            m_eq = np.empty(Q)
+            m_post = np.empty(Q)
+            s_cell = s.copy()
             for y in range(Ny):
                 for x in range(Nx):
+                    if use_omega_field:
+                        # Subgrid viscosity only moves the viscous rates; the
+                        # conserved and ghost modes keep their tuned values.
+                        sv = omega_field[z, y, x]
+                        for k in range(visc_modes.shape[0]):
+                            s_cell[visc_modes[k]] = sv
                     # macroscopic
                     rho = 0.0; mx = 0.0; my = 0.0; mz = 0.0
                     for i in range(Q):
@@ -56,23 +75,23 @@ if _HAS_NUMBA:
                     usq = ux*ux + uy*uy + uz*uz
 
                     # feq
-                    feq = np.empty(Q)
                     for i in range(Q):
                         eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
                         feq[i] = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
 
                     # m = M @ f_cell,  m_eq = M @ feq
-                    m    = np.zeros(Q)
-                    m_eq = np.zeros(Q)
                     for a in range(Q):
+                        acc_m = 0.0
+                        acc_eq = 0.0
                         for b in range(Q):
-                            m[a]    += M[a, b] * f[b, z, y, x]
-                            m_eq[a] += M[a, b] * feq[b]
+                            acc_m += M[a, b] * f[b, z, y, x]
+                            acc_eq += M[a, b] * feq[b]
+                        m[a] = acc_m
+                        m_eq[a] = acc_eq
 
                     # relax
-                    m_post = np.zeros(Q)
                     for a in range(Q):
-                        m_post[a] = m[a] - s[a] * (m[a] - m_eq[a])
+                        m_post[a] = m[a] - s_cell[a] * (m[a] - m_eq[a])
 
                     # f_post = Minv @ m_post
                     for i in range(Q):
@@ -82,7 +101,8 @@ if _HAS_NUMBA:
                         f_post[i, z, y, x] = acc
 
 else:
-    def _mrt_collision_3d(f, f_post, solid, s, M, Minv, ex, ey, ez, w):
+    def _mrt_collision_3d(f, f_post, solid, s, M, Minv, ex, ey, ez, w,
+                          omega_field, use_omega_field, visc_modes):
         pass  # replaced by numpy fallback below
 
 
@@ -101,13 +121,14 @@ def _mrt_collision_3d_numpy(
     ey:     np.ndarray,
     ez:     np.ndarray,
     w:      np.ndarray,
+    omega_field: Optional[np.ndarray] = None,
 ) -> None:
     Q, Nz, Ny, Nx = f.shape
     N = Nz * Ny * Nx
     f_flat = f.reshape(Q, N)
 
     rho = f_flat.sum(axis=0)
-    inv_rho = np.where(rho > 0.0, 1.0 / rho, 0.0)
+    inv_rho = inv_positive(rho)
     ux = inv_rho * (ex.astype(np.float64) @ f_flat)
     uy = inv_rho * (ey.astype(np.float64) @ f_flat)
     uz = inv_rho * (ez.astype(np.float64) @ f_flat)
@@ -124,7 +145,13 @@ def _mrt_collision_3d_numpy(
 
     m      = M @ f_flat
     m_eq   = M @ feq
-    m_post = m - s[:, None] * (m - m_eq)
+    # a subgrid model makes the viscous rates a per-cell field
+    if omega_field is None:
+        s_eff = s[:, None]
+    else:
+        s_eff = np.repeat(s[:, None], N, axis=1)
+        s_eff[VISCOUS_MODES, :] = np.asarray(omega_field, dtype=np.float64).reshape(N)
+    m_post = m - s_eff * (m - m_eq)
     f_post[:] = (Minv @ m_post).reshape(Q, Nz, Ny, Nx)
 
 
@@ -138,6 +165,8 @@ class MRTKernel3D:
         self.Minv = np.ascontiguousarray(M19_inv, dtype=np.float64)
         self.s    = build_s3_vec(omega)
         self._use_numba = use_numba and _HAS_NUMBA
+        # Numba needs a concretely-typed array even when the flag is False
+        self._omega_dummy = np.zeros((1, 1, 1), dtype=np.float64)
 
     def collide(
         self,
@@ -148,12 +177,21 @@ class MRTKernel3D:
         ey:     np.ndarray,
         ez:     np.ndarray,
         w:      np.ndarray,
+        omega_field: Optional[np.ndarray] = None,
     ) -> None:
+        """
+        MRT collision.  ``omega_field`` (LES) overrides the viscous rates
+        per cell; the tuned energy/ghost rates are left alone.
+        """
         if self._use_numba:
+            use_field = omega_field is not None
             _mrt_collision_3d(
-                f, f_post, solid, self.s, self.M, self.Minv, ex, ey, ez, w
+                f, f_post, solid, self.s, self.M, self.Minv, ex, ey, ez, w,
+                omega_field if use_field else self._omega_dummy, use_field,
+                VISCOUS_MODES,
             )
         else:
             _mrt_collision_3d_numpy(
-                f, f_post, solid, self.s, self.M, self.Minv, ex, ey, ez, w
+                f, f_post, solid, self.s, self.M, self.Minv, ex, ey, ez, w,
+                omega_field,
             )

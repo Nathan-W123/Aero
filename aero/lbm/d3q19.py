@@ -31,6 +31,8 @@ Domain layout: f shape = (Q, Nz, Ny, Nx)
 import numpy as np
 from typing import Tuple
 
+from .physics import inv_positive
+
 Q3 = 19
 
 # Lattice velocity vectors: E3[i] = (ex, ey, ez)
@@ -92,7 +94,7 @@ def compute_macroscopic_3d(
     rho, ux, uy, uz : ndarray (Nz, Ny, Nx) each
     """
     rho = f.sum(axis=0)
-    inv_rho = np.where(rho > 0.0, 1.0 / rho, 0.0)
+    inv_rho = inv_positive(rho)
     ex = E3[:, 0].astype(np.float64)
     ey = E3[:, 1].astype(np.float64)
     ez = E3[:, 2].astype(np.float64)

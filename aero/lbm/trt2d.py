@@ -5,16 +5,36 @@ from __future__ import annotations
 import numpy as np
 
 
+# Smallest (tau_plus - 1/2) used when solving for tau_minus.  tau_plus <= 1/2
+# means a non-positive viscosity, which `validate_parameters` already rejects;
+# the floor only keeps the relation finite instead of dividing by zero.
+_TAU_EPS = 1e-12
+
+
 def trt_taus(omega: float, magic_lambda: float = 0.25) -> tuple[float, float]:
     """
     Return (tau_plus, tau_minus) from BGK-equivalent omega and magic parameter.
 
-    omega = 1/tau  =>  tau = 1/omega
+    The symmetric rate carries the viscosity, so tau_plus must equal the BGK
+    tau for TRT to reproduce the requested Reynolds number::
+
+        tau_plus  = 1 / omega                      (nu = (tau_plus - 1/2) / 3)
+
+    The antisymmetric rate follows from the TRT "magic" combination, which is
+    what fixes the effective bounce-back wall position::
+
+        Lambda    = (tau_plus - 1/2) * (tau_minus - 1/2)
+        tau_minus = 1/2 + Lambda / (tau_plus - 1/2)
+
+    ``magic_lambda`` is Lambda.  1/4 puts a bounce-back wall exactly mid-link
+    (the usual choice); 1/6 cancels the third-order advection error and 3/16
+    is optimal for a Poiseuille profile.
+
+    Both rates stay in the stable band 0 < s < 2 for every tau_plus > 1/2.
     """
-    tau = 1.0 / omega
     lam = float(magic_lambda)
-    tau_plus = lam * tau + (1.0 - lam)
-    tau_minus = (tau_plus * tau - 0.5) / (tau_plus - 0.5)
+    tau_plus = 1.0 / omega
+    tau_minus = 0.5 + lam / max(tau_plus - 0.5, _TAU_EPS)
     return tau_plus, tau_minus
 
 

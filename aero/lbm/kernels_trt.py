@@ -15,11 +15,14 @@ except ImportError:
     nb = None  # type: ignore[assignment]
 
 
+_TAU_EPS = 1e-12
+
+
 def _trt_s_minus_field(omega_field: np.ndarray, magic_lambda: float) -> np.ndarray:
-    tau = 1.0 / omega_field
+    """Per-cell s_minus for a spatially varying omega (LES).  See `trt_taus`."""
     lam = float(magic_lambda)
-    tau_plus = lam * tau + (1.0 - lam)
-    tau_minus = (tau_plus * tau - 0.5) / (tau_plus - 0.5)
+    tau_plus = 1.0 / omega_field
+    tau_minus = 0.5 + lam / np.maximum(tau_plus - 0.5, _TAU_EPS)
     return 1.0 / tau_minus
 
 
@@ -63,9 +66,12 @@ def trt_collision_numpy(
 if _HAS_NUMBA:
     @nb.njit(cache=True)
     def _trt_s_minus_numba(omega: float, lam: float) -> float:
-        tau = 1.0 / omega
-        tau_plus = lam * tau + (1.0 - lam)
-        tau_minus = (tau_plus * tau - 0.5) / (tau_plus - 0.5)
+        """Scalar s_minus; must stay in step with `trt_taus`."""
+        tau_plus = 1.0 / omega
+        denom = tau_plus - 0.5
+        if denom < 1e-12:
+            denom = 1e-12
+        tau_minus = 0.5 + lam / denom
         return 1.0 / tau_minus
 
     @nb.njit(cache=True, parallel=True)
@@ -84,6 +90,9 @@ if _HAS_NUMBA:
     ) -> None:
         q, ny, nx = f.shape
         for y in nb.prange(ny):
+            # Hoisted out of the cell loop: one heap allocation per cell per
+            # timestep otherwise.
+            feq = np.empty(q)
             for x in range(nx):
                 rho = 0.0
                 mx = 0.0
@@ -101,7 +110,6 @@ if _HAS_NUMBA:
                     ux = mx * inv_r
                     uy = my * inv_r
                 usq = ux * ux + uy * uy
-                feq = np.empty(q)
                 for i in range(q):
                     eu = ex[i] * ux + ey[i] * uy
                     feq[i] = w[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq)

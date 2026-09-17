@@ -21,6 +21,29 @@ def build_sponge_sigma(nx: int, thickness: int, sigma_max: float) -> np.ndarray:
     return sigma
 
 
+def _sponge_slab(sigma_x: np.ndarray):
+    """First column of the sponge zone and its sigma ramp, or None if inactive."""
+    active = np.nonzero(sigma_x > 0.0)[0]
+    if active.size == 0:
+        return None
+    start = int(active[0])
+    return start, sigma_x[start:]
+
+
+def _sponge_feq_poly(u_target: float, e_stream: np.ndarray) -> np.ndarray:
+    """
+    Per-direction equilibrium polynomial for the uniform sponge target state.
+
+    The sponge relaxes toward (ux, uy[, uz]) = (u_target, 0[, 0]), so
+    ``e.u = e_x * u_target`` and ``u.u = u_target**2`` are the same in every
+    sponge cell.  Only ``rho`` varies, which turns the per-column, per-
+    direction equilibrium rebuild into one scalar per direction.
+    """
+    eu = e_stream.astype(np.float64) * float(u_target)
+    usq = float(u_target) * float(u_target)
+    return 1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq
+
+
 def apply_sponge_relaxation_2d(
     f: np.ndarray,
     sigma_x: np.ndarray,
@@ -30,19 +53,17 @@ def apply_sponge_relaxation_2d(
     w: np.ndarray,
 ) -> None:
     """Relax f toward feq(rho, u_target, 0) in the sponge zone."""
-    _, ny, nx = f.shape
-    for x in range(nx):
-        s = sigma_x[x]
-        if s <= 0.0:
-            continue
-        rho = f[:, :, x].sum(axis=0)
-        ux = np.full(ny, u_target)
-        uy = np.zeros(ny)
-        usq = ux * ux
-        for i in range(len(w)):
-            eu = ex[i] * ux + ey[i] * uy
-            feq = w[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq)
-            f[i, :, x] = (1.0 - s) * f[i, :, x] + s * feq
+    slab = _sponge_slab(sigma_x)
+    if slab is None:
+        return
+    start, s = slab
+    sub = f[:, :, start:]
+    rho = sub.sum(axis=0)                       # before sub is modified
+    poly = _sponge_feq_poly(u_target, ex)
+    one_minus_s = 1.0 - s
+    for i in range(len(w)):
+        feq = w[i] * rho * poly[i]
+        sub[i] = one_minus_s * sub[i] + s * feq
 
 
 def apply_sponge_relaxation_3d(
@@ -54,17 +75,14 @@ def apply_sponge_relaxation_3d(
     ez: np.ndarray,
     w: np.ndarray,
 ) -> None:
-    _, nz, ny, nx = f.shape
-    for x in range(nx):
-        s = sigma_x[x]
-        if s <= 0.0:
-            continue
-        rho = f[:, :, :, x].sum(axis=0)
-        ux = np.full((nz, ny), u_target)
-        uy = np.zeros((nz, ny))
-        uz = np.zeros((nz, ny))
-        usq = ux * ux
-        for i in range(len(w)):
-            eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
-            feq = w[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq)
-            f[i, :, :, x] = (1.0 - s) * f[i, :, :, x] + s * feq
+    slab = _sponge_slab(sigma_x)
+    if slab is None:
+        return
+    start, s = slab
+    sub = f[:, :, :, start:]
+    rho = sub.sum(axis=0)                       # before sub is modified
+    poly = _sponge_feq_poly(u_target, ex)
+    one_minus_s = 1.0 - s
+    for i in range(len(w)):
+        feq = w[i] * rho * poly[i]
+        sub[i] = one_minus_s * sub[i] + s * feq

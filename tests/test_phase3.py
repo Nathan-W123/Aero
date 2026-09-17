@@ -261,13 +261,20 @@ class TestNumbaSpeedup:
 
     STEPS = 500
     Ny, Nx = 100, 200
+    # Re=100 on this grid is under-resolved and the field overflows to ~1e214
+    # within the timed window.  Timing saturated/denormal arithmetic measures
+    # the FPU's slow paths rather than the kernels, and gave a machine-
+    # dependent result that could land either side of the threshold.
+    RE = 20.0
 
     def _time_backend(self, backend):
-        s = _make_solver(backend=backend, Ny=self.Ny, Nx=self.Nx)
+        s = _make_solver(backend=backend, Ny=self.Ny, Nx=self.Nx, re=self.RE)
         s.run(steps=self.STEPS, check_every=self.STEPS + 1, verbose=False)
         t0 = time.perf_counter()
         s.run(steps=self.STEPS, check_every=self.STEPS + 1, verbose=False)
-        return time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
+        assert np.all(np.isfinite(s.f)), "benchmark case diverged; timing is meaningless"
+        return elapsed
 
     def test_numba_faster_than_numpy(self):
         if not HAS_NUMBA:

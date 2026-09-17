@@ -12,6 +12,11 @@ except ImportError:
     nb = None  # type: ignore[assignment]
 
 
+def _is_numpy(*arrays: np.ndarray) -> bool:
+    """True when every array is a host NumPy array (i.e. Numba can take it)."""
+    return all(isinstance(a, np.ndarray) for a in arrays)
+
+
 # ---------------------------------------------------------------------------
 # Numba JIT kernels
 # ---------------------------------------------------------------------------
@@ -227,6 +232,121 @@ def apply_guo_forcing_3d(
                               ex, ey, ez, w, solid)
 
 
+if HAS_NUMBA:
+    @nb.njit(cache=True, parallel=True)
+    def _uniform_body_force_2d_nb(
+        f: np.ndarray,
+        coeff: float,
+        fx: float,
+        fy: float,
+        ex: np.ndarray,
+        ey: np.ndarray,
+        w: np.ndarray,
+        solid: np.ndarray,
+    ) -> None:
+        q, ny, nx = f.shape
+        cs2 = 1.0 / 3.0
+        for y in nb.prange(ny):
+            for x in range(nx):
+                if solid[y, x]:
+                    continue
+                rho = 0.0
+                mx = 0.0
+                my = 0.0
+                for i in range(q):
+                    fi = f[i, y, x]
+                    rho += fi
+                    mx += ex[i] * fi
+                    my += ey[i] * fi
+                if rho <= 0.0:
+                    continue
+                inv_rho = 1.0 / rho
+                ux = mx * inv_rho
+                uy = my * inv_rho
+                uf = ux * fx + uy * fy
+                for i in range(q):
+                    eu = ex[i] * ux + ey[i] * uy
+                    ef = ex[i] * fx + ey[i] * fy
+                    term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
+                    f[i, y, x] += coeff * w[i] * rho * term
+
+    @nb.njit(cache=True, parallel=True)
+    def _uniform_body_force_3d_nb(
+        f: np.ndarray,
+        coeff: float,
+        fx: float,
+        fy: float,
+        fz: float,
+        ex: np.ndarray,
+        ey: np.ndarray,
+        ez: np.ndarray,
+        w: np.ndarray,
+        solid: np.ndarray,
+    ) -> None:
+        q, nz, ny, nx = f.shape
+        cs2 = 1.0 / 3.0
+        for z in nb.prange(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    if solid[z, y, x]:
+                        continue
+                    rho = 0.0
+                    mx = 0.0
+                    my = 0.0
+                    mz = 0.0
+                    for i in range(q):
+                        fi = f[i, z, y, x]
+                        rho += fi
+                        mx += ex[i] * fi
+                        my += ey[i] * fi
+                        mz += ez[i] * fi
+                    if rho <= 0.0:
+                        continue
+                    inv_rho = 1.0 / rho
+                    ux = mx * inv_rho
+                    uy = my * inv_rho
+                    uz = mz * inv_rho
+                    uf = ux * fx + uy * fy + uz * fz
+                    for i in range(q):
+                        eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
+                        ef = ex[i] * fx + ey[i] * fy + ez[i] * fz
+                        term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
+                        f[i, z, y, x] += coeff * w[i] * rho * term
+
+
+def _uniform_body_force_numpy(
+    f: np.ndarray,
+    coeff: float,
+    force: tuple,
+    e_components: tuple,
+    w: np.ndarray,
+    solid: np.ndarray,
+) -> None:
+    """
+    Vectorised Guo body force for an arbitrary lattice dimension.
+
+    ``force`` and ``e_components`` are same-length tuples of the force vector
+    components and the matching lattice-velocity column arrays.
+    """
+    cs2 = 1.0 / 3.0
+    fluid = ~solid
+    rho = f.sum(axis=0)
+    ok = fluid & (rho > 0.0)
+    if not ok.any():
+        return
+    inv_rho = np.where(ok, 1.0 / np.where(rho > 0.0, rho, 1.0), 0.0)
+
+    u = [inv_rho * np.tensordot(e.astype(np.float64), f, axes=(0, 0))
+         for e in e_components]
+    uf = sum(uc * fc for uc, fc in zip(u, force))
+
+    for i in range(f.shape[0]):
+        eu = sum(float(e[i]) * uc for e, uc in zip(e_components, u))
+        ef = sum(float(e[i]) * fc for e, fc in zip(e_components, force))
+        term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
+        f[i] += np.where(ok, coeff * w[i] * rho * term, 0.0)
+
+
 def apply_uniform_body_force_2d(
     f: np.ndarray,
     tau: float,
@@ -240,24 +360,16 @@ def apply_uniform_body_force_2d(
     """Apply a uniform Guo-style body force to all fluid nodes."""
     if abs(fx) < 1e-16 and abs(fy) < 1e-16:
         return
-    cs2 = 1.0 / 3.0
-    coeff = (1.0 - 0.5 / tau)
-    q = f.shape[0]
-    for y in range(f.shape[1]):
-        for x in range(f.shape[2]):
-            if solid[y, x]:
-                continue
-            rho = f[:, y, x].sum()
-            if rho <= 0.0:
-                continue
-            ux = np.dot(ex.astype(np.float64), f[:, y, x]) / rho
-            uy = np.dot(ey.astype(np.float64), f[:, y, x]) / rho
-            for i in range(q):
-                eu = ex[i] * ux + ey[i] * uy
-                ef = ex[i] * fx + ey[i] * fy
-                uf = ux * fx + uy * fy
-                term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
-                f[i, y, x] += coeff * w[i] * rho * term
+    coeff = 1.0 - 0.5 / tau
+    if HAS_NUMBA and _is_numpy(f, solid):
+        _uniform_body_force_2d_nb(
+            f, coeff, float(fx), float(fy),
+            ex.astype(np.float64), ey.astype(np.float64), w, solid,
+        )
+    else:
+        _uniform_body_force_numpy(
+            f, coeff, (float(fx), float(fy)), (ex, ey), w, solid,
+        )
 
 
 def apply_uniform_body_force_3d(
@@ -275,27 +387,14 @@ def apply_uniform_body_force_3d(
     """Apply a uniform Guo-style body force to all fluid nodes."""
     if abs(fx) < 1e-16 and abs(fy) < 1e-16 and abs(fz) < 1e-16:
         return
-    cs2 = 1.0 / 3.0
-    coeff = (1.0 - 0.5 / tau)
-    q = f.shape[0]
-    nz, ny, nx = f.shape[1:]
-    exf = ex.astype(np.float64)
-    eyf = ey.astype(np.float64)
-    ezf = ez.astype(np.float64)
-    for z in range(nz):
-        for y in range(ny):
-            for x in range(nx):
-                if solid[z, y, x]:
-                    continue
-                rho = f[:, z, y, x].sum()
-                if rho <= 0.0:
-                    continue
-                ux = np.dot(exf, f[:, z, y, x]) / rho
-                uy = np.dot(eyf, f[:, z, y, x]) / rho
-                uz = np.dot(ezf, f[:, z, y, x]) / rho
-                uf = ux * fx + uy * fy + uz * fz
-                for i in range(q):
-                    eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
-                    ef = ex[i] * fx + ey[i] * fy + ez[i] * fz
-                    term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
-                    f[i, z, y, x] += coeff * w[i] * rho * term
+    coeff = 1.0 - 0.5 / tau
+    if HAS_NUMBA and _is_numpy(f, solid):
+        _uniform_body_force_3d_nb(
+            f, coeff, float(fx), float(fy), float(fz),
+            ex.astype(np.float64), ey.astype(np.float64), ez.astype(np.float64),
+            w, solid,
+        )
+    else:
+        _uniform_body_force_numpy(
+            f, coeff, (float(fx), float(fy), float(fz)), (ex, ey, ez), w, solid,
+        )

@@ -301,24 +301,34 @@ def build_surface_links_3d(
     """
     Nz, Ny, Nx = solid.shape
     fluid = ~solid
-    links = []
+    z_line = np.arange(Nz)
+    y_line = np.arange(Ny)
+    x_line = np.arange(Nx)
+
+    per_dir = []
     for i in range(1, 19):
         ex_, ey_, ez_ = int(E3[i, 0]), int(E3[i, 1]), int(E3[i, 2])
-        z_g, y_g, x_g = np.meshgrid(
-            np.arange(Nz), np.arange(Ny), np.arange(Nx), indexing='ij'
-        )
-        zn = np.clip(z_g + ez_, 0, Nz - 1)
-        yn = np.clip(y_g + ey_, 0, Ny - 1)
-        xn = np.clip(x_g + ex_, 0, Nx - 1)
-        mask = fluid & solid[zn, yn, xn]
-        zs, ys, xs = np.where(mask)
-        for z, y, x in zip(zs.tolist(), ys.tolist(), xs.tolist()):
-            links.append((i, int(z), int(y), int(x)))
+        # Clamped (not wrapped) neighbour indices — see the 2D builder.
+        zn = np.clip(z_line + ez_, 0, Nz - 1)
+        yn = np.clip(y_line + ey_, 0, Ny - 1)
+        xn = np.clip(x_line + ex_, 0, Nx - 1)
+        mask = fluid & solid[zn[:, None, None], yn[None, :, None], xn[None, None, :]]
+        zs, ys, xs = np.nonzero(mask)
+        if zs.size:
+            per_dir.append(
+                np.stack(
+                    (np.full(zs.size, i, dtype=np.int32),
+                     zs.astype(np.int32),
+                     ys.astype(np.int32),
+                     xs.astype(np.int32)),
+                    axis=1,
+                )
+            )
 
-    if not links:
+    if not per_dir:
         return np.empty((0, 4), dtype=np.int32), np.empty(0, dtype=np.float32)
 
-    links_arr = np.array(links, dtype=np.int32)
+    links_arr = np.concatenate(per_dir, axis=0)
     if phi is not None:
         z_arr = links_arr[:, 1]
         y_arr = links_arr[:, 2]

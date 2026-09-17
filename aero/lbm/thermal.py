@@ -56,24 +56,26 @@ def collide_g_2d(
     Q = g.shape[0]
     from .d2q9 import E, W
     g_post = np.empty_like(g)
+    T_solid = T[solid]
     for i in range(Q):
         eu = float(E[i, 0]) * ux + float(E[i, 1]) * uy
         g_eq = W[i] * T * (1.0 + 3.0 * eu)
         g_post[i] = g[i] - omega_T * (g[i] - g_eq)
-    # Solid cells: relax to zero-velocity equilibrium at local T
-    g_post[:, solid] = 0.0
-    for i in range(Q):
-        g_post[i][solid] = W[i] * T[solid]
+        # Solid cells: relax to zero-velocity equilibrium at local T
+        g_post[i][solid] = W[i] * T_solid
     return g_post
 
 
 def stream_g_2d(g: np.ndarray, ex: np.ndarray, ey: np.ndarray) -> np.ndarray:
     """Streaming step for the 2D temperature distribution."""
-    Q = g.shape[0]
+    from .kernels import stream_kernel
+
     g_new = np.empty_like(g)
-    for i in range(Q):
-        g_new[i] = np.roll(g[i], int(ey[i]), axis=0)
-        g_new[i] = np.roll(g_new[i], int(ex[i]), axis=1)
+    stream_kernel(
+        np.ascontiguousarray(g, dtype=np.float64), g_new,
+        np.ascontiguousarray(ex, dtype=np.int32),
+        np.ascontiguousarray(ey, dtype=np.int32),
+    )
     return g_new
 
 
@@ -159,13 +161,12 @@ def collide_g_3d(
     from .d3q19 import E3, W3
     Q = g.shape[0]
     g_post = np.empty_like(g)
+    T_solid = T[solid]
     for i in range(Q):
         eu = float(E3[i, 0]) * ux + float(E3[i, 1]) * uy + float(E3[i, 2]) * uz
         g_eq = W3[i] * T * (1.0 + 3.0 * eu)
         g_post[i] = g[i] - omega_T * (g[i] - g_eq)
-    g_post[:, solid] = 0.0
-    for i in range(Q):
-        g_post[i][solid] = W3[i] * T[solid]
+        g_post[i][solid] = W3[i] * T_solid
     return g_post
 
 
@@ -176,12 +177,15 @@ def stream_g_3d(
     ez: np.ndarray,
 ) -> np.ndarray:
     """Streaming step for the 3D temperature distribution."""
-    Q = g.shape[0]
+    from .kernels3d import stream_kernel_3d
+
     g_new = np.empty_like(g)
-    for i in range(Q):
-        tmp = np.roll(g[i], int(ez[i]), axis=0)
-        tmp = np.roll(tmp, int(ey[i]), axis=1)
-        g_new[i] = np.roll(tmp, int(ex[i]), axis=2)
+    stream_kernel_3d(
+        np.ascontiguousarray(g, dtype=np.float64), g_new,
+        np.ascontiguousarray(ex, dtype=np.int32),
+        np.ascontiguousarray(ey, dtype=np.int32),
+        np.ascontiguousarray(ez, dtype=np.int32),
+    )
     return g_new
 
 

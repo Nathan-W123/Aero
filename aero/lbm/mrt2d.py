@@ -48,6 +48,17 @@ M9 = np.array([
 M9_inv = np.linalg.inv(M9)
 
 
+# Entries of s that depend on the local relaxation rate.  A subgrid model
+# makes omega a per-cell field, and only these rows may then vary per cell.
+VISCOUS_MODES = np.array([7, 8], dtype=np.int64)     # pxx, pxy
+ENERGY_FLUX_MODES = np.array([4, 6], dtype=np.int64)  # qx, qy — sq(omega)
+
+
+def magic_sq(sv: float) -> float:
+    """Energy-flux rate tied to the viscous rate (4th-order accurate diffusion)."""
+    return 8.0 * (2.0 - sv) / (8.0 - sv)
+
+
 def build_s_vec(omega: float, se: float = 1.64, sep: float = 1.54) -> np.ndarray:
     """
     Build the MRT relaxation vector s for D2Q9.
@@ -63,7 +74,7 @@ def build_s_vec(omega: float, se: float = 1.64, sep: float = 1.54) -> np.ndarray
     s : (9,) float64 — diagonal of S matrix
     """
     sv = omega                            # stress modes → viscosity
-    sq = 8.0 * (2.0 - sv) / (8.0 - sv)  # magic parameter (4th-order accurate)
+    sq = magic_sq(sv)                     # magic parameter (4th-order accurate)
     return np.array([
         1.0,   # s0  rho      (conserved)
         se,    # s1  e
