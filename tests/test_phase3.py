@@ -40,9 +40,15 @@ def _lattice_arrays():
     return ex, ey, w
 
 
-def _call_collision_kernel(f, got, solid, omega, ex, ey, w, ny, nx):
+def _call_collision_kernel(f, got, solid, omega, ex, ey, w, ny, nx, acc=None):
+    """Collision with no LES field and, by default, no body force."""
+    from aero.lbm.forcing import FORCE_FIELD, FORCE_NONE, dummy_force_field
     dummy = np.zeros((ny, nx), dtype=np.float64)
-    collision_kernel(f, got, solid, omega, ex, ey, w, dummy, False)
+    mode = FORCE_NONE if acc is None else FORCE_FIELD
+    collision_kernel(
+        f, got, solid, omega, ex, ey, w, dummy, False,
+        np.zeros(2), dummy_force_field(2) if acc is None else acc, mode,
+    )
 
 
 # ---------------------------------------------------------------------------

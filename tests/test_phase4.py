@@ -32,9 +32,15 @@ from aero.geometry3d.box import Box
 from aero.forces3d import compute_forces_3d, forces_to_coefficients_3d
 
 
-def _call_collision_kernel_3d(f, got, solid, omega, ex, ey, ez, w, nz, ny, nx):
+def _call_collision_kernel_3d(f, got, solid, omega, ex, ey, ez, w, nz, ny, nx, acc=None):
+    """Collision with no LES field and, by default, no body force."""
+    from aero.lbm.forcing import FORCE_FIELD, FORCE_NONE, dummy_force_field
     dummy = np.zeros((nz, ny, nx), dtype=np.float64)
-    collision_kernel_3d(f, got, solid, omega, ex, ey, ez, w, dummy, False)
+    mode = FORCE_NONE if acc is None else FORCE_FIELD
+    collision_kernel_3d(
+        f, got, solid, omega, ex, ey, ez, w, dummy, False,
+        np.zeros(3), dummy_force_field(3) if acc is None else acc, mode,
+    )
 
 
 # ---------------------------------------------------------------------------

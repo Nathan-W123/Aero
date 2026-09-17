@@ -69,7 +69,12 @@ from .les import (
 )
 from .physics import base_nu_from_omega
 from . import kernels_trt as _ktrt
-from .ibm_guo import apply_guo_forcing_2d
+from .ibm_guo import ibm_acceleration_2d
+from .forcing import (
+    FORCE_NONE, FORCE_UNIFORM, FORCE_FIELD,
+    boussinesq_acceleration, dummy_force_field, resolve_force_mode,
+    uniform_acceleration,
+)
 
 
 class Solver:
@@ -103,6 +108,8 @@ class Solver:
         van_driest_A: float = 25.0,
         wall_velocity_top: float = 0.0,
         wall_velocity_bottom: float = 0.0,
+        body_force_x: float = 0.0,
+        body_force_y: float = 0.0,
         synthetic_inflow: bool = False,
         synthetic_inflow_intensity: float = 0.03,
         synthetic_inflow_seed: int = 12345,
@@ -170,6 +177,8 @@ class Solver:
         self.van_driest_A = float(van_driest_A)
         self.wall_velocity_top = float(wall_velocity_top)
         self.wall_velocity_bottom = float(wall_velocity_bottom)
+        self.body_force_x = float(body_force_x)
+        self.body_force_y = float(body_force_y)
         self.synthetic_inflow = bool(synthetic_inflow)
         self.synthetic_inflow_intensity = float(synthetic_inflow_intensity)
         self._rng = np.random.default_rng(int(synthetic_inflow_seed))
@@ -233,6 +242,12 @@ class Solver:
         self._omega_dummy = np.zeros((Ny, Nx), dtype=np.float64)
         self._inlet_uy_field = np.zeros(Ny, dtype=np.float64)
 
+        # Guo forcing: the uniform part is a (2,) vector, the dummy stands in
+        # for the per-cell field on branches that never read it.
+        self._acc_uniform = uniform_acceleration(self.body_force_x, self.body_force_y)
+        self._acc_dummy = dummy_force_field(2)
+        self._last_acc: tuple = (FORCE_NONE, self._acc_dummy)
+
         # Step counter — incremented by run(); preserved across checkpoint loads
         self.step_count: int = 0
 
@@ -272,16 +287,75 @@ class Solver:
     # Private: single timestep
     # ------------------------------------------------------------------
 
+    def macroscopic(self, f: Optional[np.ndarray] = None) -> tuple:
+        """
+        ``(rho, ux, uy)`` including the Guo half-force correction.
+
+        With a force present the physical velocity is ``(sum e_i f_i + F/2)/rho``.
+        Reporting the bare moment sum instead understates the velocity by
+        ``a/2`` everywhere the force acts.
+        """
+        if f is None:
+            f = self.f
+        rho, ux, uy = compute_macroscopic(f)
+        mode, field = self._last_acc
+        if mode == FORCE_UNIFORM:
+            ux = ux + 0.5 * self._acc_uniform[0]
+            uy = uy + 0.5 * self._acc_uniform[1]
+        elif mode == FORCE_FIELD:
+            ux = ux + 0.5 * field[0]
+            uy = uy + 0.5 * field[1]
+        if mode != FORCE_NONE:
+            ux = np.where(self.solid, 0.0, ux)
+            uy = np.where(self.solid, 0.0, uy)
+        return rho, ux, uy
+
+    def _acc_as_field(self, mode: int, acc_u: np.ndarray, acc_f: np.ndarray):
+        """Expand the force to a full field, for kernels that only take one."""
+        if mode == FORCE_NONE:
+            return None
+        if mode == FORCE_UNIFORM:
+            return np.broadcast_to(acc_u[:, None, None], (2, self.Ny, self.Nx))
+        return acc_f
+
+    def _build_acceleration(self) -> tuple:
+        """
+        Total acceleration for this step, as ``(mode, uniform, field)``.
+
+        Every force source — uniform body force, Boussinesq buoyancy, immersed
+        boundary — is expressed as an acceleration and summed here, so the
+        collision kernel applies one consistent Guo source term rather than
+        several ad-hoc passes.  The uniform-only case stays a ``(2,)`` vector
+        and costs no per-cell memory traffic.
+        """
+        field = None
+
+        if self.buoyancy and self.g is not None:
+            from .thermal import extract_T
+            field = boussinesq_acceleration(
+                extract_T(self.g), self.T_ref, self.g_gravity, self.beta, 2, axis=1
+            )
+
+        if self.ibm_enabled and self.phi is not None:
+            ibm = ibm_acceleration_2d(
+                self.f, self.phi, self._u_wall_x, self._u_wall_y,
+                self._ex, self._ey, self.solid,
+            )
+            field = ibm if field is None else field + ibm
+
+        if field is not None:
+            field += self._acc_uniform[:, None, None]
+            return FORCE_FIELD, self._acc_uniform, np.ascontiguousarray(field)
+
+        mode = resolve_force_mode(self._acc_uniform, None)
+        return mode, self._acc_uniform, self._acc_dummy
+
     def _step(self) -> tuple:
         """Execute one LBM timestep. Returns instantaneous (Cd, Cl)."""
         f = self.f
 
-        if self.ibm_enabled and self.phi is not None:
-            apply_guo_forcing_2d(
-                f, self.phi, self.tau,
-                self._u_wall_x, self._u_wall_y,
-                self._ex, self._ey, self._w, self.solid,
-            )
+        force_mode, acc_u, acc_f = self._build_acceleration()
+        self._last_acc = (force_mode, acc_f)
 
         omega_field = self._omega_dummy
         use_omega_field = False
@@ -294,15 +368,16 @@ class Solver:
             use_omega_field = True
         omega_use = self.omega
 
-        # 1+2. Collision. `f_pre` is the post-collision, pre-streaming state:
-        #      streaming always reads it and writes into a separate array, so
-        #      it stays valid for mid-link bounce-back and the force
-        #      evaluation without needing a snapshot copy.
+        # 1+2. Collision (with Guo forcing).  `f_pre` is the post-collision,
+        #      pre-streaming state: streaming always reads it and writes into a
+        #      separate array, so it stays valid for mid-link bounce-back and
+        #      the force evaluation without needing a snapshot copy.
         if self.collision == "mrt":
             f_pre = np.empty_like(f)
             self._mrt_kernel.collide(
                 f, f_pre, self.solid, self._ex, self._ey, self._w,
                 omega_field if use_omega_field else None,
+                acc_u, acc_f, force_mode,
             )
 
         elif self.collision == "trt":
@@ -313,12 +388,14 @@ class Solver:
                     self._ex, self._ey, self._w,
                     OPP.astype(np.int32), self.trt_lambda,
                     omega_field, use_omega_field,
+                    acc_u, acc_f, force_mode,
                 )
             else:
                 _ktrt.trt_collision_numpy(
                     f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._w, self.trt_lambda,
                     omega_field if use_omega_field else None,
+                    self._acc_as_field(force_mode, acc_u, acc_f),
                 )
 
         elif self._use_numba:
@@ -328,23 +405,26 @@ class Solver:
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._w,
                 omega_field, use_omega_field,
+                acc_u, acc_f, force_mode,
             )
 
         else:
-            # NumPy fallback: BGK collision; solid cells relax to
-            # zero-velocity equilibrium
-            rho, ux, uy = compute_macroscopic(f)
-            ux_c = ux.copy()
-            uy_c = uy.copy()
-            ux_c[self.solid] = 0.0
-            uy_c[self.solid] = 0.0
-            feq = compute_feq(rho, ux_c, uy_c)
-            om = omega_field if use_omega_field else omega_use
-            f_pre = (1.0 - om) * f + om * feq
+            # Pure-NumPy path — never dispatches to the JIT kernels even when
+            # Numba is installed, so `backend="numpy"` means what it says.
+            f_pre = np.empty_like(f)
+            _kernels.collision_kernel_numpy(
+                f, f_pre, self.solid, omega_use,
+                self._ex, self._ey, self._w,
+                omega_field, use_omega_field,
+                acc_u, acc_f, force_mode,
+            )
 
         # 3. Push streaming into a fresh array (never writes to its source)
         f_post = np.empty_like(f_pre)
-        _kernels.stream_kernel(f_pre, f_post, self._ex, self._ey)
+        if self._use_numba:
+            _kernels.stream_kernel(f_pre, f_post, self._ex, self._ey)
+        else:
+            _kernels.stream_kernel_numpy(f_pre, f_post, self._ex, self._ey)
 
         # 5. Boundary conditions — order matters (same for both backends)
         if not self.ibm_enabled:
@@ -394,20 +474,15 @@ class Solver:
                 u_bottom=self.wall_velocity_bottom,
             )
 
-        # Thermal step
+        # Thermal step.  Buoyancy is no longer added here: it joins the
+        # acceleration field consumed by collision, which is where the Guo
+        # scheme requires it (and gives it the half-force correction).
         if self.thermal and self.g is not None:
             from .thermal import (
-                collide_g_2d, stream_g_2d, extract_T,
-                apply_temperature_bc_2d, guo_buoyancy_force_2d,
+                collide_g_2d, stream_g_2d, extract_T, apply_temperature_bc_2d,
             )
-            rho_now, ux_now, uy_now = compute_macroscopic(f_post)
+            _, ux_now, uy_now = self.macroscopic(f_post)
             T_now = extract_T(self.g)
-            if self.buoyancy:
-                F_b = guo_buoyancy_force_2d(
-                    rho_now, T_now, self.T_ref,
-                    self.g_gravity, self.beta, self._ey, self._w,
-                )
-                f_post = f_post + F_b
             g_post = collide_g_2d(self.g, ux_now, uy_now, T_now, self.omega_T, self.solid)
             g_post = stream_g_2d(g_post, self._ex, self._ey)
             apply_temperature_bc_2d(g_post, self.T_hot, self.T_cold, self._w, self._ex, self._ey)
@@ -505,14 +580,13 @@ class Solver:
                 self.save_checkpoint(str(ckpt_path))
 
             if hdf5_writer and hdf5_every and step % hdf5_every == 0:
-                from ..lbm.d2q9 import compute_macroscopic as _cm2
                 from .thermal import extract_T as _extract_T
-                _rho, _ux, _uy = _cm2(self.f)
+                _rho, _ux, _uy = self.macroscopic()
                 _scalar = _extract_T(self.g) if (self.thermal and self.g is not None) else None
                 hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, rho=_rho, scalar=_scalar)
 
             if step % check_every == 0:
-                rho, ux, uy = compute_macroscopic(self.f)
+                rho, ux, uy = self.macroscopic()
                 check_stability(self.f, rho, ux, uy, step)
 
                 elapsed        = time.perf_counter() - t_start
@@ -548,7 +622,7 @@ class Solver:
                         break
 
         # Final macroscopic state
-        rho, ux, uy        = compute_macroscopic(self.f)
+        rho, ux, uy        = self.macroscopic()
         self.rho, self.ux, self.uy = rho, ux, uy
 
         Cd_arr = np.array(self.Cd_history[-avg_window:])
@@ -633,6 +707,8 @@ class Solver:
             bouzidi=self.bouzidi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             wall_velocity_top=self.wall_velocity_top,
             wall_velocity_bottom=self.wall_velocity_bottom,
+            body_force_x=self.body_force_x,
+            body_force_y=self.body_force_y,
             synthetic_inflow=self.synthetic_inflow,
             synthetic_inflow_intensity=self.synthetic_inflow_intensity,
             thermal=self.thermal,

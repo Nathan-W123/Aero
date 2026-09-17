@@ -10,6 +10,7 @@ from typing import Optional
 
 from .mrt3d import M19, M19_inv, build_s3_vec, VISCOUS_MODES
 from .physics import inv_positive
+from .forcing import FORCE_NONE, FORCE_UNIFORM, FORCE_FIELD, dummy_force_field
 
 try:
     import numba as nb
@@ -38,6 +39,9 @@ if _HAS_NUMBA:
         omega_field: np.ndarray,  # (Nz, Ny, Nx) per-cell relaxation rate (LES)
         use_omega_field: bool,
         visc_modes: np.ndarray,   # rows of s carrying the viscosity
+        acc_uniform: np.ndarray,
+        acc_field: np.ndarray,
+        force_mode: int,
     ) -> None:
         Q, Nz, Ny, Nx = f.shape
         for z in nb.prange(Nz):
@@ -47,6 +51,7 @@ if _HAS_NUMBA:
             m = np.empty(Q)
             m_eq = np.empty(Q)
             m_post = np.empty(Q)
+            src = np.empty(Q)
             s_cell = s.copy()
             for y in range(Ny):
                 for x in range(Nx):
@@ -65,19 +70,40 @@ if _HAS_NUMBA:
                         my  += ey[i] * fi
                         mz  += ez[i] * fi
                     inv_rho = 1.0 / rho if rho > 0.0 else 0.0
+
+                    ax = 0.0; ay = 0.0; az = 0.0
+                    if force_mode == 1:
+                        ax = acc_uniform[0]
+                        ay = acc_uniform[1]
+                        az = acc_uniform[2]
+                    elif force_mode == 2:
+                        ax = acc_field[0, z, y, x]
+                        ay = acc_field[1, z, y, x]
+                        az = acc_field[2, z, y, x]
+
                     if solid[z, y, x]:
                         ux = 0.0; uy = 0.0; uz = 0.0
+                        ax = 0.0; ay = 0.0; az = 0.0
                     else:
-                        ux = mx * inv_rho
-                        uy = my * inv_rho
-                        uz = mz * inv_rho
+                        # half-force correction: rho u = sum e_i f_i + F/2
+                        ux = mx * inv_rho + 0.5 * ax
+                        uy = my * inv_rho + 0.5 * ay
+                        uz = mz * inv_rho + 0.5 * az
 
                     usq = ux*ux + uy*uy + uz*uz
+                    ua = ux*ax + uy*ay + uz*az
 
                     # feq
                     for i in range(Q):
                         eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
                         feq[i] = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
+
+                    # Guo source in distribution space
+                    if force_mode != 0:
+                        for i in range(Q):
+                            eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
+                            ea = ex[i]*ax + ey[i]*ay + ez[i]*az
+                            src[i] = w[i] * rho * (3.0*(ea - ua) + 9.0*eu*ea)
 
                     # m = M @ f_cell,  m_eq = M @ feq
                     for a in range(Q):
@@ -89,9 +115,19 @@ if _HAS_NUMBA:
                         m[a] = acc_m
                         m_eq[a] = acc_eq
 
-                    # relax
-                    for a in range(Q):
-                        m_post[a] = m[a] - s_cell[a] * (m[a] - m_eq[a])
+                    # relax: m_post = m - s (m - m_eq) + (I - S/2) M src
+                    if force_mode == 0:
+                        for a in range(Q):
+                            m_post[a] = m[a] - s_cell[a] * (m[a] - m_eq[a])
+                    else:
+                        for a in range(Q):
+                            acc_s = 0.0
+                            for b in range(Q):
+                                acc_s += M[a, b] * src[b]
+                            m_post[a] = (
+                                m[a] - s_cell[a] * (m[a] - m_eq[a])
+                                + (1.0 - 0.5 * s_cell[a]) * acc_s
+                            )
 
                     # f_post = Minv @ m_post
                     for i in range(Q):
@@ -102,7 +138,8 @@ if _HAS_NUMBA:
 
 else:
     def _mrt_collision_3d(f, f_post, solid, s, M, Minv, ex, ey, ez, w,
-                          omega_field, use_omega_field, visc_modes):
+                          omega_field, use_omega_field, visc_modes,
+                          acc_uniform, acc_field, force_mode):
         pass  # replaced by numpy fallback below
 
 
@@ -122,6 +159,7 @@ def _mrt_collision_3d_numpy(
     ez:     np.ndarray,
     w:      np.ndarray,
     omega_field: Optional[np.ndarray] = None,
+    acc: Optional[np.ndarray] = None,
 ) -> None:
     Q, Nz, Ny, Nx = f.shape
     N = Nz * Ny * Nx
@@ -133,6 +171,16 @@ def _mrt_collision_3d_numpy(
     uy = inv_rho * (ey.astype(np.float64) @ f_flat)
     uz = inv_rho * (ez.astype(np.float64) @ f_flat)
     solid_flat = solid.ravel()
+    if acc is None:
+        ax = ay = az = None
+    else:
+        fluid_flat = ~solid_flat
+        ax = np.where(fluid_flat, np.asarray(acc[0]).reshape(N), 0.0)
+        ay = np.where(fluid_flat, np.asarray(acc[1]).reshape(N), 0.0)
+        az = np.where(fluid_flat, np.asarray(acc[2]).reshape(N), 0.0)
+        ux = ux + 0.5 * ax          # half-force correction
+        uy = uy + 0.5 * ay
+        uz = uz + 0.5 * az
     ux[solid_flat] = 0.0
     uy[solid_flat] = 0.0
     uz[solid_flat] = 0.0
@@ -152,6 +200,15 @@ def _mrt_collision_3d_numpy(
         s_eff = np.repeat(s[:, None], N, axis=1)
         s_eff[VISCOUS_MODES, :] = np.asarray(omega_field, dtype=np.float64).reshape(N)
     m_post = m - s_eff * (m - m_eq)
+    if acc is not None:
+        # Guo source, transformed to moment space and scaled by (I - S/2)
+        ua = ux*ax + uy*ay + uz*az
+        src = np.empty((Q, N))
+        for i in range(Q):
+            eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
+            ea = ex[i]*ax + ey[i]*ay + ez[i]*az
+            src[i] = w[i] * rho * (3.0*(ea - ua) + 9.0*eu*ea)
+        m_post = m_post + (1.0 - 0.5 * s_eff) * (M @ src)
     f_post[:] = (Minv @ m_post).reshape(Q, Nz, Ny, Nx)
 
 
@@ -167,6 +224,8 @@ class MRTKernel3D:
         self._use_numba = use_numba and _HAS_NUMBA
         # Numba needs a concretely-typed array even when the flag is False
         self._omega_dummy = np.zeros((1, 1, 1), dtype=np.float64)
+        self._acc_dummy_u = np.zeros(3, dtype=np.float64)
+        self._acc_dummy_f = dummy_force_field(3)
 
     def collide(
         self,
@@ -178,10 +237,14 @@ class MRTKernel3D:
         ez:     np.ndarray,
         w:      np.ndarray,
         omega_field: Optional[np.ndarray] = None,
+        acc_uniform: Optional[np.ndarray] = None,
+        acc_field: Optional[np.ndarray] = None,
+        force_mode: int = FORCE_NONE,
     ) -> None:
         """
         MRT collision.  ``omega_field`` (LES) overrides the viscous rates
-        per cell; the tuned energy/ghost rates are left alone.
+        per cell; the tuned energy/ghost rates are left alone.  Guo forcing
+        enters in moment space scaled by ``(I - S/2)``.
         """
         if self._use_numba:
             use_field = omega_field is not None
@@ -189,9 +252,19 @@ class MRTKernel3D:
                 f, f_post, solid, self.s, self.M, self.Minv, ex, ey, ez, w,
                 omega_field if use_field else self._omega_dummy, use_field,
                 VISCOUS_MODES,
+                acc_uniform if acc_uniform is not None else self._acc_dummy_u,
+                acc_field if acc_field is not None else self._acc_dummy_f,
+                force_mode,
             )
         else:
+            acc = None
+            if force_mode == FORCE_UNIFORM:
+                acc = np.broadcast_to(
+                    np.asarray(acc_uniform).reshape(3, 1, 1, 1), (3,) + f.shape[1:]
+                )
+            elif force_mode == FORCE_FIELD:
+                acc = acc_field
             _mrt_collision_3d_numpy(
                 f, f_post, solid, self.s, self.M, self.Minv, ex, ey, ez, w,
-                omega_field,
+                omega_field, acc,
             )

@@ -123,6 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--van-driest-A", type=float, default=25.0, help="Van Driest damping constant A+ (default 25)")
     p.add_argument("--wall-velocity-top", type=float, default=0.0, help="Top-wall tangential x velocity")
     p.add_argument("--wall-velocity-bottom", type=float, default=0.0, help="Bottom-wall tangential x velocity")
+    p.add_argument("--body-force-x", type=float, default=0.0,
+                   help="Uniform streamwise acceleration (pressure-gradient-equivalent channel forcing)")
+    p.add_argument("--body-force-y", type=float, default=0.0,
+                   help="Uniform vertical acceleration (e.g. gravity)")
     p.add_argument("--synthetic-inflow", action="store_true", help="Use filtered synthetic inlet fluctuations")
     p.add_argument("--synthetic-inflow-intensity", type=float, default=0.03, help="RMS synthetic inflow intensity relative to u0")
     p.add_argument("--scalar", "--thermal", dest="thermal", action="store_true",
@@ -381,6 +385,8 @@ def main() -> int:
         van_driest_A=args.van_driest_a,
         wall_velocity_top=args.wall_velocity_top,
         wall_velocity_bottom=args.wall_velocity_bottom,
+        body_force_x=args.body_force_x,
+        body_force_y=args.body_force_y,
         synthetic_inflow=args.synthetic_inflow,
         synthetic_inflow_intensity=args.synthetic_inflow_intensity,
         thermal=args.thermal,

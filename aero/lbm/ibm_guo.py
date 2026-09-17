@@ -1,8 +1,25 @@
-"""Guo et al. (2002) immersed boundary forcing for LBM."""
+"""
+Immersed-boundary acceleration field for the Guo forcing scheme.
+
+This module used to add a source term directly to ``f`` before collision.
+That is the wrong place for it: the Guo scheme couples the source term to the
+equilibrium through the half-force velocity, so forcing applied outside
+collision cannot be consistent.  Forcing now lives inside the collision
+kernels (see :mod:`aero.lbm.forcing`); what remains here is building the
+acceleration field those kernels consume.
+
+The old source term was also missing its ``1/cs^2`` factor, which made the
+immersed boundary push with exactly one third of the requested force.
+"""
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import numpy as np
+
+from .forcing import ibm_acceleration
+from .physics import inv_positive
 
 try:
     import numba as nb
@@ -17,384 +34,52 @@ def _is_numpy(*arrays: np.ndarray) -> bool:
     return all(isinstance(a, np.ndarray) for a in arrays)
 
 
-# ---------------------------------------------------------------------------
-# Numba JIT kernels
-# ---------------------------------------------------------------------------
-
-if HAS_NUMBA:
-    @nb.njit(cache=True, parallel=True)
-    def _guo_forcing_2d_nb(
-        f: np.ndarray,
-        phi: np.ndarray,
-        tau: float,
-        u_wall_x: np.ndarray,
-        u_wall_y: np.ndarray,
-        ex: np.ndarray,
-        ey: np.ndarray,
-        w: np.ndarray,
-        solid: np.ndarray,
-    ) -> None:
-        Q = f.shape[0]
-        ny, nx = phi.shape
-        delta = 1.5
-        coeff = 1.0 - 0.5 / tau
-        for y in nb.prange(ny):
-            for x in range(nx):
-                if solid[y, x] or phi[y, x] <= 0.0 or phi[y, x] > delta:
-                    continue
-                rho = 0.0
-                for i in range(Q):
-                    rho += f[i, y, x]
-                if rho <= 0.0:
-                    continue
-                inv_rho = 1.0 / rho
-                ux = 0.0
-                uy = 0.0
-                for i in range(Q):
-                    ux += ex[i] * f[i, y, x]
-                    uy += ey[i] * f[i, y, x]
-                ux *= inv_rho
-                uy *= inv_rho
-                fx = coeff * (u_wall_x[y, x] - ux)
-                fy = coeff * (u_wall_y[y, x] - uy)
-                for i in range(Q):
-                    eu = ex[i] * fx + ey[i] * fy
-                    f[i, y, x] += w[i] * eu
-
-    @nb.njit(cache=True, parallel=True)
-    def _guo_forcing_3d_nb(
-        f: np.ndarray,
-        phi: np.ndarray,
-        tau: float,
-        u_wall_x: np.ndarray,
-        u_wall_y: np.ndarray,
-        u_wall_z: np.ndarray,
-        ex: np.ndarray,
-        ey: np.ndarray,
-        ez: np.ndarray,
-        w: np.ndarray,
-        solid: np.ndarray,
-    ) -> None:
-        Q = f.shape[0]
-        nz, ny, nx = phi.shape
-        delta = 1.5
-        coeff = 1.0 - 0.5 / tau
-        for z in nb.prange(nz):
-            for y in range(ny):
-                for x in range(nx):
-                    if solid[z, y, x] or phi[z, y, x] <= 0.0 or phi[z, y, x] > delta:
-                        continue
-                    rho = 0.0
-                    for i in range(Q):
-                        rho += f[i, z, y, x]
-                    if rho <= 0.0:
-                        continue
-                    inv_rho = 1.0 / rho
-                    ux = 0.0
-                    uy = 0.0
-                    uz = 0.0
-                    for i in range(Q):
-                        ux += ex[i] * f[i, z, y, x]
-                        uy += ey[i] * f[i, z, y, x]
-                        uz += ez[i] * f[i, z, y, x]
-                    ux *= inv_rho
-                    uy *= inv_rho
-                    uz *= inv_rho
-                    fx = coeff * (u_wall_x[z, y, x] - ux)
-                    fy = coeff * (u_wall_y[z, y, x] - uy)
-                    fz = coeff * (u_wall_z[z, y, x] - uz)
-                    for i in range(Q):
-                        eu = ex[i] * fx + ey[i] * fy + ez[i] * fz
-                        f[i, z, y, x] += w[i] * eu
-
-
-# ---------------------------------------------------------------------------
-# NumPy fallbacks (renamed from original)
-# ---------------------------------------------------------------------------
-
-def _guo_forcing_2d_numpy(
-    f: np.ndarray,
-    phi: np.ndarray,
-    tau: float,
-    u_wall_x: np.ndarray,
-    u_wall_y: np.ndarray,
-    ex: np.ndarray,
-    ey: np.ndarray,
-    w: np.ndarray,
-    solid: np.ndarray,
-) -> None:
-    delta = 1.5
-    q = f.shape[0]
-    coeff = (1.0 - 0.5 / tau)
-    exf = ex.astype(np.float64)
-    eyf = ey.astype(np.float64)
-    for y in range(phi.shape[0]):
-        for x in range(phi.shape[1]):
-            if solid[y, x] or phi[y, x] <= 0.0 or phi[y, x] > delta:
-                continue
-            rho = f[:, y, x].sum()
-            if rho <= 0.0:
-                continue
-            ux = np.dot(exf, f[:, y, x]) / rho
-            uy = np.dot(eyf, f[:, y, x]) / rho
-            fx = coeff * (u_wall_x[y, x] - ux)
-            fy = coeff * (u_wall_y[y, x] - uy)
-            for i in range(q):
-                eu = ex[i] * fx + ey[i] * fy
-                f[i, y, x] += w[i] * eu
-
-
-def _guo_forcing_3d_numpy(
-    f: np.ndarray,
-    phi: np.ndarray,
-    tau: float,
-    u_wall_x: np.ndarray,
-    u_wall_y: np.ndarray,
-    u_wall_z: np.ndarray,
-    ex: np.ndarray,
-    ey: np.ndarray,
-    ez: np.ndarray,
-    w: np.ndarray,
-    solid: np.ndarray,
-) -> None:
-    delta = 1.5
-    q = f.shape[0]
-    coeff = (1.0 - 0.5 / tau)
-    exf = ex.astype(np.float64)
-    eyf = ey.astype(np.float64)
-    ezf = ez.astype(np.float64)
-    nz, ny, nx = phi.shape
-    for z in range(nz):
-        for y in range(ny):
-            for x in range(nx):
-                if solid[z, y, x] or phi[z, y, x] <= 0.0 or phi[z, y, x] > delta:
-                    continue
-                rho = f[:, z, y, x].sum()
-                if rho <= 0.0:
-                    continue
-                ux = np.dot(exf, f[:, z, y, x]) / rho
-                uy = np.dot(eyf, f[:, z, y, x]) / rho
-                uz = np.dot(ezf, f[:, z, y, x]) / rho
-                fx = coeff * (u_wall_x[z, y, x] - ux)
-                fy = coeff * (u_wall_y[z, y, x] - uy)
-                fz = coeff * (u_wall_z[z, y, x] - uz)
-                for i in range(q):
-                    eu = ex[i] * fx + ey[i] * fy + ez[i] * fz
-                    f[i, z, y, x] += w[i] * eu
-
-
-# ---------------------------------------------------------------------------
-# Public dispatchers
-# ---------------------------------------------------------------------------
-
-def apply_guo_forcing_2d(
-    f: np.ndarray,
-    phi: np.ndarray,
-    tau: float,
-    u_wall_x: np.ndarray,
-    u_wall_y: np.ndarray,
-    ex: np.ndarray,
-    ey: np.ndarray,
-    w: np.ndarray,
-    solid: np.ndarray,
-) -> None:
-    """
-    Add Guo forcing in IBM band (0 < phi <= delta).
-
-    phi < 0 => solid; phi > delta => free stream; 0 < phi <= 1.5 => IBM band.
-    """
-    if HAS_NUMBA:
-        _guo_forcing_2d_nb(f, phi, tau, u_wall_x, u_wall_y,
-                           ex.astype(np.float64), ey.astype(np.float64), w, solid)
-    else:
-        _guo_forcing_2d_numpy(f, phi, tau, u_wall_x, u_wall_y, ex, ey, w, solid)
-
-
-def apply_guo_forcing_3d(
-    f: np.ndarray,
-    phi: np.ndarray,
-    tau: float,
-    u_wall_x: np.ndarray,
-    u_wall_y: np.ndarray,
-    u_wall_z: np.ndarray,
-    ex: np.ndarray,
-    ey: np.ndarray,
-    ez: np.ndarray,
-    w: np.ndarray,
-    solid: np.ndarray,
-) -> None:
-    if HAS_NUMBA:
-        _guo_forcing_3d_nb(f, phi, tau, u_wall_x, u_wall_y, u_wall_z,
-                           ex.astype(np.float64), ey.astype(np.float64),
-                           ez.astype(np.float64), w, solid)
-    else:
-        _guo_forcing_3d_numpy(f, phi, tau, u_wall_x, u_wall_y, u_wall_z,
-                              ex, ey, ez, w, solid)
-
-
-if HAS_NUMBA:
-    @nb.njit(cache=True, parallel=True)
-    def _uniform_body_force_2d_nb(
-        f: np.ndarray,
-        coeff: float,
-        fx: float,
-        fy: float,
-        ex: np.ndarray,
-        ey: np.ndarray,
-        w: np.ndarray,
-        solid: np.ndarray,
-    ) -> None:
-        q, ny, nx = f.shape
-        cs2 = 1.0 / 3.0
-        for y in nb.prange(ny):
-            for x in range(nx):
-                if solid[y, x]:
-                    continue
-                rho = 0.0
-                mx = 0.0
-                my = 0.0
-                for i in range(q):
-                    fi = f[i, y, x]
-                    rho += fi
-                    mx += ex[i] * fi
-                    my += ey[i] * fi
-                if rho <= 0.0:
-                    continue
-                inv_rho = 1.0 / rho
-                ux = mx * inv_rho
-                uy = my * inv_rho
-                uf = ux * fx + uy * fy
-                for i in range(q):
-                    eu = ex[i] * ux + ey[i] * uy
-                    ef = ex[i] * fx + ey[i] * fy
-                    term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
-                    f[i, y, x] += coeff * w[i] * rho * term
-
-    @nb.njit(cache=True, parallel=True)
-    def _uniform_body_force_3d_nb(
-        f: np.ndarray,
-        coeff: float,
-        fx: float,
-        fy: float,
-        fz: float,
-        ex: np.ndarray,
-        ey: np.ndarray,
-        ez: np.ndarray,
-        w: np.ndarray,
-        solid: np.ndarray,
-    ) -> None:
-        q, nz, ny, nx = f.shape
-        cs2 = 1.0 / 3.0
-        for z in nb.prange(nz):
-            for y in range(ny):
-                for x in range(nx):
-                    if solid[z, y, x]:
-                        continue
-                    rho = 0.0
-                    mx = 0.0
-                    my = 0.0
-                    mz = 0.0
-                    for i in range(q):
-                        fi = f[i, z, y, x]
-                        rho += fi
-                        mx += ex[i] * fi
-                        my += ey[i] * fi
-                        mz += ez[i] * fi
-                    if rho <= 0.0:
-                        continue
-                    inv_rho = 1.0 / rho
-                    ux = mx * inv_rho
-                    uy = my * inv_rho
-                    uz = mz * inv_rho
-                    uf = ux * fx + uy * fy + uz * fz
-                    for i in range(q):
-                        eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
-                        ef = ex[i] * fx + ey[i] * fy + ez[i] * fz
-                        term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
-                        f[i, z, y, x] += coeff * w[i] * rho * term
-
-
-def _uniform_body_force_numpy(
-    f: np.ndarray,
-    coeff: float,
-    force: tuple,
-    e_components: tuple,
-    w: np.ndarray,
-    solid: np.ndarray,
-) -> None:
-    """
-    Vectorised Guo body force for an arbitrary lattice dimension.
-
-    ``force`` and ``e_components`` are same-length tuples of the force vector
-    components and the matching lattice-velocity column arrays.
-    """
-    cs2 = 1.0 / 3.0
-    fluid = ~solid
+def _moments(f: np.ndarray, e_cols: Tuple[np.ndarray, ...], xp=np):
+    """Density and momentum components from ``f``, backend-agnostic."""
     rho = f.sum(axis=0)
-    ok = fluid & (rho > 0.0)
-    if not ok.any():
-        return
-    inv_rho = np.where(ok, 1.0 / np.where(rho > 0.0, rho, 1.0), 0.0)
-
-    u = [inv_rho * np.tensordot(e.astype(np.float64), f, axes=(0, 0))
-         for e in e_components]
-    uf = sum(uc * fc for uc, fc in zip(u, force))
-
-    for i in range(f.shape[0]):
-        eu = sum(float(e[i]) * uc for e, uc in zip(e_components, u))
-        ef = sum(float(e[i]) * fc for e, fc in zip(e_components, force))
-        term = (ef - uf) / cs2 + (eu * ef) / (cs2 * cs2)
-        f[i] += np.where(ok, coeff * w[i] * rho * term, 0.0)
+    flat = f.reshape(f.shape[0], -1)
+    momentum = tuple(
+        (e.astype(np.float64) @ flat).reshape(rho.shape) for e in e_cols
+    )
+    return rho, momentum
 
 
-def apply_uniform_body_force_2d(
+def ibm_acceleration_2d(
     f: np.ndarray,
-    tau: float,
-    fx: float,
-    fy: float,
+    phi: np.ndarray,
+    u_wall_x: np.ndarray,
+    u_wall_y: np.ndarray,
     ex: np.ndarray,
     ey: np.ndarray,
-    w: np.ndarray,
     solid: np.ndarray,
-) -> None:
-    """Apply a uniform Guo-style body force to all fluid nodes."""
-    if abs(fx) < 1e-16 and abs(fy) < 1e-16:
-        return
-    coeff = 1.0 - 0.5 / tau
-    if HAS_NUMBA and _is_numpy(f, solid):
-        _uniform_body_force_2d_nb(
-            f, coeff, float(fx), float(fy),
-            ex.astype(np.float64), ey.astype(np.float64), w, solid,
-        )
-    else:
-        _uniform_body_force_numpy(
-            f, coeff, (float(fx), float(fy)), (ex, ey), w, solid,
-        )
+    band: float = 1.5,
+) -> np.ndarray:
+    """
+    Direct-forcing IBM acceleration field, shape ``(2, Ny, Nx)``.
+
+    Non-zero only in the band ``0 < phi <= band``; see
+    :func:`aero.lbm.forcing.ibm_acceleration` for the scheme.
+    """
+    rho, momentum = _moments(f, (ex, ey))
+    return ibm_acceleration(
+        rho, momentum, (u_wall_x, u_wall_y), phi, solid, band=band
+    )
 
 
-def apply_uniform_body_force_3d(
+def ibm_acceleration_3d(
     f: np.ndarray,
-    tau: float,
-    fx: float,
-    fy: float,
-    fz: float,
+    phi: np.ndarray,
+    u_wall_x: np.ndarray,
+    u_wall_y: np.ndarray,
+    u_wall_z: np.ndarray,
     ex: np.ndarray,
     ey: np.ndarray,
     ez: np.ndarray,
-    w: np.ndarray,
     solid: np.ndarray,
-) -> None:
-    """Apply a uniform Guo-style body force to all fluid nodes."""
-    if abs(fx) < 1e-16 and abs(fy) < 1e-16 and abs(fz) < 1e-16:
-        return
-    coeff = 1.0 - 0.5 / tau
-    if HAS_NUMBA and _is_numpy(f, solid):
-        _uniform_body_force_3d_nb(
-            f, coeff, float(fx), float(fy), float(fz),
-            ex.astype(np.float64), ey.astype(np.float64), ez.astype(np.float64),
-            w, solid,
-        )
-    else:
-        _uniform_body_force_numpy(
-            f, coeff, (float(fx), float(fy), float(fz)), (ex, ey, ez), w, solid,
-        )
+    band: float = 1.5,
+) -> np.ndarray:
+    """Direct-forcing IBM acceleration field, shape ``(3, Nz, Ny, Nx)``."""
+    rho, momentum = _moments(f, (ex, ey, ez))
+    return ibm_acceleration(
+        rho, momentum, (u_wall_x, u_wall_y, u_wall_z), phi, solid, band=band
+    )

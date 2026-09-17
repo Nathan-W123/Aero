@@ -65,7 +65,12 @@ from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
 from .physics import base_nu_from_omega
 from . import kernels3d_trt as _ktrt3
-from .ibm_guo import apply_guo_forcing_3d, apply_uniform_body_force_3d
+from .ibm_guo import ibm_acceleration_3d
+from .forcing import (
+    FORCE_NONE, FORCE_UNIFORM, FORCE_FIELD,
+    boussinesq_acceleration, dummy_force_field, resolve_force_mode,
+    uniform_acceleration,
+)
 
 
 class Solver3D:
@@ -253,6 +258,21 @@ class Solver3D:
         self._u_wall_z = np.zeros((Nz, Ny, Nx))
         self._omega_dummy = np.zeros((Nz, Ny, Nx), dtype=np.float64)
         self._inlet_uy_field = np.zeros((Nz, Ny), dtype=np.float64)
+
+        # Guo forcing: the uniform part is a (3,) vector, the dummy stands in
+        # for the per-cell field on branches that never read it.
+        self._acc_uniform = uniform_acceleration(
+            self.body_force_x, self.body_force_y, self.body_force_z
+        )
+        self._acc_dummy = dummy_force_field(3)
+        self._acc_uniform_dev = self._acc_uniform
+        self._acc_dummy_dev = self._acc_dummy
+        self._last_acc: tuple = (FORCE_NONE, self._acc_dummy)
+        # CPU copies of the IBM wall-velocity fields: the acceleration field is
+        # built on the host even when the distribution lives on the GPU.
+        self._u_wall_x_np = np.zeros((Nz, Ny, Nx))
+        self._u_wall_y_np = np.zeros((Nz, Ny, Nx))
+        self._u_wall_z_np = np.zeros((Nz, Ny, Nx))
         self._inlet_uz_field = np.zeros((Nz, Ny), dtype=np.float64)
 
         # Transfer domain arrays to GPU when using CuPy
@@ -271,6 +291,9 @@ class Solver3D:
             self._u_wall_z = xp.asarray(self._u_wall_z)
             self.surface_links = xp.asarray(self.surface_links)
             self.q_vals = xp.asarray(self.q_vals)
+            self._acc_uniform_dev = xp.asarray(self._acc_uniform)
+            self._acc_dummy_dev = xp.asarray(self._acc_dummy)
+            self._last_acc = (FORCE_NONE, self._acc_dummy_dev)
 
         self.step_count: int = 0
 
@@ -321,15 +344,88 @@ class Solver3D:
 
     # ------------------------------------------------------------------
 
+    def macroscopic(self, f: Optional[np.ndarray] = None) -> tuple:
+        """
+        ``(rho, ux, uy, uz)`` including the Guo half-force correction.
+
+        With a force present the physical velocity is ``(sum e_i f_i + F/2)/rho``.
+        Reporting the bare moment sum instead understates the velocity by
+        ``a/2`` everywhere the force acts.
+        """
+        if f is None:
+            f = self.f
+        if self._use_cupy and isinstance(f, np.ndarray) is False:
+            f = f.get()
+        rho, ux, uy, uz = compute_macroscopic_3d(f)
+        mode, field = self._last_acc
+        if mode == FORCE_UNIFORM:
+            ux = ux + 0.5 * self._acc_uniform[0]
+            uy = uy + 0.5 * self._acc_uniform[1]
+            uz = uz + 0.5 * self._acc_uniform[2]
+        elif mode == FORCE_FIELD:
+            acc = field.get() if hasattr(field, "get") else field
+            ux = ux + 0.5 * acc[0]
+            uy = uy + 0.5 * acc[1]
+            uz = uz + 0.5 * acc[2]
+        if mode != FORCE_NONE:
+            solid = self.solid.get() if hasattr(self.solid, "get") else self.solid
+            ux = np.where(solid, 0.0, ux)
+            uy = np.where(solid, 0.0, uy)
+            uz = np.where(solid, 0.0, uz)
+        return rho, ux, uy, uz
+
+    def _acc_as_field(self, mode: int, acc_u: np.ndarray, acc_f: np.ndarray):
+        """Expand the force to a full field, for kernels that only take one."""
+        if mode == FORCE_NONE:
+            return None
+        if mode == FORCE_UNIFORM:
+            return np.broadcast_to(
+                acc_u[:, None, None, None], (3, self.Nz, self.Ny, self.Nx)
+            )
+        return acc_f
+
+    def _build_acceleration(self) -> tuple:
+        """
+        Total acceleration for this step, as ``(mode, uniform, field)``.
+
+        Every force source — uniform body force, Boussinesq buoyancy, immersed
+        boundary — is expressed as an acceleration and summed here, so the
+        collision kernel applies one consistent Guo source term rather than
+        several ad-hoc passes.  The uniform-only case stays a ``(3,)`` vector
+        and costs no per-cell memory traffic.
+        """
+        field = None
+
+        if self.buoyancy and self.g is not None:
+            from .thermal import extract_T
+            field = boussinesq_acceleration(
+                extract_T(self.g), self.T_ref, self.g_gravity, self.beta, 3, axis=1
+            )
+
+        if self.ibm_enabled and self.phi is not None:
+            f_cpu = self.f.get() if self._use_cupy else self.f
+            solid_cpu = self.solid.get() if self._use_cupy else self.solid
+            ibm = ibm_acceleration_3d(
+                f_cpu, self.phi,
+                self._u_wall_x_np, self._u_wall_y_np, self._u_wall_z_np,
+                self._ex_np, self._ey_np, self._ez_np, solid_cpu,
+            )
+            field = ibm if field is None else field + ibm
+
+        if field is not None:
+            field = np.ascontiguousarray(field + self._acc_uniform[:, None, None, None])
+            if self._use_cupy:
+                field = self._xp.asarray(field)
+            return FORCE_FIELD, self._acc_uniform_dev, field
+
+        mode = resolve_force_mode(self._acc_uniform, None)
+        return mode, self._acc_uniform_dev, self._acc_dummy_dev
+
     def _step(self) -> tuple:
         f = self.f
 
-        if self.ibm_enabled and self.phi is not None:
-            apply_guo_forcing_3d(
-                f, self.phi, self.tau,
-                self._u_wall_x, self._u_wall_y, self._u_wall_z,
-                self._ex, self._ey, self._ez, self._w, self.solid,
-            )
+        force_mode, acc_u, acc_f = self._build_acceleration()
+        self._last_acc = (force_mode, acc_f)
 
         omega_field = self._omega_dummy
         use_omega_field = False
@@ -352,6 +448,7 @@ class Solver3D:
             self._mrt_kernel.collide(
                 f, f_pre, self.solid, self._ex, self._ey, self._ez, self._w,
                 omega_field if use_omega_field else None,
+                acc_u, acc_f, force_mode,
             )
         elif self.collision == "trt":
             f_pre = np.empty_like(f)
@@ -362,19 +459,22 @@ class Solver3D:
                     self._ex, self._ey, self._ez, self._w,
                     OPP3.astype(np.int32), self.trt_lambda,
                     omega_field, use_omega_field,
+                    acc_u, acc_f, force_mode,
                 )
             else:
                 _ktrt3.trt_collision_numpy_3d(
                     f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._ez, self._w, self.trt_lambda,
                     omega_field if use_omega_field else None,
+                    self._acc_as_field(force_mode, acc_u, acc_f),
                 )
         elif self._use_cupy:
             f_pre = xp.empty_like(f)
             collision_kernel_3d_xp(
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
-                omega_field, use_omega_field, xp=xp,
+                omega_field, use_omega_field,
+                acc_u, acc_f, force_mode, xp=xp,
             )
         elif self._use_numba:
             f_pre = np.empty_like(f)
@@ -382,37 +482,29 @@ class Solver3D:
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
+                acc_u, acc_f, force_mode,
             )
         else:
-            rho, ux, uy, uz = compute_macroscopic_3d(f)
-            ux[self.solid] = 0.0
-            uy[self.solid] = 0.0
-            uz[self.solid] = 0.0
-            feq = compute_feq_3d(rho, ux, uy, uz)
-            om = omega_field if use_omega_field else omega_use
-            f_pre = (1.0 - om) * f + om * feq
+            # Pure-NumPy path — never dispatches to the JIT kernels even when
+            # Numba is installed, so `backend="numpy"` means what it says.
+            f_pre = np.empty_like(f)
+            _k3.collision_kernel_3d_numpy(
+                f, f_pre, self.solid, omega_use,
+                self._ex, self._ey, self._ez, self._w,
+                omega_field, use_omega_field,
+                acc_u, acc_f, force_mode,
+            )
 
         # Push streaming into a fresh array (never writes to its source)
         if self._use_cupy:
             f_post = xp.empty_like(f_pre)
             stream_kernel_3d_xp(f_pre, f_post, self._ex, self._ey, self._ez, xp=xp)
-        else:
+        elif self._use_numba:
             f_post = np.empty_like(f_pre)
             _k3.stream_kernel_3d(f_pre, f_post, self._ex, self._ey, self._ez)
-
-        if any(abs(val) > 0.0 for val in (self.body_force_x, self.body_force_y, self.body_force_z)):
-            apply_uniform_body_force_3d(
-                f_post,
-                self.tau,
-                self.body_force_x,
-                self.body_force_y,
-                self.body_force_z,
-                self._ex,
-                self._ey,
-                self._ez,
-                self._w,
-                self.solid,
-            )
+        else:
+            f_post = np.empty_like(f_pre)
+            _k3.stream_kernel_3d_numpy(f_pre, f_post, self._ex, self._ey, self._ez)
 
         # BCs
         if not self.ibm_enabled:
@@ -470,24 +562,15 @@ class Solver3D:
             )
 
         # Thermal step (CPU only; g stays on numpy even with CuPy f)
+        # Buoyancy is no longer added here: it joins the acceleration field
+        # consumed by collision, which is where the Guo scheme requires it
+        # (and gives it the half-force correction).
         if self.thermal and self.g is not None:
             from .thermal import (
-                collide_g_3d, stream_g_3d, extract_T,
-                apply_temperature_bc_3d, guo_buoyancy_force_3d,
+                collide_g_3d, stream_g_3d, extract_T, apply_temperature_bc_3d,
             )
-            f_cpu = f_post.get() if self._use_cupy else f_post
-            rho_now, ux_now, uy_now, uz_now = compute_macroscopic_3d(f_cpu)
+            rho_now, ux_now, uy_now, uz_now = self.macroscopic(f_post)
             T_now = extract_T(self.g)
-            if self.buoyancy:
-                from .d3q19 import E3
-                F_b = guo_buoyancy_force_3d(
-                    rho_now, T_now, self.T_ref,
-                    self.g_gravity, self.beta, E3[:, 1], self._w_np,
-                )
-                if self._use_cupy:
-                    f_post = f_post + self._xp.asarray(F_b)
-                else:
-                    f_post = f_post + F_b
             solid_cpu = self.solid.get() if self._use_cupy else self.solid
             g_post = collide_g_3d(self.g, ux_now, uy_now, uz_now, T_now, self.omega_T, solid_cpu)
             g_post = stream_g_3d(g_post, self._ex_np, self._ey_np, self._ez_np)
@@ -597,8 +680,7 @@ class Solver3D:
             if hdf5_writer and hdf5_every and step % hdf5_every == 0:
                 from ..lbm.d3q19 import compute_macroscopic_3d as _cm3
                 from .thermal import extract_T as _extract_T
-                _f_cpu = self.f.get() if self._use_cupy else self.f
-                _rho, _ux, _uy, _uz = _cm3(_f_cpu)
+                _rho, _ux, _uy, _uz = self.macroscopic()
                 _scalar = _extract_T(self.g) if (self.thermal and self.g is not None) else None
                 hdf5_writer.write_step(self.step_count, ux=_ux, uy=_uy, uz=_uz, rho=_rho, scalar=_scalar)
 
@@ -648,7 +730,7 @@ class Solver3D:
                         stop_reason = "auto_converged"
                         break
 
-        rho, ux, uy, uz = compute_macroscopic_3d(self.f)
+        rho, ux, uy, uz = self.macroscopic()
 
         Cd_arr  = np.array(self.Cd_history[-avg_window:])
         Cly_arr = np.array(self.Cly_history[-avg_window:])
