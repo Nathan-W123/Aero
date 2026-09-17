@@ -1,4 +1,4 @@
-"""TRT collision kernel for D3Q19."""
+"""TRT collision kernel for D3Q19 / D3Q27."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 
 from .trt2d import trt_s_minus
 from .kernels_trt import _trt_s_minus_field, _trt_s_minus_numba
-from .d3q19 import OPP3, compute_feq_3d, compute_macroscopic_3d
+from .lattice3d import D3Q19, compute_feq, compute_macroscopic
 
 try:
     import numba as nb
@@ -28,8 +28,9 @@ def trt_collision_numpy_3d(
     magic_lambda: float = 0.25,
     omega_field: np.ndarray | None = None,
     acc: np.ndarray | None = None,
+    lattice=D3Q19,
 ) -> None:
-    rho, ux, uy, uz = compute_macroscopic_3d(f)
+    rho, ux, uy, uz = compute_macroscopic(f, lattice)
     ux = ux.copy()
     uy = uy.copy()
     uz = uz.copy()
@@ -44,7 +45,7 @@ def trt_collision_numpy_3d(
     ux[solid] = 0.0
     uy[solid] = 0.0
     uz[solid] = 0.0
-    feq = compute_feq_3d(rho, ux, uy, uz)
+    feq = compute_feq(rho, ux, uy, uz, lattice)
     if omega_field is None:
         om = omega
         s_minus = trt_s_minus(omega, magic_lambda)
@@ -54,7 +55,7 @@ def trt_collision_numpy_3d(
     ua = None if acc is None else ux * ax + uy * ay + uz * az
 
     for i in range(f.shape[0]):
-        j = int(OPP3[i])
+        j = int(lattice.OPP[i])
         f_plus = 0.5 * (f[i] + f[j])
         f_minus = 0.5 * (f[i] - f[j])
         feq_plus = 0.5 * (feq[i] + feq[j])
@@ -90,6 +91,7 @@ if _HAS_NUMBA:
         acc_uniform: np.ndarray,
         acc_field: np.ndarray,
         force_mode: int,
+        h3: float = 0.0,
     ) -> None:
         q, nz, ny, nx = f.shape
         for z in nb.prange(nz):
@@ -134,7 +136,10 @@ if _HAS_NUMBA:
                     ua = ux * ax + uy * ay + uz * az
                     for i in range(q):
                         eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
-                        feq[i] = w[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq)
+                        feq[i] = w[i] * rho * (
+                            1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq
+                            + h3 * 4.5 * (eu * eu * eu - eu * usq)
+                        )
                     om = omega_field[z, y, x] if use_omega_field else omega
                     sm = _trt_s_minus_numba(om, magic_lambda)
                     for i in range(q):

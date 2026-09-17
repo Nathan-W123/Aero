@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .d3q19 import E3, W3, compute_feq_3d, compute_macroscopic_3d
+from .lattice3d import D3Q19, compute_feq, compute_macroscopic
 from .kernels_reg import CS2, HERMITE2
 
 try:
@@ -31,9 +31,10 @@ def regularized_collision_numpy_3d(
     w: np.ndarray,
     omega_field: np.ndarray | None = None,
     acc: np.ndarray | None = None,
+    lattice=D3Q19,
 ) -> None:
     """Pure-NumPy regularized collision with optional Guo forcing."""
-    rho, ux, uy, uz = compute_macroscopic_3d(f)
+    rho, ux, uy, uz = compute_macroscopic(f, lattice)
     fluid = ~solid
     if acc is not None:
         ax = np.where(fluid, acc[0], 0.0)
@@ -48,7 +49,7 @@ def regularized_collision_numpy_3d(
     uy = np.where(solid, 0.0, uy)
     uz = np.where(solid, 0.0, uz)
 
-    feq = compute_feq_3d(rho, ux, uy, uz)
+    feq = compute_feq(rho, ux, uy, uz, lattice)
     fneq = f - feq
 
     e = [ex.astype(np.float64), ey.astype(np.float64), ez.astype(np.float64)]
@@ -100,6 +101,7 @@ if _HAS_NUMBA:
         acc_uniform: np.ndarray,
         acc_field: np.ndarray,
         force_mode: int,
+        h3: float = 0.0,
     ) -> None:
         q, nz, ny, nx = f.shape
         for z in nb.prange(nz):
@@ -148,6 +150,7 @@ if _HAS_NUMBA:
                         eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
                         feq[i] = w[i] * rho * (
                             1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq
+                            + h3 * 4.5 * (eu * eu * eu - eu * usq)
                         )
 
                     pxx = 0.0; pxy = 0.0; pxz = 0.0

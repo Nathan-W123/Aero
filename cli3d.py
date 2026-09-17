@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Aero CFD — 3D LBM Wind Tunnel Simulator (D3Q19)
+Aero CFD — 3D LBM Wind Tunnel Simulator (D3Q19 / D3Q27)
 CLI entry point.
 
 Usage
@@ -35,7 +35,7 @@ from aero.visualization3d import save_all_3d, HAS_PYVISTA
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="3D LBM D3Q19 Wind Tunnel CFD Simulator",
+        description="3D LBM Wind Tunnel CFD Simulator (D3Q19 / D3Q27)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -85,6 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
     # Backend
     p.add_argument("--backend", choices=["auto", "numpy", "numba"], default="auto")
     p.add_argument("--collision", choices=["bgk", "mrt", "trt", "regularized"], default="bgk")
+    p.add_argument(
+        "--lattice", choices=["d3q19", "d3q27"], default="d3q19",
+        help="velocity set. d3q27 carries the third-order equilibrium term "
+             "and cuts the O(u^3) Galilean-invariance error ~490x, for about "
+             "23%% more work per cell; worth it for turbulence statistics, "
+             "not for routine runs. Incompatible with --collision mrt.",
+    )
     p.add_argument("--trt-lambda", type=float, default=0.25)
     p.add_argument("--inlet-perturbation", type=float, default=0.0,
                    help="Inlet uz perturbation amplitude (fraction of u0)")
@@ -151,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sem-n", type=int, default=200,
                    help="Number of SEM synthetic eddies (default 200)")
     p.add_argument("--allow-high-blockage", action="store_true",
-                   help="Allow very confined runs (>30% frontal blockage)")
+                   help="Allow very confined runs (>30%% frontal blockage)")
     p.add_argument("--autoconfigure", choices=["off", "safe"], default="off",
                    help="Automatically adjust recoverable preflight settings")
     # Multi-block static z-refinement
@@ -385,6 +392,7 @@ def main() -> int:
     print(f"  x_bc      : {args.streamwise_bc}")
     print(f"  outlet_bc : {args.outlet_bc}")
     print(f"  collision : {args.collision}")
+    print(f"  lattice   : {args.lattice}")
     print(f"  backend   : {args.backend}")
     print(f"  viz3d     : {args.viz3d}")
     print("=" * 60)
@@ -451,6 +459,7 @@ def main() -> int:
         streamwise_bc=args.streamwise_bc,
         backend=args.backend,
         collision=args.collision,
+        lattice=args.lattice,
         inlet_perturbation=args.inlet_perturbation,
         trt_lambda=args.trt_lambda,
         sponge_thickness=args.sponge_cells,

@@ -1,8 +1,13 @@
 """
-Numba-JIT accelerated D3Q19 kernels.
+Numba-JIT accelerated 3D kernels (D3Q19 or D3Q27).
 
 collision_kernel_3d  — fused macroscopic + BGK collision
 stream_kernel_3d     — 3D push streaming
+
+Generic in the velocity set: everything loops to ``f.shape[0]`` and reads the
+directions from its arguments, so the same kernels serve both lattices.  The
+one lattice-dependent term is the third-order Hermite contribution to the
+equilibrium, passed as the scalar ``h3`` (1.0 on D3Q27, 0.0 on D3Q19).
 
 f layout: (Q, Nz, Ny, Nx), C-contiguous float64.
 ex/ey/ez: (Q,) int32.  w: (Q,) float64.
@@ -39,9 +44,10 @@ if HAS_NUMBA:
         acc_uniform: np.ndarray,
         acc_field: np.ndarray,
         force_mode: int,
+        h3: float = 0.0,
     ) -> None:
         """
-        Fused macroscopic + BGK collision for D3Q19, with Guo forcing.
+        Fused macroscopic + BGK collision for D3Q19/D3Q27, with Guo forcing.
         Parallel over z slices.
 
         A tile of x is carried through three passes so every inner loop walks
@@ -50,6 +56,11 @@ if HAS_NUMBA:
 
         ``force_mode`` is FORCE_NONE / FORCE_UNIFORM / FORCE_FIELD from
         forcing.py; see that module for the scheme.
+
+        ``h3`` scales the third-order Hermite term in the equilibrium: 1.0 on
+        D3Q27, 0.0 on D3Q19, where the lattice lacks the moment to support it.
+        At 0.0 the extra term is multiplied by exactly zero, so D3Q19 results
+        are bit-identical to not having it.
         """
         Q, Nz, Ny, Nx = f.shape
         for z in nb.prange(Nz):
@@ -132,6 +143,7 @@ if HAS_NUMBA:
                                 eu = exi * ux_t[k] + eyi * uy_t[k] + ezi * uz_t[k]
                                 feqi = wi * rho_t[k] * (
                                     1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq_t[k]
+                                    + h3 * 4.5 * (eu * eu * eu - eu * usq_t[k])
                                 )
                                 om = om_t[k]
                                 f_post[i, z, y, x0 + k] = (
@@ -147,6 +159,7 @@ if HAS_NUMBA:
                                 eu = exi * ux_t[k] + eyi * uy_t[k] + ezi * uz_t[k]
                                 feqi = wi * rho_t[k] * (
                                     1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq_t[k]
+                                    + h3 * 4.5 * (eu * eu * eu - eu * usq_t[k])
                                 )
                                 om = om_t[k]
                                 ea = exi * ax_t[k] + eyi * ay_t[k] + ezi * az_t[k]
@@ -199,10 +212,12 @@ if HAS_NUMBA:
 
 else:
     def collision_kernel_3d(f, f_post, solid, omega, ex, ey, ez, w, omega_field,
-                            use_omega_field, acc_uniform, acc_field, force_mode):
+                            use_omega_field, acc_uniform, acc_field, force_mode,
+                            h3=0.0):
         """NumPy fallback for collision_kernel_3d."""
         collision_kernel_3d_xp(f, f_post, solid, omega, ex, ey, ez, w, omega_field,
-                               use_omega_field, acc_uniform, acc_field, force_mode, xp=np)
+                               use_omega_field, acc_uniform, acc_field, force_mode,
+                               xp=np, h3=h3)
 
     def stream_kernel_3d(f_src, f_dst, ex, ey, ez):
         """NumPy fallback for stream_kernel_3d."""
@@ -211,7 +226,7 @@ else:
 
 def collision_kernel_3d_xp(f, f_post, solid, omega, ex, ey, ez, w, omega_field,
                            use_omega_field, acc_uniform=None, acc_field=None,
-                           force_mode=0, xp=np):
+                           force_mode=0, xp=np, h3=0.0):
     """Array-backend-agnostic BGK collision with Guo forcing (numpy or cupy)."""
     rho = f.sum(axis=0)
     # Guard the denominator before dividing: 1.0 / rho over the raw array
@@ -242,7 +257,10 @@ def collision_kernel_3d_xp(f, f_post, solid, omega, ex, ey, ez, w, omega_field,
     ua = None if ax is None else ux * ax + uy * ay + uz * az
     for i in range(f.shape[0]):
         eu = ex[i]*ux + ey[i]*uy + ez[i]*uz
-        feqi = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
+        poly = 1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq
+        if h3:
+            poly = poly + 4.5 * (eu*eu*eu - eu*usq)
+        feqi = w[i] * rho * poly
         f_post[i] = (1.0 - om) * f[i] + om * feqi
         if ax is not None:
             ea = ex[i]*ax + ey[i]*ay + ez[i]*az
@@ -253,7 +271,7 @@ def collision_kernel_3d_xp(f, f_post, solid, omega, ex, ey, ez, w, omega_field,
 
 def collision_kernel_3d_numpy(f, f_post, solid, omega, ex, ey, ez, w, omega_field,
                               use_omega_field, acc_uniform=None, acc_field=None,
-                              force_mode=0):
+                              force_mode=0, h3=0.0):
     """
     Pure-NumPy BGK collision.
 
@@ -261,7 +279,8 @@ def collision_kernel_3d_numpy(f, f_post, solid, omega, ex, ey, ez, w, omega_fiel
     contract the solver has to honour even where Numba is installed.
     """
     collision_kernel_3d_xp(f, f_post, solid, omega, ex, ey, ez, w, omega_field,
-                           use_omega_field, acc_uniform, acc_field, force_mode, xp=np)
+                           use_omega_field, acc_uniform, acc_field, force_mode,
+                           xp=np, h3=h3)
 
 
 def stream_kernel_3d_numpy(f_src, f_dst, ex, ey, ez):

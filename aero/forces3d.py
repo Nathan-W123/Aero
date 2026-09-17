@@ -3,16 +3,19 @@
 import numpy as np
 from typing import Dict, Optional, Tuple
 from .lbm.d3q19 import E3, W3, OPP3, compute_feq_3d, compute_macroscopic_3d
+from .lbm.lattice3d import D3Q19, Lattice3D
 from .lbm.physics import inv_positive
 
 
-def _link_arrays_3d(links: np.ndarray) -> Tuple[np.ndarray, ...]:
+def _link_arrays_3d(
+    links: np.ndarray, lat: Lattice3D = D3Q19
+) -> Tuple[np.ndarray, ...]:
     """Split a (N,4) link table into i/z/y/x/opp index arrays (all intp)."""
     i_arr = links[:, 0].astype(np.intp)
     z_arr = links[:, 1].astype(np.intp)
     y_arr = links[:, 2].astype(np.intp)
     x_arr = links[:, 3].astype(np.intp)
-    return i_arr, z_arr, y_arr, x_arr, OPP3[i_arr].astype(np.intp)
+    return i_arr, z_arr, y_arr, x_arr, lat.OPP[i_arr].astype(np.intp)
 
 
 def _link_feq_pair_3d(
@@ -22,6 +25,7 @@ def _link_feq_pair_3d(
     y_arr: np.ndarray,
     x_arr: np.ndarray,
     opp_arr: np.ndarray,
+    lat: Lattice3D = D3Q19,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Equilibrium values feq_i and feq_opp[i] at every surface-link node.
@@ -30,12 +34,10 @@ def _link_feq_pair_3d(
     over the link nodes replaces a Python-level loop that rebuilt the full
     19-direction equilibrium per link.
     """
-    f_node = f_pre[:, z_arr, y_arr, x_arr]               # (19, N_links)
+    f_node = f_pre[:, z_arr, y_arr, x_arr]               # (Q, N_links)
     rho = f_node.sum(axis=0)
     inv_rho = inv_positive(rho)
-    ex_all = E3[:, 0].astype(np.float64)
-    ey_all = E3[:, 1].astype(np.float64)
-    ez_all = E3[:, 2].astype(np.float64)
+    ex_all, ey_all, ez_all = lat.ex, lat.ey, lat.ez
     ux = inv_rho * (ex_all @ f_node)
     uy = inv_rho * (ey_all @ f_node)
     uz = inv_rho * (ez_all @ f_node)
@@ -43,8 +45,15 @@ def _link_feq_pair_3d(
 
     eu_out = ex_all[i_arr] * ux + ey_all[i_arr] * uy + ez_all[i_arr] * uz
     eu_in = ex_all[opp_arr] * ux + ey_all[opp_arr] * uy + ez_all[opp_arr] * uz
-    feq_out = W3[i_arr] * rho * (1.0 + 3.0 * eu_out + 4.5 * eu_out * eu_out - 1.5 * usq)
-    feq_in = W3[opp_arr] * rho * (1.0 + 3.0 * eu_in + 4.5 * eu_in * eu_in - 1.5 * usq)
+    poly_out = 1.0 + 3.0 * eu_out + 4.5 * eu_out * eu_out - 1.5 * usq
+    poly_in = 1.0 + 3.0 * eu_in + 4.5 * eu_in * eu_in - 1.5 * usq
+    if lat.h3:
+        # must match the collision's equilibrium, or the pressure/viscous
+        # split leaks the H3 term into the "viscous" residual
+        poly_out = poly_out + 4.5 * (eu_out ** 3 - eu_out * usq)
+        poly_in = poly_in + 4.5 * (eu_in ** 3 - eu_in * usq)
+    feq_out = lat.W[i_arr] * rho * poly_out
+    feq_in = lat.W[opp_arr] * rho * poly_in
     return feq_out, feq_in
 
 
@@ -52,6 +61,8 @@ def compute_forces_3d(
     f_pre: np.ndarray,
     f_post: np.ndarray,
     links: np.ndarray,
+    *,
+    lattice: Lattice3D = D3Q19,
 ) -> Tuple[float, float, float]:
     if links.shape[0] == 0:
         return 0.0, 0.0, 0.0
@@ -60,15 +71,15 @@ def compute_forces_3d(
     z_arr   = links[:, 1]
     y_arr   = links[:, 2]
     x_arr   = links[:, 3]
-    opp_arr = OPP3[i_arr]
+    opp_arr = lattice.OPP[i_arr]
 
     f_out = f_pre[i_arr,   z_arr, y_arr, x_arr]
     f_in  = f_post[opp_arr, z_arr, y_arr, x_arr]
     mom   = f_out + f_in
 
-    ex = E3[i_arr, 0].astype(np.float64)
-    ey = E3[i_arr, 1].astype(np.float64)
-    ez = E3[i_arr, 2].astype(np.float64)
+    ex = lattice.ex[i_arr]
+    ey = lattice.ey[i_arr]
+    ez = lattice.ez[i_arr]
 
     return (
         float(np.sum(ex * mom)),
@@ -81,12 +92,16 @@ def compute_force_split_3d(
     f_pre: np.ndarray,
     f_post: np.ndarray,
     links: np.ndarray,
+    *,
+    lattice: Lattice3D = D3Q19,
 ) -> Tuple[float, float, float, float, float, float]:
     if links.shape[0] == 0:
         return (0.0,) * 6
 
-    i_arr, z_arr, y_arr, x_arr, opp_arr = _link_arrays_3d(links)
-    feq_out, feq_in = _link_feq_pair_3d(f_pre, i_arr, z_arr, y_arr, x_arr, opp_arr)
+    i_arr, z_arr, y_arr, x_arr, opp_arr = _link_arrays_3d(links, lattice)
+    feq_out, feq_in = _link_feq_pair_3d(
+        f_pre, i_arr, z_arr, y_arr, x_arr, opp_arr, lattice
+    )
 
     f_out = f_pre[i_arr, z_arr, y_arr, x_arr]
     f_in = f_post[opp_arr, z_arr, y_arr, x_arr]
@@ -94,9 +109,9 @@ def compute_force_split_3d(
     mom_p = feq_out + feq_in
     mom_v = (f_out - feq_out) + (f_in - feq_in)
 
-    ex = E3[i_arr, 0].astype(np.float64)
-    ey = E3[i_arr, 1].astype(np.float64)
-    ez = E3[i_arr, 2].astype(np.float64)
+    ex = lattice.ex[i_arr]
+    ey = lattice.ey[i_arr]
+    ez = lattice.ez[i_arr]
     return (
         float(np.sum(ex * mom_p)),
         float(np.sum(ey * mom_p)),
@@ -149,6 +164,7 @@ def compute_force_moment_3d(
     center_x: float,
     center_y: float,
     center_z: float,
+    lattice: Lattice3D = D3Q19,
 ) -> Tuple[float, float, float, float, float, float]:
     """Return raw Fx, Fy, Fz and moments Mx, My, Mz."""
     if links.shape[0] == 0:
@@ -157,11 +173,11 @@ def compute_force_moment_3d(
     z_arr = links[:, 1]
     y_arr = links[:, 2]
     x_arr = links[:, 3]
-    opp_arr = OPP3[i_arr]
+    opp_arr = lattice.OPP[i_arr]
     mom = f_pre[i_arr, z_arr, y_arr, x_arr] + f_post[opp_arr, z_arr, y_arr, x_arr]
-    dfx = E3[i_arr, 0].astype(np.float64) * mom
-    dfy = E3[i_arr, 1].astype(np.float64) * mom
-    dfz = E3[i_arr, 2].astype(np.float64) * mom
+    dfx = lattice.ex[i_arr] * mom
+    dfy = lattice.ey[i_arr] * mom
+    dfz = lattice.ez[i_arr] * mom
     rx = x_arr.astype(np.float64) - float(center_x)
     ry = y_arr.astype(np.float64) - float(center_y)
     rz = z_arr.astype(np.float64) - float(center_z)
@@ -191,6 +207,7 @@ def spanwise_force_profile_3d(
     links: np.ndarray,
     *,
     nz: int,
+    lattice: Lattice3D = D3Q19,
 ) -> Dict[str, list[float]]:
     """Return sectional force sums per spanwise z-index."""
     nz = int(nz)
@@ -200,12 +217,12 @@ def spanwise_force_profile_3d(
             "z": list(range(nz)),
             "fx": list(zeros), "fy": list(zeros), "fz": list(zeros),
         }
-    i_arr, z_arr, y_arr, x_arr, opp_arr = _link_arrays_3d(links)
+    i_arr, z_arr, y_arr, x_arr, opp_arr = _link_arrays_3d(links, lattice)
     mom = f_pre[i_arr, z_arr, y_arr, x_arr] + f_post[opp_arr, z_arr, y_arr, x_arr]
     # bincount is an order of magnitude faster than np.add.at for this pattern
-    fx = np.bincount(z_arr, weights=E3[i_arr, 0].astype(np.float64) * mom, minlength=nz)
-    fy = np.bincount(z_arr, weights=E3[i_arr, 1].astype(np.float64) * mom, minlength=nz)
-    fz = np.bincount(z_arr, weights=E3[i_arr, 2].astype(np.float64) * mom, minlength=nz)
+    fx = np.bincount(z_arr, weights=lattice.ex[i_arr] * mom, minlength=nz)
+    fy = np.bincount(z_arr, weights=lattice.ey[i_arr] * mom, minlength=nz)
+    fz = np.bincount(z_arr, weights=lattice.ez[i_arr] * mom, minlength=nz)
     return {"z": list(range(nz)), "fx": fx.tolist(), "fy": fy.tolist(), "fz": fz.tolist()}
 
 
@@ -219,6 +236,7 @@ def surface_diagnostics_3d(
     center_z: float,
     nz: int,
     want_profile: bool = True,
+    lattice: Lattice3D = D3Q19,
 ) -> Dict[str, object]:
     """
     Every momentum-exchange surface observable from a single gather.
@@ -243,14 +261,14 @@ def surface_diagnostics_3d(
         out["profile"] = empty
         return out
 
-    i_arr, z_arr, y_arr, x_arr, opp_arr = _link_arrays_3d(links)
+    i_arr, z_arr, y_arr, x_arr, opp_arr = _link_arrays_3d(links, lattice)
     f_out = f_pre[i_arr, z_arr, y_arr, x_arr]
     f_in = f_post[opp_arr, z_arr, y_arr, x_arr]
     mom = f_out + f_in
 
-    ex = E3[i_arr, 0].astype(np.float64)
-    ey = E3[i_arr, 1].astype(np.float64)
-    ez = E3[i_arr, 2].astype(np.float64)
+    ex = lattice.ex[i_arr]
+    ey = lattice.ey[i_arr]
+    ez = lattice.ez[i_arr]
     dfx = ex * mom
     dfy = ey * mom
     dfz = ez * mom
@@ -259,7 +277,9 @@ def surface_diagnostics_3d(
     ry = y_arr.astype(np.float64) - float(center_y)
     rz = z_arr.astype(np.float64) - float(center_z)
 
-    feq_out, feq_in = _link_feq_pair_3d(f_pre, i_arr, z_arr, y_arr, x_arr, opp_arr)
+    feq_out, feq_in = _link_feq_pair_3d(
+        f_pre, i_arr, z_arr, y_arr, x_arr, opp_arr, lattice
+    )
     mom_p = feq_out + feq_in
     mom_v = (f_out - feq_out) + (f_in - feq_in)
 

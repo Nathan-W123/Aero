@@ -466,11 +466,12 @@ def build_omega_field_3d(
     phi: Optional[np.ndarray] = None,
     van_driest: bool = False,
     van_driest_A: float = 25.0,
+    lattice=None,
 ) -> np.ndarray:
     """Per-cell relaxation rate from selectable LES model (Nz, Ny, Nx)."""
-    from .d3q19 import compute_macroscopic_3d
+    from .lattice3d import D3Q19, compute_macroscopic
 
-    rho, ux, uy, uz = compute_macroscopic_3d(f)
+    rho, ux, uy, uz = compute_macroscopic(f, D3Q19 if lattice is None else lattice)
     if les_model == "wale":
         if van_driest and phi is not None:
             y_wall = np.abs(phi)

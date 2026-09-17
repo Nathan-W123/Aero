@@ -1,5 +1,5 @@
 """
-Boundary conditions for the D3Q19 LBM solver.
+Boundary conditions for the 3D LBM solver (D3Q19 or D3Q27).
 
 Applied each timestep in this order (after streaming):
   1. Mid-link bounce-back   (obstacle surface)
@@ -9,17 +9,88 @@ Applied each timestep in this order (after streaming):
   (z direction: periodic by default via streaming)
 
 f array layout: (Q, Nz, Ny, Nx)
+
+Every routine here is written against a :class:`~aero.lbm.lattice3d.Lattice3D`
+descriptor rather than against hard-coded direction indices, and defaults to
+D3Q19.  That is not tidiness for its own sake: a 27-entry index table written
+out by hand is exactly the kind of thing whose transcription errors survive
+review and then show up as a slow momentum leak.
 """
 
 from typing import Optional, Tuple
 
 import numpy as np
-from .d3q19 import E3, OPP3, Y_MIR3, compute_feq_3d, compute_macroscopic_3d
+
+from .lattice3d import D3Q19, Lattice3D, compute_feq, compute_macroscopic
 
 
 # ---------------------------------------------------------------------------
-# Inlet: Zou-He 3D velocity BC (ux=u0, uy=0, uz=0) at x=0
+# Inlet: Zou-He 3D velocity BC at x=0
 # ---------------------------------------------------------------------------
+
+def _zou_he_x_inlet(
+    f: np.ndarray,
+    ux_t: np.ndarray,
+    uy_t: np.ndarray,
+    uz_t: np.ndarray,
+    lat: Lattice3D,
+    c: int = 0,
+) -> np.ndarray:
+    """
+    Impose ``(ux, uy, uz) = (ux_t, uy_t, uz_t)`` on the x-normal face ``c``.
+
+    The unknowns after streaming are the directions with ``ex > 0``; everything
+    else arrived from the interior.  Three steps, each exact:
+
+    1.  Density from the mass and x-momentum closure.  Splitting f by the sign
+        of ``ex`` gives ``rho = (2 F_minus + F_zero) / (1 - ux)``, independent
+        of the transverse target.
+
+    2.  Non-equilibrium bounce-back for each unknown,
+        ``f_i = f_opp(i) + 6 w_i rho (e_i . u)``, the even part of the
+        equilibrium cancelling in the difference.  This lands mass and
+        x-momentum exactly, because ``sum_{ex>0} w_i = 1/6`` for any lattice
+        whose x-components are in {-1, 0, 1}.
+
+    3.  Transverse momentum.  Step 2 delivers only ``rho u_y / 3`` of the
+        target and leaves the ex=0 plane's own transverse momentum in place,
+        so the shortfall is spread back over the unknowns as
+        ``delta_i = lambda w_i e_iy``.  That shape is forced: it is the only
+        one that is odd in ``e_y`` (so it cannot disturb mass or x-momentum)
+        while still carrying y-momentum.  The normalisation is
+        ``S = sum_{ex>0} w_i e_iy^2``, computed from the lattice.
+
+    Doing it this way rather than from a table is what lets D3Q27 work here
+    unchanged, where the unknown set is nine directions rather than five and
+    three of them carry ``e_y > 0`` instead of one.
+    """
+    U = lat.x_plus
+    opp_u = lat.OPP[U].astype(np.intp)
+    ex, ey, ez, w = lat.ex, lat.ey, lat.ez, lat.W
+
+    known_minus = f[lat.x_minus, :, :, c].sum(axis=0)
+    known_zero = f[lat.x_zero, :, :, c].sum(axis=0)
+    rho = (2.0 * known_minus + known_zero) / np.clip(1.0 - ux_t, 1e-10, None)
+
+    # transverse momentum already carried by the directions that stay put
+    zero_idx = lat.x_zero
+    cy = np.einsum("i,izy->zy", ey[zero_idx], f[zero_idx, :, :, c])
+    cz = np.einsum("i,izy->zy", ez[zero_idx], f[zero_idx, :, :, c])
+
+    for k, i in enumerate(U):
+        eu = ex[i] * ux_t + ey[i] * uy_t + ez[i] * uz_t
+        f[i, :, :, c] = f[opp_u[k], :, :, c] + 6.0 * w[i] * rho * eu
+
+    s = lat.transverse_norm
+    lam_y = ((2.0 / 3.0) * rho * uy_t - cy) / s
+    lam_z = ((2.0 / 3.0) * rho * uz_t - cz) / s
+    for i in U:
+        if ey[i] != 0.0:
+            f[i, :, :, c] += lam_y * w[i] * ey[i]
+        if ez[i] != 0.0:
+            f[i, :, :, c] += lam_z * w[i] * ez[i]
+    return rho
+
 
 def apply_inlet_zou_he_3d(
     f: np.ndarray,
@@ -28,6 +99,7 @@ def apply_inlet_zou_he_3d(
     uy_amp: float = 0.0,
     uz_amp: float = 0.0,
     step: int = 0,
+    lattice: Lattice3D = D3Q19,
 ) -> None:
     """
     3D Zou-He velocity BC at left face (x=0): impose ux=u0, uy≈0, uz≈0.
@@ -35,37 +107,25 @@ def apply_inlet_zou_he_3d(
     Optional spanwise uz_amp and vertical uy_amp perturbations (fraction of u0)
     trigger 3D shedding at supercritical Re.
     """
-    c = 0  # x=0 column index
-
-    F_minus = (f[2,:,:,c] + f[8,:,:,c] + f[10,:,:,c]
-               + f[12,:,:,c] + f[14,:,:,c])
-    F_neut  = (f[0,:,:,c] + f[3,:,:,c] + f[4,:,:,c]
-               + f[5,:,:,c] + f[6,:,:,c]
-               + f[15,:,:,c] + f[16,:,:,c] + f[17,:,:,c] + f[18,:,:,c])
-    rho_in = (2.0 * F_minus + F_neut) / (1.0 - u0)
-
-    cy = (f[3,:,:,c] - f[4,:,:,c]
-          + f[15,:,:,c] - f[16,:,:,c] + f[17,:,:,c] - f[18,:,:,c])
-    cz = (f[5,:,:,c] - f[6,:,:,c]
-          + f[15,:,:,c] + f[16,:,:,c] - f[17,:,:,c] - f[18,:,:,c])
+    nz, ny = f.shape[1], f.shape[2]
+    shape = (nz, ny)
+    ux_t = np.full(shape, float(u0))
+    uy_t = np.zeros(shape)
+    uz_t = np.zeros(shape)
 
     if uy_amp > 0.0 or uz_amp > 0.0:
-        nz, ny = f.shape[1], f.shape[2]
-        yy = np.arange(ny, dtype=np.float64)
-        zz = np.arange(nz, dtype=np.float64)
         phase = 0.17 * step
         if uy_amp > 0.0:
-            uy = uy_amp * u0 * np.sin(2.0 * np.pi * yy / max(ny, 1) + phase)
-            cy = cy + rho_in * uy
+            yy = np.arange(ny, dtype=np.float64)
+            uy_t += uy_amp * u0 * np.sin(2.0 * np.pi * yy / max(ny, 1) + phase)
         if uz_amp > 0.0:
-            uz = uz_amp * u0 * np.sin(2.0 * np.pi * zz / max(nz, 1) + phase)
-            cz = cz + rho_in * uz[:, None]
+            zz = np.arange(nz, dtype=np.float64)
+            uz_t += (
+                uz_amp * u0
+                * np.sin(2.0 * np.pi * zz / max(nz, 1) + phase)
+            )[:, None]
 
-    f[1, :,:,c]  = f[2, :,:,c] + (1.0/3.0) * rho_in * u0
-    f[7, :,:,c]  = f[10,:,:,c] + (1.0/6.0) * rho_in * u0 - 0.5 * cy
-    f[9, :,:,c]  = f[8, :,:,c] + (1.0/6.0) * rho_in * u0 + 0.5 * cy
-    f[11,:,:,c]  = f[14,:,:,c] + (1.0/6.0) * rho_in * u0 - 0.5 * cz
-    f[13,:,:,c]  = f[12,:,:,c] + (1.0/6.0) * rho_in * u0 + 0.5 * cz
+    _zou_he_x_inlet(f, ux_t, uy_t, uz_t, lattice)
 
 
 def apply_inlet_velocity_field_3d(
@@ -73,24 +133,17 @@ def apply_inlet_velocity_field_3d(
     ux_target: np.ndarray,
     uy_target: np.ndarray,
     uz_target: np.ndarray,
+    *,
+    lattice: Lattice3D = D3Q19,
 ) -> None:
     """3D Zou-He inlet with per-cell target velocity fields at x=0."""
-    c = 0
-    ux_target = np.asarray(ux_target, dtype=np.float64)
-    uy_target = np.asarray(uy_target, dtype=np.float64)
-    uz_target = np.asarray(uz_target, dtype=np.float64)
-    F_minus = (f[2,:,:,c] + f[8,:,:,c] + f[10,:,:,c] + f[12,:,:,c] + f[14,:,:,c])
-    F_neut  = (f[0,:,:,c] + f[3,:,:,c] + f[4,:,:,c] + f[5,:,:,c] + f[6,:,:,c]
-               + f[15,:,:,c] + f[16,:,:,c] + f[17,:,:,c] + f[18,:,:,c])
-    rho_in = (2.0 * F_minus + F_neut) / np.maximum(1.0 - ux_target, 1e-8)
-    cy = rho_in * uy_target
-    cz = rho_in * uz_target
-
-    f[1, :,:,c]  = f[2, :,:,c] + (1.0/3.0) * rho_in * ux_target
-    f[7, :,:,c]  = f[10,:,:,c] + (1.0/6.0) * rho_in * ux_target - 0.5 * cy
-    f[9, :,:,c]  = f[8, :,:,c] + (1.0/6.0) * rho_in * ux_target + 0.5 * cy
-    f[11,:,:,c]  = f[14,:,:,c] + (1.0/6.0) * rho_in * ux_target - 0.5 * cz
-    f[13,:,:,c]  = f[12,:,:,c] + (1.0/6.0) * rho_in * ux_target + 0.5 * cz
+    _zou_he_x_inlet(
+        f,
+        np.asarray(ux_target, dtype=np.float64),
+        np.asarray(uy_target, dtype=np.float64),
+        np.asarray(uz_target, dtype=np.float64),
+        lattice,
+    )
 
 
 def apply_inlet_sem_3d(
@@ -99,42 +152,25 @@ def apply_inlet_sem_3d(
     u_prime: np.ndarray,
     v_prime: np.ndarray,
     w_prime: np.ndarray,
+    *,
+    lattice: Lattice3D = D3Q19,
 ) -> None:
     """
     Zou-He 3D velocity BC at x=0 with SEM fluctuations.
 
-    Imposes (ux, uy, uz) = (u0 + u_prime, v_prime, w_prime) on the inlet face
-    using the standard Zou-He non-equilibrium bounce-back formulation.
+    Imposes (ux, uy, uz) = (u0 + u_prime, v_prime, w_prime) on the inlet face.
 
     Parameters
     ----------
     u_prime, v_prime, w_prime : (Nz, Ny) arrays from SEMInlet.fluctuation()
     """
-    c = 0
-    ux_field = u0 + u_prime  # (Nz, Ny)
-
-    F_minus = (f[2,:,:,c] + f[8,:,:,c] + f[10,:,:,c]
-               + f[12,:,:,c] + f[14,:,:,c])
-    F_neut  = (f[0,:,:,c] + f[3,:,:,c] + f[4,:,:,c]
-               + f[5,:,:,c] + f[6,:,:,c]
-               + f[15,:,:,c] + f[16,:,:,c] + f[17,:,:,c] + f[18,:,:,c])
-    rho_in = (2.0 * F_minus + F_neut) / np.clip(1.0 - ux_field, 1e-10, None)
-
-    # cy_base enforces uy=0; subtract rho*v_prime to impose uy=+v_prime
-    cy = (f[3,:,:,c] - f[4,:,:,c]
-          + f[15,:,:,c] - f[16,:,:,c] + f[17,:,:,c] - f[18,:,:,c])
-    cy = cy - rho_in * v_prime
-
-    # cz_base enforces uz=0; subtract rho*w_prime to impose uz=+w_prime
-    cz = (f[5,:,:,c] - f[6,:,:,c]
-          + f[15,:,:,c] + f[16,:,:,c] - f[17,:,:,c] - f[18,:,:,c])
-    cz = cz - rho_in * w_prime
-
-    f[1, :,:,c]  = f[2, :,:,c] + (1.0/3.0) * rho_in * ux_field
-    f[7, :,:,c]  = f[10,:,:,c] + (1.0/6.0) * rho_in * ux_field - 0.5 * cy
-    f[9, :,:,c]  = f[8, :,:,c] + (1.0/6.0) * rho_in * ux_field + 0.5 * cy
-    f[11,:,:,c]  = f[14,:,:,c] + (1.0/6.0) * rho_in * ux_field - 0.5 * cz
-    f[13,:,:,c]  = f[12,:,:,c] + (1.0/6.0) * rho_in * ux_field + 0.5 * cz
+    _zou_he_x_inlet(
+        f,
+        u0 + np.asarray(u_prime, dtype=np.float64),
+        np.asarray(v_prime, dtype=np.float64),
+        np.asarray(w_prime, dtype=np.float64),
+        lattice,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +211,7 @@ def apply_recycling_rescaling_inlet_3d(
     *,
     recycle_index: int = -2,
     inlet_index: int = 0,
+    lattice: Lattice3D = D3Q19,
 ) -> None:
     """
     Recycle the downstream plane to the inlet and rescale its mean ux to `target_u0`.
@@ -182,18 +219,19 @@ def apply_recycling_rescaling_inlet_3d(
     This preserves cross-stream structure and turbulence content better than a
     uniform inlet while remaining lightweight enough for the current solver.
     """
-    rho, ux, uy, uz = compute_macroscopic_3d(f)
+    rho, ux, uy, uz = compute_macroscopic(f, lattice)
     recycle_rho = rho[:, :, recycle_index]
     recycle_ux = ux[:, :, recycle_index]
     recycle_uy = uy[:, :, recycle_index]
     recycle_uz = uz[:, :, recycle_index]
     mean_ux = float(np.mean(recycle_ux))
     scale = 1.0 if abs(mean_ux) < 1e-12 else float(target_u0) / mean_ux
-    feq = compute_feq_3d(
+    feq = compute_feq(
         recycle_rho[:, :, None],
         (recycle_ux * scale)[:, :, None],
         (recycle_uy * scale)[:, :, None],
         (recycle_uz * scale)[:, :, None],
+        lattice,
     )
     f[:, :, :, inlet_index] = feq[:, :, :, 0]
 
@@ -202,51 +240,41 @@ def apply_recycling_rescaling_inlet_3d(
 # Wall BCs: top (y=Ny-1) and bottom (y=0)
 # ---------------------------------------------------------------------------
 
-def apply_slip_walls_3d(f: np.ndarray) -> None:
+def apply_slip_walls_3d(f: np.ndarray, *, lattice: Lattice3D = D3Q19) -> None:
     """
     Specular reflection at top and bottom walls (preserve ex,ez, flip ey).
 
-    y-mirror pairs (ex,ez fixed, ey flipped):
-      (3↔4), (7↔9), (8↔10), (15↔16), (17↔18)
+    The unknowns at the bottom wall are the directions with ``ey > 0``; each
+    takes the value of its y-mirror image.  For D3Q19 that reproduces the pairs
+    (3<->4), (7<->9), (8<->10), (15<->16), (17<->18); D3Q27 adds the corners.
     """
+    up = lattice.y_plus
+    dn = lattice.y_minus
+    mir = lattice.Y_MIR.astype(np.intp)
+
     # Bottom wall (y=0): incoming ey<0 directions → reflect to ey>0
-    f[3,:,0,:] = f[4,:,0,:]   # ey+ ← ey-
-    f[7,:,0,:] = f[9,:,0,:]   # ex+,ey+ ← ex+,ey-
-    f[8,:,0,:] = f[10,:,0,:]  # ex-,ey+ ← ex-,ey-
-    f[15,:,0,:] = f[16,:,0,:] # ey+,ez+ ← ey-,ez+
-    f[17,:,0,:] = f[18,:,0,:] # ey+,ez- ← ey-,ez-
-
+    f[up, :, 0, :] = f[mir[up], :, 0, :]
     # Top wall (y=Ny-1): incoming ey>0 directions → reflect to ey<0
-    f[4,:,-1,:] = f[3,:,-1,:]
-    f[9,:,-1,:] = f[7,:,-1,:]
-    f[10,:,-1,:] = f[8,:,-1,:]
-    f[16,:,-1,:] = f[15,:,-1,:]
-    f[18,:,-1,:] = f[17,:,-1,:]
+    f[dn, :, -1, :] = f[mir[dn], :, -1, :]
 
 
-def apply_noslip_walls_3d(f: np.ndarray) -> None:
+def apply_noslip_walls_3d(f: np.ndarray, *, lattice: Lattice3D = D3Q19) -> None:
     """
     Full bounce-back (no-slip) at top and bottom walls.
 
-    Reverses all velocity components: f[opp[i]] ← f[i] for incoming directions.
+    Reverses all velocity components: f[i] ← f[opp[i]] for the unknowns.
 
-    Bounce-back pairs vs slip pairs differ for diagonal directions:
-      slip: ex,ez fixed, ey flipped     (7↔9, 8↔10, 15↔16, 17↔18)
-      noslip: full reversal via OPP3    (7↔10, 8↔9, 15↔18, 16↔17)
+    Bounce-back differs from slip exactly in the diagonals, where the full
+    reversal also flips ex and ez:
+      slip:   ex,ez fixed, ey flipped  (7<->9, 8<->10, 15<->16, 17<->18)
+      noslip: full reversal via OPP    (7<->10, 8<->9, 15<->18, 16<->17)
     """
-    # Bottom wall (y=0): ey<0 incoming → reverse
-    f[3,:,0,:]  = f[4,:,0,:]
-    f[7,:,0,:]  = f[10,:,0,:]  # OPP3[10]=7 ← differs from slip
-    f[8,:,0,:]  = f[9,:,0,:]   # OPP3[9]=8  ← differs from slip
-    f[15,:,0,:] = f[18,:,0,:]  # OPP3[18]=15
-    f[17,:,0,:] = f[16,:,0,:]  # OPP3[16]=17
+    up = lattice.y_plus
+    dn = lattice.y_minus
+    opp = lattice.OPP.astype(np.intp)
 
-    # Top wall (y=Ny-1): ey>0 incoming → reverse
-    f[4,:,-1,:]  = f[3,:,-1,:]
-    f[10,:,-1,:] = f[7,:,-1,:]
-    f[9,:,-1,:]  = f[8,:,-1,:]
-    f[18,:,-1,:] = f[15,:,-1,:]
-    f[16,:,-1,:] = f[17,:,-1,:]
+    f[up, :, 0, :] = f[opp[up], :, 0, :]
+    f[dn, :, -1, :] = f[opp[dn], :, -1, :]
 
 
 def apply_moving_walls_3d(
@@ -254,22 +282,31 @@ def apply_moving_walls_3d(
     *,
     u_top: float = 0.0,
     u_bottom: float = 0.0,
+    lattice: Lattice3D = D3Q19,
 ) -> None:
-    """Moving-wall bounce-back with tangential x-velocity on top/bottom y-walls."""
+    """
+    Moving-wall bounce-back with tangential x-velocity on top/bottom y-walls.
+
+    Bounce-back plus the momentum the wall injects,
+    ``f_i = f_opp(i) + 6 w_i rho (e_i . u_wall)``, which for a purely
+    streamwise wall velocity is non-zero only on directions with ``ex != 0``.
+    """
+    up = lattice.y_plus
+    dn = lattice.y_minus
+    opp = lattice.OPP.astype(np.intp)
+    w, ex = lattice.W, lattice.ex
+
     rho_bottom = np.maximum(np.sum(f[:, :, 0, :], axis=0), 1e-12)
     rho_top = np.maximum(np.sum(f[:, :, -1, :], axis=0), 1e-12)
 
-    f[3,:,0,:]  = f[4,:,0,:]
-    f[7,:,0,:]  = f[10,:,0,:] + 6.0 * (1.0 / 36.0) * rho_bottom * float(u_bottom)
-    f[8,:,0,:]  = f[9,:,0,:]  - 6.0 * (1.0 / 36.0) * rho_bottom * float(u_bottom)
-    f[15,:,0,:] = f[18,:,0,:]
-    f[17,:,0,:] = f[16,:,0,:]
-
-    f[4,:,-1,:]  = f[3,:,-1,:]
-    f[10,:,-1,:] = f[7,:,-1,:]  - 6.0 * (1.0 / 36.0) * rho_top * float(u_top)
-    f[9,:,-1,:]  = f[8,:,-1,:]  + 6.0 * (1.0 / 36.0) * rho_top * float(u_top)
-    f[18,:,-1,:] = f[15,:,-1,:]
-    f[16,:,-1,:] = f[17,:,-1,:]
+    f[up, :, 0, :] = (
+        f[opp[up], :, 0, :]
+        + 6.0 * (w[up] * ex[up])[:, None, None] * rho_bottom * float(u_bottom)
+    )
+    f[dn, :, -1, :] = (
+        f[opp[dn], :, -1, :]
+        + 6.0 * (w[dn] * ex[dn])[:, None, None] * rho_top * float(u_top)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +316,8 @@ def apply_moving_walls_3d(
 def build_surface_links_3d(
     solid: np.ndarray,
     phi: Optional[np.ndarray] = None,
+    *,
+    lattice: Lattice3D = D3Q19,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Precompute surface links for 3D bounce-back.
@@ -306,8 +345,8 @@ def build_surface_links_3d(
     x_line = np.arange(Nx)
 
     per_dir = []
-    for i in range(1, 19):
-        ex_, ey_, ez_ = int(E3[i, 0]), int(E3[i, 1]), int(E3[i, 2])
+    for i in range(1, lattice.Q):
+        ex_, ey_, ez_ = (int(v) for v in lattice.E[i])
         # Clamped (not wrapped) neighbour indices — see the 2D builder.
         zn = np.clip(z_line + ez_, 0, Nz - 1)
         yn = np.clip(y_line + ey_, 0, Ny - 1)
@@ -344,6 +383,8 @@ def apply_bounce_back_3d(
     f: np.ndarray,
     f_pre: np.ndarray,
     links: np.ndarray,
+    *,
+    lattice: Lattice3D = D3Q19,
 ) -> None:
     """
     Mid-link bounce-back on 3D obstacle surface.
@@ -356,7 +397,7 @@ def apply_bounce_back_3d(
     z_arr = links[:, 1]
     y_arr = links[:, 2]
     x_arr = links[:, 3]
-    opp_i = OPP3[i_arr]
+    opp_i = lattice.OPP[i_arr]
     f[opp_i, z_arr, y_arr, x_arr] = f_pre[i_arr, z_arr, y_arr, x_arr]
 
 
@@ -365,6 +406,8 @@ def apply_bounce_back_bouzidi_3d(
     f_pre: np.ndarray,
     links: np.ndarray,
     q_vals: np.ndarray,
+    *,
+    lattice: Lattice3D = D3Q19,
 ) -> None:
     """
     Bouzidi (2001) interpolated bounce-back for 3D — 2nd-order at curved walls.
@@ -381,7 +424,7 @@ def apply_bounce_back_bouzidi_3d(
     z_arr = links[:, 1]
     y_arr = links[:, 2]
     x_arr = links[:, 3]
-    opp_i = OPP3[i_arr]
+    opp_i = lattice.OPP[i_arr]
     q = q_vals.astype(np.float64)
 
     m = q < 0.5
@@ -393,9 +436,9 @@ def apply_bounce_back_bouzidi_3d(
 
     m2 = ~m
     if m2.any():
-        zn = np.clip(z_arr[m2] + E3[opp_i[m2], 2].astype(int), 0, Nz - 1)
-        yn = np.clip(y_arr[m2] + E3[opp_i[m2], 1].astype(int), 0, Ny - 1)
-        xn = np.clip(x_arr[m2] + E3[opp_i[m2], 0].astype(int), 0, Nx - 1)
+        zn = np.clip(z_arr[m2] + lattice.E[opp_i[m2], 2].astype(int), 0, Nz - 1)
+        yn = np.clip(y_arr[m2] + lattice.E[opp_i[m2], 1].astype(int), 0, Ny - 1)
+        xn = np.clip(x_arr[m2] + lattice.E[opp_i[m2], 0].astype(int), 0, Nx - 1)
         inv2q = 1.0 / (2.0 * q[m2])
         f[opp_i[m2], z_arr[m2], y_arr[m2], x_arr[m2]] = (
             inv2q * f_pre[i_arr[m2], z_arr[m2], y_arr[m2], x_arr[m2]]

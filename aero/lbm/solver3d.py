@@ -1,5 +1,5 @@
 """
-D3Q19 3D LBM wind tunnel solver.
+3D LBM wind tunnel solver (D3Q19 or D3Q27).
 
 Timestep loop:
   1. Fused macroscopic + collision → f_pre
@@ -30,7 +30,7 @@ import pathlib
 import time
 from typing import Callable, Optional, List
 
-from .d3q19 import Q3, E3, W3, compute_macroscopic_3d, compute_feq_3d
+from .lattice3d import Lattice3D, compute_feq, compute_macroscopic, get_lattice3d
 from . import kernels3d as _k3
 from .kernels3d import collision_kernel_3d_xp, stream_kernel_3d_xp
 from .kernels3d_mrt import MRTKernel3D
@@ -94,6 +94,7 @@ class Solver3D:
         streamwise_bc: str = "open",
         backend: str = "auto",
         collision: str = "bgk",
+        lattice: str = "d3q19",
         inlet_perturbation: float = 0.0,
         trt_lambda: float = 0.25,
         sponge_thickness: int = 0,
@@ -142,7 +143,11 @@ class Solver3D:
         inlet_bc    : "velocity"  (only option in Phase 4)
         outlet_bc   : "convective" | "zerogradient"
         backend     : "auto" | "numpy" | "numba"
-        collision   : "bgk" | "mrt" | "trt"
+        collision   : "bgk" | "mrt" | "trt" | "regularized"
+        lattice     : "d3q19" (default) | "d3q27".  d3q27 carries the
+                      third-order equilibrium term and removes the O(u^3)
+                      Galilean-invariance error for ~23% more work per
+                      cell; see aero.lbm.lattice3d.  Not valid with mrt.
         inlet_perturbation : spanwise uz fraction of u0 at inlet
         """
         self.Nz = Nz
@@ -210,6 +215,16 @@ class Solver3D:
             )
         self.collision = collision
 
+        self.lattice: Lattice3D = get_lattice3d(lattice)
+        # MRT's moment matrix is built for the 19 D3Q19 directions specifically;
+        # there is no meaningful way to apply it to 27.  Refuse rather than
+        # transform in the wrong basis, which would look like it worked.
+        if self.lattice.name != "d3q19" and collision == "mrt":
+            raise ValueError(
+                f"collision='mrt' is only implemented for D3Q19, not "
+                f"{self.lattice.name}. Use 'bgk', 'trt' or 'regularized'."
+            )
+
         # Backend
         self._xp = np
         self._use_cupy = False
@@ -237,20 +252,24 @@ class Solver3D:
         self.backend: str = "cupy" if self._use_cupy else ("numba" if self._use_numba else "numpy")
 
         # Pre-cast lattice arrays
-        self._ex = E3[:, 0].astype(np.int32)
-        self._ey = E3[:, 1].astype(np.int32)
-        self._ez = E3[:, 2].astype(np.int32)
-        self._w  = W3.copy()
+        _lat = self.lattice
+        self.Q = _lat.Q
+        self._ex = _lat.E[:, 0].astype(np.int32)
+        self._ey = _lat.E[:, 1].astype(np.int32)
+        self._ez = _lat.E[:, 2].astype(np.int32)
+        self._w  = _lat.W.copy()
         # Keep numpy copies for thermal (needed even when CuPy overwrites above)
-        self._ex_np = E3[:, 0].astype(np.int32)
-        self._ey_np = E3[:, 1].astype(np.int32)
-        self._ez_np = E3[:, 2].astype(np.int32)
-        self._w_np  = W3.copy()
+        self._ex_np = self._ex.copy()
+        self._ey_np = self._ey.copy()
+        self._ez_np = self._ez.copy()
+        self._w_np  = _lat.W.copy()
         self._mrt_kernel = None
 
         self.solid = np.ascontiguousarray(solid, dtype=np.bool_)
         _phi_for_q = phi if (bouzidi and phi is not None) else None
-        self.surface_links, self.q_vals = build_surface_links_3d(self.solid, _phi_for_q)
+        self.surface_links, self.q_vals = build_surface_links_3d(
+            self.solid, _phi_for_q, lattice=_lat
+        )
 
         # Initialize f to equilibrium
         rho_init = np.full((Nz, Ny, Nx), rho0)
@@ -258,7 +277,7 @@ class Solver3D:
         uy_init  = np.zeros((Nz, Ny, Nx))
         uz_init  = np.zeros((Nz, Ny, Nx))
         self.f   = np.ascontiguousarray(
-            compute_feq_3d(rho_init, ux_init, uy_init, uz_init), dtype=np.float64
+            compute_feq(rho_init, ux_init, uy_init, uz_init, _lat), dtype=np.float64
         )
         self._f_outlet_prev = self.f[:, :, :, -1].copy()
         if self.collision == "mrt":
@@ -368,7 +387,7 @@ class Solver3D:
             f = self.f
         if self._use_cupy and isinstance(f, np.ndarray) is False:
             f = f.get()
-        rho, ux, uy, uz = compute_macroscopic_3d(f)
+        rho, ux, uy, uz = compute_macroscopic(f, self.lattice)
         mode, field = self._last_acc
         if mode == FORCE_UNIFORM:
             ux = ux + 0.5 * self._acc_uniform[0]
@@ -446,6 +465,7 @@ class Solver3D:
                 f, self.solid, self.fluid, self._base_nu, self.omega, self.les_cs,
                 les_model=self.les_model,
                 phi=self.phi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+                lattice=self.lattice,
             )
             use_omega_field = True
         if self.wall_model:
@@ -485,7 +505,7 @@ class Solver3D:
                     f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._ez, self._w,
                     omega_field, use_omega_field,
-                    acc_u, acc_f, force_mode,
+                    acc_u, acc_f, force_mode, self.lattice.h3_factor,
                 )
             else:
                 _kreg3.regularized_collision_numpy_3d(
@@ -493,18 +513,18 @@ class Solver3D:
                     self._ex, self._ey, self._ez, self._w,
                     omega_field if use_omega_field else None,
                     self._acc_as_field(force_mode, acc_u, acc_f),
+                    self.lattice,
                 )
 
         elif self.collision == "trt":
             f_pre = np.empty_like(f)
             if self._use_numba and _ktrt3._HAS_NUMBA:
-                from .d3q19 import OPP3
                 _ktrt3.trt_collision_kernel_3d(
                     f, f_pre, self.solid, omega_use,
                     self._ex, self._ey, self._ez, self._w,
-                    OPP3.astype(np.int32), self.trt_lambda,
+                    self.lattice.OPP.astype(np.int32), self.trt_lambda,
                     omega_field, use_omega_field,
-                    acc_u, acc_f, force_mode,
+                    acc_u, acc_f, force_mode, self.lattice.h3_factor,
                 )
             else:
                 _ktrt3.trt_collision_numpy_3d(
@@ -512,6 +532,7 @@ class Solver3D:
                     self._ex, self._ey, self._ez, self._w, self.trt_lambda,
                     omega_field if use_omega_field else None,
                     self._acc_as_field(force_mode, acc_u, acc_f),
+                    self.lattice,
                 )
         elif self._use_cupy:
             f_pre = xp.empty_like(f)
@@ -519,7 +540,7 @@ class Solver3D:
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
-                acc_u, acc_f, force_mode, xp=xp,
+                acc_u, acc_f, force_mode, xp=xp, h3=self.lattice.h3_factor,
             )
         elif self._use_numba:
             f_pre = np.empty_like(f)
@@ -527,7 +548,7 @@ class Solver3D:
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
-                acc_u, acc_f, force_mode,
+                acc_u, acc_f, force_mode, self.lattice.h3_factor,
             )
         else:
             # Pure-NumPy path — never dispatches to the JIT kernels even when
@@ -537,7 +558,7 @@ class Solver3D:
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
-                acc_u, acc_f, force_mode,
+                acc_u, acc_f, force_mode, self.lattice.h3_factor,
             )
 
         # Push streaming into a fresh array (never writes to its source)
@@ -554,16 +575,23 @@ class Solver3D:
         # BCs
         if not self.ibm_enabled:
             if self.bouzidi:
-                apply_bounce_back_bouzidi_3d(f_post, f_pre, self.surface_links, self.q_vals)
+                apply_bounce_back_bouzidi_3d(
+                    f_post, f_pre, self.surface_links, self.q_vals,
+                    lattice=self.lattice,
+                )
             else:
-                apply_bounce_back_3d(f_post, f_pre, self.surface_links)
+                apply_bounce_back_3d(
+                    f_post, f_pre, self.surface_links, lattice=self.lattice
+                )
 
         if self.streamwise_bc == "open":
             if self.inlet_bc == "velocity":
                 if self._sem is not None:
                     self._sem.step()
                     du, dv, dw = self._sem.fluctuation()
-                    apply_inlet_sem_3d(f_post, self.u0, du, dv, dw)
+                    apply_inlet_sem_3d(
+                        f_post, self.u0, du, dv, dw, lattice=self.lattice
+                    )
                 elif self.synthetic_inflow:
                     uy_in, uz_in = self._update_synthetic_inflow()
                     apply_inlet_velocity_field_3d(
@@ -571,6 +599,7 @@ class Solver3D:
                         np.full((self.Nz, self.Ny), self.u0, dtype=np.float64),
                         uy_in,
                         uz_in,
+                        lattice=self.lattice,
                     )
                 else:
                     apply_inlet_zou_he_3d(
@@ -578,6 +607,7 @@ class Solver3D:
                         self.u0,
                         uz_amp=self.inlet_perturbation,
                         step=self.step_count + 1,
+                        lattice=self.lattice,
                     )
 
             if self.outlet_bc == "convective":
@@ -587,7 +617,9 @@ class Solver3D:
         elif self.streamwise_bc == "periodic":
             apply_streamwise_periodic_3d(f_post)
         elif self.streamwise_bc == "recycling":
-            apply_recycling_rescaling_inlet_3d(f_post, self.u0)
+            apply_recycling_rescaling_inlet_3d(
+                f_post, self.u0, lattice=self.lattice
+            )
 
         if self.sponge_thickness > 0:
             apply_sponge_relaxation_3d(
@@ -596,14 +628,15 @@ class Solver3D:
             )
 
         if self.wall_bc == "slip":
-            apply_slip_walls_3d(f_post)
+            apply_slip_walls_3d(f_post, lattice=self.lattice)
         elif self.wall_bc == "noslip":
-            apply_noslip_walls_3d(f_post)
+            apply_noslip_walls_3d(f_post, lattice=self.lattice)
         elif self.wall_bc == "moving":
             apply_moving_walls_3d(
                 f_post,
                 u_top=self.wall_velocity_top,
                 u_bottom=self.wall_velocity_bottom,
+                lattice=self.lattice,
             )
 
         # Thermal step (CPU only; g stays on numpy even with CuPy f)
@@ -645,6 +678,7 @@ class Solver3D:
             center_y=self._ref_center_y,
             center_z=self._ref_center_z,
             nz=self.Nz,
+            lattice=self.lattice,
         )
         Cd, Cly, Clz = forces_to_coefficients_3d(
             diag["fx"], diag["fy"], diag["fz"], self.rho0, self.u0, self.D
@@ -743,7 +777,6 @@ class Solver3D:
                 self.save_checkpoint(str(ckpt))
 
             if hdf5_writer and hdf5_every and step % hdf5_every == 0:
-                from ..lbm.d3q19 import compute_macroscopic_3d as _cm3
                 from .thermal import extract_T as _extract_T
                 _rho, _ux, _uy, _uz = self.macroscopic()
                 _scalar = _extract_T(self.g) if (self.thermal and self.g is not None) else None
@@ -886,10 +919,11 @@ class Solver3D:
                 f_cpu, solid, ~solid, self._base_nu, self.omega,
                 self.les_cs, les_model=self.les_model, phi=self.phi,
                 van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+                lattice=self.lattice,
             wall_model=self.wall_model, wall_model_distance=self.wall_model_distance,
             )
         return surface_fields(
-            f_cpu, links, e=E3, w=W3, omega=self.omega,
+            f_cpu, links, e=self.lattice.E, w=self.lattice.W, omega=self.omega,
             rho_ref=self.rho0, u_ref=self.u0, omega_field=omega_field,
         )
 
@@ -924,7 +958,8 @@ class Solver3D:
             rho0=self.rho0, wall_bc=self.wall_bc, inlet_bc=self.inlet_bc,
             outlet_bc=self.outlet_bc, streamwise_bc=self.streamwise_bc,
             backend="numpy",  # always restart on CPU; user can switch after
-            collision=self.collision, inlet_perturbation=self.inlet_perturbation,
+            collision=self.collision, lattice=self.lattice.name,
+            inlet_perturbation=self.inlet_perturbation,
             trt_lambda=self.trt_lambda, sponge_thickness=self.sponge_thickness,
             sponge_strength=self.sponge_strength, les=self.les, les_cs=self.les_cs,
             les_model=self.les_model,

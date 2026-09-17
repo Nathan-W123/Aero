@@ -109,3 +109,20 @@ def test_every_parser_dest_is_read_back_correctly(module_name):
     }
     missing = sorted(referenced - dests)
     assert not missing, f"{module_name} reads undefined arg dests: {missing}"
+
+
+@pytest.mark.parametrize("module_name", ["cli", "cli3d"])
+def test_help_renders(module_name):
+    """
+    ``--help`` must actually print.
+
+    argparse interpolates every help string against a dict, so a literal '%'
+    that is not doubled raises ``TypeError`` at format time -- and only then.
+    Building the parser does not catch it, which is how ``cli3d.py --help``
+    shipped raising on "(>30% frontal blockage)".
+    """
+    import importlib
+
+    parser = importlib.import_module(module_name).build_parser()
+    text = parser.format_help()
+    assert "usage" in text.lower()
