@@ -123,6 +123,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--van-driest-A", type=float, default=25.0, help="Van Driest damping constant A+ (default 25)")
     p.add_argument("--wall-velocity-top", type=float, default=0.0, help="Top-wall tangential x velocity")
     p.add_argument("--wall-velocity-bottom", type=float, default=0.0, help="Bottom-wall tangential x velocity")
+    p.add_argument("--statistics", action="store_true",
+                   help="Accumulate time-averaged fields (mean/RMS velocity, "
+                        "Reynolds stresses, TKE, mean pressure)")
+    p.add_argument("--stats-start", type=int, default=None,
+                   help="First step to include in the averages (default: skip the "
+                        "first 20%% of the run as transient)")
+    p.add_argument("--stats-every", type=int, default=1,
+                   help="Sample the flow field every N steps for the averages")
     p.add_argument("--body-force-x", type=float, default=0.0,
                    help="Uniform streamwise acceleration (pressure-gradient-equivalent channel forcing)")
     p.add_argument("--body-force-y", type=float, default=0.0,
@@ -269,6 +277,22 @@ def list_cases(cases_root: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _print_statistics(result: dict) -> None:
+    """Print the time-averaged summary, and say where the fields went."""
+    stats = result.get("statistics")
+    if not stats or not stats.get("samples"):
+        return
+    print()
+    print("  === TIME-AVERAGED STATISTICS ===")
+    print(f"  samples          = {stats['samples']} (from step {stats['start_step']})")
+    print(f"  mean speed  max  = {stats['mean_speed_max']:.5f}")
+    print(f"  TKE         max  = {stats['tke_max']:.4e}   mean = {stats['tke_mean']:.4e}")
+    peaks = stats["reynolds_stress_peak"]
+    print("  Reynolds stress peaks: " + "  ".join(f"<{k}>={v:.3e}" for k, v in peaks.items()))
+    lo, hi = stats["mean_pressure_range"]
+    print(f"  mean pressure    = [{lo:.6f}, {hi:.6f}]")
+
+
 def main() -> int:
     parser = build_parser()
     args   = parser.parse_args()
@@ -382,7 +406,7 @@ def main() -> int:
         bouzidi=args.bouzidi,
         phi=phi,
         van_driest=args.van_driest,
-        van_driest_A=args.van_driest_a,
+        van_driest_A=args.van_driest_A,
         wall_velocity_top=args.wall_velocity_top,
         wall_velocity_bottom=args.wall_velocity_bottom,
         body_force_x=args.body_force_x,
@@ -426,6 +450,9 @@ def main() -> int:
         auto_stop=args.early_stop,
         hdf5_path=args.export_hdf5,
         hdf5_every=args.hdf5_every or args.check_every,
+        collect_statistics=args.statistics,
+        stats_start=args.stats_start,
+        stats_every=args.stats_every,
     )
     elapsed = time.perf_counter() - t0
     if autoconfig_report is not None:
@@ -433,6 +460,8 @@ def main() -> int:
 
     # Strouhal number (Phase 2)
     St = compute_strouhal(result["Cl_history"], p["D"], args.u0)
+
+    _print_statistics(result)
 
     print()
     print("  === RESULTS ===")

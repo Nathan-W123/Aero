@@ -102,6 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Write HDF5 snapshot every N steps")
     p.add_argument("--mesh-bc", choices=["voxel", "ibm"], default="voxel",
                    help="STL mesh boundary: voxel bounce-back or Guo IBM")
+    p.add_argument("--statistics", action="store_true",
+                   help="Accumulate time-averaged fields (mean/RMS velocity, "
+                        "Reynolds stresses, TKE, mean pressure)")
+    p.add_argument("--stats-start", type=int, default=None,
+                   help="First step to include in the averages (default: skip the "
+                        "first 20%% of the run as transient)")
+    p.add_argument("--stats-every", type=int, default=1,
+                   help="Sample the flow field every N steps for the averages")
     p.add_argument("--body-force-x", type=float, default=0.0,
                    help="Uniform streamwise body force for periodic/internal-flow cases")
     p.add_argument("--body-force-y", type=float, default=0.0)
@@ -227,6 +235,22 @@ def assess_blockage(blockage: float, allow_high_blockage: bool) -> tuple[str, bo
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _print_statistics(result: dict) -> None:
+    """Print the time-averaged summary, and say where the fields went."""
+    stats = result.get("statistics")
+    if not stats or not stats.get("samples"):
+        return
+    print()
+    print("  === TIME-AVERAGED STATISTICS ===")
+    print(f"  samples          = {stats['samples']} (from step {stats['start_step']})")
+    print(f"  mean speed  max  = {stats['mean_speed_max']:.5f}")
+    print(f"  TKE         max  = {stats['tke_max']:.4e}   mean = {stats['tke_mean']:.4e}")
+    peaks = stats["reynolds_stress_peak"]
+    print("  Reynolds stress peaks: " + "  ".join(f"<{k}>={v:.3e}" for k, v in peaks.items()))
+    lo, hi = stats["mean_pressure_range"]
+    print(f"  mean pressure    = [{lo:.6f}, {hi:.6f}]")
+
 
 def main() -> int:
     parser = build_parser()
@@ -475,10 +499,15 @@ def main() -> int:
         auto_stop=args.auto_stop,
         hdf5_path=args.export_hdf5,
         hdf5_every=args.hdf5_every or args.check_every,
+        collect_statistics=args.statistics,
+        stats_start=args.stats_start,
+        stats_every=args.stats_every,
     )
     elapsed = time.perf_counter() - t0
     if autoconfig_report is not None:
         result["autoconfig_report"] = autoconfig_report.as_dict()
+
+    _print_statistics(result)
 
     print()
     print("  === RESULTS ===")

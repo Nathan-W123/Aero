@@ -30,6 +30,9 @@ dev = [
     "pytest-cov",
     "numba>=0.57",
 ]
+mpi = [
+    "mpi4py>=3.1",
+]
 
 [project.scripts]
 aero = "cli:main"

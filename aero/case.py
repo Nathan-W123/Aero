@@ -140,6 +140,10 @@ class SimulationCase:
             self.results["scalar_validation"] = result["scalar_validation"]
         if result.get("autoconfig_report") is not None:
             self.results["autoconfig_report"] = result["autoconfig_report"]
+        # Only the scalar summary goes in results.json; the averaged fields
+        # themselves are arrays and belong in the npz beside it.
+        if result.get("statistics") is not None:
+            self.results["statistics"] = result["statistics"]
 
         self.case_dir.mkdir(parents=True, exist_ok=True)
         with open(self.results_path, "w") as fh:

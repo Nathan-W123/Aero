@@ -60,6 +60,7 @@ from ..forces3d import (
     surface_diagnostics_3d,
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
+from ..statistics import FlowStatistics
 from ..observables import coefficient_spectrum
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
@@ -637,6 +638,9 @@ class Solver3D:
         strouhal_tol: float = 0.05,
         hdf5_path: Optional[str] = None,
         hdf5_every: Optional[int] = None,
+        collect_statistics: bool = False,
+        stats_start: Optional[int] = None,
+        stats_every: int = 1,
     ) -> dict:
         """
         Run the 3D simulation for `steps` timesteps.
@@ -656,6 +660,15 @@ class Solver3D:
             if hdf5_path else None
         )
 
+        # Time averaging: skip the initial transient by default, using the
+        # same 80/20 split the coefficient averages already use.
+        self.stats = None
+        if collect_statistics:
+            first = steps // 5 if stats_start is None else int(stats_start)
+            self.stats = FlowStatistics(
+                shape=(self.Nz, self.Ny, self.Nx), components=3, start_step=first,
+            )
+
         t_start    = time.perf_counter()
         avg_window = max(1, steps // 5)
         stop_reason = "max_steps"
@@ -672,6 +685,14 @@ class Solver3D:
             self.Cmz_history.append(getattr(self, "_last_cmz", 0.0))
             self.Cd_p_history.append(getattr(self, "_last_cd_p", 0.0))
             self.Cd_v_history.append(getattr(self, "_last_cd_v", 0.0))
+
+            if (
+                self.stats is not None
+                and self.stats.should_sample(step)
+                and step % max(int(stats_every), 1) == 0
+            ):
+                _rho_s, _ux_s, _uy_s, _uz_s = self.macroscopic()
+                self.stats.update(_ux_s, _uy_s, _uz_s, rho=_rho_s)
 
             if checkpoint_every and checkpoint_dir and step % checkpoint_every == 0:
                 ckpt = pathlib.Path(checkpoint_dir) / f"checkpoint3d_{self.step_count:08d}.npz"
@@ -796,6 +817,8 @@ class Solver3D:
             "stop_reason": stop_reason,
             "convergence_report": last_convergence,
             "strouhal_report": last_strouhal,
+            "statistics": self.stats.summary() if self.stats is not None else None,
+            "mean_fields": self.stats.fields() if self.stats is not None else None,
             "rho": rho, "ux": ux, "uy": uy, "uz": uz,
             "scalar": scalar,
             "scalar_stats": scalar_stats,
