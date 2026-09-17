@@ -32,6 +32,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--collision", choices=["bgk", "mrt", "trt"], default="bgk")
     p.add_argument("--wall-bc", choices=["slip", "noslip"], default="slip")
     p.add_argument("--outlet-bc", choices=["convective", "zerogradient"], default="convective")
+    p.add_argument("--reduce-every", type=int, default=1,
+                   help="Reduce and record forces every N steps (1 = every step, "
+                        "matching the serial solvers)")
     p.add_argument("--no-verbose", action="store_true")
     p.add_argument("--output-dir", type=str, default="./mpi_outputs3d")
     return p.parse_args()
@@ -86,6 +89,7 @@ def main() -> None:
         collision=args.collision,
         wall_bc=args.wall_bc,
         outlet_bc=args.outlet_bc,
+        reduce_every=args.reduce_every,
     )
 
     if rank == 0:
