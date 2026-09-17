@@ -70,6 +70,7 @@ from .les import (
     build_omega_field_2d,
 )
 from .physics import base_nu_from_omega
+from .wall_model import apply_wall_model, wall_adjacent_mask
 from . import kernels_trt as _ktrt
 from . import kernels_reg as _kreg
 from .ibm_guo import ibm_acceleration_2d
@@ -109,6 +110,8 @@ class Solver:
         bouzidi: bool = False,
         van_driest: bool = False,
         van_driest_A: float = 25.0,
+        wall_model: bool = False,
+        wall_model_distance: float = 0.5,
         wall_velocity_top: float = 0.0,
         wall_velocity_bottom: float = 0.0,
         body_force_x: float = 0.0,
@@ -178,6 +181,9 @@ class Solver:
         self.bouzidi = bool(bouzidi)
         self.van_driest = bool(van_driest)
         self.van_driest_A = float(van_driest_A)
+        self.wall_model = bool(wall_model)
+        self.wall_model_distance = float(wall_model_distance)
+        self._wall_mask = None
         self.wall_velocity_top = float(wall_velocity_top)
         self.wall_velocity_bottom = float(wall_velocity_bottom)
         self.body_force_x = float(body_force_x)
@@ -372,6 +378,19 @@ class Solver:
                 phi=self.phi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             )
             use_omega_field = True
+        if self.wall_model:
+            # Runs after the subgrid model so wall cells take the modelled
+            # value and everything else keeps the subgrid one.
+            if not use_omega_field:
+                omega_field = np.full((self.Ny, self.Nx), self.omega)
+                use_omega_field = True
+            if self._wall_mask is None:
+                self._wall_mask = wall_adjacent_mask(self.solid)
+            _, _ux_w, _uy_w = self.macroscopic(f)
+            omega_field = apply_wall_model(
+                omega_field, (_ux_w, _uy_w), self.solid, self._base_nu,
+                wall_distance=self.wall_model_distance, mask=self._wall_mask,
+            )
         omega_use = self.omega
 
         # 1+2. Collision (with Guo forcing).  `f_pre` is the post-collision,
@@ -782,6 +801,7 @@ class Solver:
             les=self.les, les_cs=self.les_cs, ibm_enabled=self.ibm_enabled,
             les_model=self.les_model,
             bouzidi=self.bouzidi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            wall_model=self.wall_model, wall_model_distance=self.wall_model_distance,
             wall_velocity_top=self.wall_velocity_top,
             wall_velocity_bottom=self.wall_velocity_bottom,
             body_force_x=self.body_force_x,

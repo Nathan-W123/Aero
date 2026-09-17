@@ -66,6 +66,7 @@ from ..observables import coefficient_spectrum
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
 from .physics import base_nu_from_omega
+from .wall_model import apply_wall_model, wall_adjacent_mask
 from . import kernels3d_trt as _ktrt3
 from . import kernels3d_reg as _kreg3
 from .ibm_guo import ibm_acceleration_3d
@@ -105,6 +106,8 @@ class Solver3D:
         bouzidi: bool = False,
         van_driest: bool = False,
         van_driest_A: float = 25.0,
+        wall_model: bool = False,
+        wall_model_distance: float = 0.5,
         body_force_x: float = 0.0,
         body_force_y: float = 0.0,
         body_force_z: float = 0.0,
@@ -173,6 +176,9 @@ class Solver3D:
         self.bouzidi = bool(bouzidi)
         self.van_driest = bool(van_driest)
         self.van_driest_A = float(van_driest_A)
+        self.wall_model = bool(wall_model)
+        self.wall_model_distance = float(wall_model_distance)
+        self._wall_mask = None
         self.body_force_x = float(body_force_x)
         self.body_force_y = float(body_force_y)
         self.body_force_z = float(body_force_z)
@@ -442,6 +448,22 @@ class Solver3D:
                 phi=self.phi, van_driest=self.van_driest, van_driest_A=self.van_driest_A,
             )
             use_omega_field = True
+        if self.wall_model:
+            # Runs after the subgrid model so wall cells take the modelled
+            # value and everything else keeps the subgrid one.
+            if not use_omega_field:
+                omega_field = np.full((self.Nz, self.Ny, self.Nx), self.omega)
+                use_omega_field = True
+            if self._wall_mask is None:
+                self._wall_mask = wall_adjacent_mask(
+                    self.solid.get() if self._use_cupy else self.solid
+                )
+            _, _ux_w, _uy_w, _uz_w = self.macroscopic(f)
+            solid_cpu = self.solid.get() if self._use_cupy else self.solid
+            omega_field = apply_wall_model(
+                omega_field, (_ux_w, _uy_w, _uz_w), solid_cpu, self._base_nu,
+                wall_distance=self.wall_model_distance, mask=self._wall_mask,
+            )
         omega_use = self.omega
 
         # Collision. `f_pre` is the post-collision, pre-streaming state:
@@ -864,6 +886,7 @@ class Solver3D:
                 f_cpu, solid, ~solid, self._base_nu, self.omega,
                 self.les_cs, les_model=self.les_model, phi=self.phi,
                 van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            wall_model=self.wall_model, wall_model_distance=self.wall_model_distance,
             )
         return surface_fields(
             f_cpu, links, e=E3, w=W3, omega=self.omega,
@@ -907,6 +930,7 @@ class Solver3D:
             les_model=self.les_model,
             ibm_enabled=self.ibm_enabled, bouzidi=self.bouzidi,
             van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            wall_model=self.wall_model, wall_model_distance=self.wall_model_distance,
             body_force_x=self.body_force_x, body_force_y=self.body_force_y,
             body_force_z=self.body_force_z,
             wall_velocity_top=self.wall_velocity_top,

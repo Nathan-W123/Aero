@@ -102,6 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Write HDF5 snapshot every N steps")
     p.add_argument("--mesh-bc", choices=["voxel", "ibm"], default="voxel",
                    help="STL mesh boundary: voxel bounce-back or Guo IBM")
+    p.add_argument("--wall-model", action="store_true",
+                   help="Equilibrium (law-of-the-wall) near-wall model, for LES whose "
+                        "first cell does not resolve the viscous sublayer")
+    p.add_argument("--wall-model-distance", type=float, default=0.5,
+                   help="Distance from the wall, in cells, at which the model reads "
+                        "the velocity (default 0.5)")
     p.add_argument("--statistics", action="store_true",
                    help="Accumulate time-averaged fields (mean/RMS velocity, "
                         "Reynolds stresses, TKE, mean pressure)")
@@ -455,6 +461,8 @@ def main() -> int:
         bouzidi=args.bouzidi,
         van_driest=args.van_driest,
         van_driest_A=args.van_driest_A,
+        wall_model=args.wall_model,
+        wall_model_distance=args.wall_model_distance,
         ibm_enabled=ibm_active,
         phi=phi_for_solver,
         body_force_x=args.body_force_x,

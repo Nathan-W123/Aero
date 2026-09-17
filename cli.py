@@ -123,6 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--van-driest-A", type=float, default=25.0, help="Van Driest damping constant A+ (default 25)")
     p.add_argument("--wall-velocity-top", type=float, default=0.0, help="Top-wall tangential x velocity")
     p.add_argument("--wall-velocity-bottom", type=float, default=0.0, help="Bottom-wall tangential x velocity")
+    p.add_argument("--wall-model", action="store_true",
+                   help="Equilibrium (law-of-the-wall) near-wall model, for LES whose "
+                        "first cell does not resolve the viscous sublayer")
+    p.add_argument("--wall-model-distance", type=float, default=0.5,
+                   help="Distance from the wall, in cells, at which the model reads "
+                        "the velocity (default 0.5)")
     p.add_argument("--statistics", action="store_true",
                    help="Accumulate time-averaged fields (mean/RMS velocity, "
                         "Reynolds stresses, TKE, mean pressure)")
@@ -424,6 +430,8 @@ def main() -> int:
         phi=phi,
         van_driest=args.van_driest,
         van_driest_A=args.van_driest_A,
+        wall_model=args.wall_model,
+        wall_model_distance=args.wall_model_distance,
         wall_velocity_top=args.wall_velocity_top,
         wall_velocity_bottom=args.wall_velocity_bottom,
         body_force_x=args.body_force_x,
