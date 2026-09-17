@@ -293,6 +293,23 @@ def _print_statistics(result: dict) -> None:
     print(f"  mean pressure    = [{lo:.6f}, {hi:.6f}]")
 
 
+def _print_surface(result: dict) -> None:
+    """Print the surface observables summary."""
+    surf = result.get("surface")
+    if not surf or not surf.get("links"):
+        return
+    print()
+    print("  === SURFACE OBSERVABLES ===")
+    print(f"  surface nodes    = {surf['links']}")
+    print(f"  Cp               = [{surf['cp_min']:+.4f}, {surf['cp_max']:+.4f}]"
+          f"   mean {surf['cp_mean']:+.4f}")
+    print(f"  Cf          mean = {surf['cf_mean']:.4e}   max = {surf['cf_max']:.4e}")
+    print(f"  u_tau       mean = {surf['u_tau_mean']:.4e}")
+    print(f"  y+   min/mean/max= {surf['y_plus_min']:.3f} / "
+          f"{surf['y_plus_mean']:.3f} / {surf['y_plus_max']:.3f}")
+    print(f"  wall resolution  : {surf['wall_resolution']}")
+
+
 def main() -> int:
     parser = build_parser()
     args   = parser.parse_args()
@@ -462,6 +479,7 @@ def main() -> int:
     St = compute_strouhal(result["Cl_history"], p["D"], args.u0)
 
     _print_statistics(result)
+    _print_surface(result)
 
     print()
     print("  === RESULTS ===")

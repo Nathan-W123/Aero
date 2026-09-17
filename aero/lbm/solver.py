@@ -60,6 +60,7 @@ from ..forces import (
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
 from ..statistics import FlowStatistics
+from ..surface import surface_fields, surface_profile, surface_summary
 from ..observables import coefficient_spectrum
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_2d
 from .les import (
@@ -673,6 +674,7 @@ class Solver:
 
         if hdf5_writer:
             hdf5_writer.close()
+        _surface = self.surface_fields()
         return {
             "Cd_mean":    float(np.mean(Cd_arr)),
             "Cl_mean":    float(np.mean(Cl_arr)),
@@ -699,12 +701,43 @@ class Solver:
             "strouhal_report": last_strouhal,
             "statistics": self.stats.summary() if self.stats is not None else None,
             "mean_fields": self.stats.fields() if self.stats is not None else None,
+            "surface": self.surface_summary(_surface),
+            "surface_fields": _surface,
             "rho": rho,
             "ux":  ux,
             "uy":  uy,
             "scalar": scalar,
             "scalar_stats": scalar_stats,
         }
+
+    # ------------------------------------------------------------------
+    # Surface observables
+    # ------------------------------------------------------------------
+
+    def surface_fields(self) -> dict:
+        """Per-link Cp, wall shear stress, friction velocity and y+."""
+        omega_field = None
+        if self.les:
+            omega_field = build_omega_field_2d(
+                self.f, self.solid, self.fluid, self._base_nu, self.omega,
+                self.les_cs, les_model=self.les_model, phi=self.phi,
+                van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            )
+        return surface_fields(
+            self.f, self.surface_links, e=E, w=W, omega=self.omega,
+            rho_ref=self.rho0, u_ref=self.u0, omega_field=omega_field,
+        )
+
+    def surface_summary(self, fields: Optional[dict] = None) -> dict:
+        """Scalar reduction of the surface observables, for results.json."""
+        if fields is None:
+            fields = self.surface_fields()
+        summary = surface_summary(fields)
+        if summary.get("links"):
+            summary["cp_profile_y"] = surface_profile(
+                fields, axis=0, length=self.Ny, quantity="cp"
+            )
+        return summary
 
     # ------------------------------------------------------------------
     # Checkpoint: save / load solver state

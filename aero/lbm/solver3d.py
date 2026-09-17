@@ -61,6 +61,7 @@ from ..forces3d import (
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
 from ..statistics import FlowStatistics
+from ..surface import surface_fields, surface_profile, surface_summary
 from ..observables import coefficient_spectrum
 from .sponge import build_sponge_sigma, apply_sponge_relaxation_3d
 from .les import strain_rate_magnitude_3d, smagorinsky_nu_sgs, build_omega_field_3d
@@ -783,6 +784,7 @@ class Solver3D:
 
         if hdf5_writer:
             hdf5_writer.close()
+        _surface = self.surface_fields()
         return {
             "Cd_mean":    float(np.mean(Cd_arr)),
             "Cly_mean":   float(np.mean(Cly_arr)),
@@ -819,10 +821,44 @@ class Solver3D:
             "strouhal_report": last_strouhal,
             "statistics": self.stats.summary() if self.stats is not None else None,
             "mean_fields": self.stats.fields() if self.stats is not None else None,
+            "surface": self.surface_summary(_surface),
+            "surface_fields": _surface,
             "rho": rho, "ux": ux, "uy": uy, "uz": uz,
             "scalar": scalar,
             "scalar_stats": scalar_stats,
         }
+
+    # ------------------------------------------------------------------
+    # Surface observables
+    # ------------------------------------------------------------------
+
+    def surface_fields(self) -> dict:
+        """Per-link Cp, wall shear stress, friction velocity and y+."""
+        f_cpu = self.f.get() if self._use_cupy else self.f
+        links = self.surface_links.get() if self._use_cupy else self.surface_links
+        solid = self.solid.get() if self._use_cupy else self.solid
+        omega_field = None
+        if self.les:
+            omega_field = build_omega_field_3d(
+                f_cpu, solid, ~solid, self._base_nu, self.omega,
+                self.les_cs, les_model=self.les_model, phi=self.phi,
+                van_driest=self.van_driest, van_driest_A=self.van_driest_A,
+            )
+        return surface_fields(
+            f_cpu, links, e=E3, w=W3, omega=self.omega,
+            rho_ref=self.rho0, u_ref=self.u0, omega_field=omega_field,
+        )
+
+    def surface_summary(self, fields: Optional[dict] = None) -> dict:
+        """Scalar reduction of the surface observables, for results.json."""
+        if fields is None:
+            fields = self.surface_fields()
+        summary = surface_summary(fields)
+        if summary.get("links"):
+            summary["cp_profile_z"] = surface_profile(
+                fields, axis=0, length=self.Nz, quantity="cp"
+            )
+        return summary
 
     # ------------------------------------------------------------------
 

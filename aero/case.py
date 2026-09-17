@@ -144,6 +144,8 @@ class SimulationCase:
         # themselves are arrays and belong in the npz beside it.
         if result.get("statistics") is not None:
             self.results["statistics"] = result["statistics"]
+        if result.get("surface"):
+            self.results["surface"] = result["surface"]
 
         self.case_dir.mkdir(parents=True, exist_ok=True)
         with open(self.results_path, "w") as fh:
