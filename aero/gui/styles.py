@@ -1,32 +1,68 @@
-"""Qt stylesheets and chart colors for the Aero CFD desktop GUI."""
+"""
+Qt stylesheets and chart colors for the Aero CFD desktop GUI.
 
-# Teal-blue dark palette
-_BG_DEEP = "#0a0e14"
-_BG_MAIN = "#0f1419"
-_BG_PANEL = "#151c24"
-_BG_ELEVATED = "#1a2332"
-_BG_INPUT = "#1e2a3a"
-_BORDER = "#2d3a4f"
-_BORDER_FOCUS = "#3d7ea6"
-_TEXT = "#e2e8f0"
-_TEXT_MUTED = "#94a3b8"
-_TEXT_DIM = "#64748b"
-_ACCENT = "#2dd4bf"
-_ACCENT_BRIGHT = "#4de8ff"
-_ACCENT_DEEP = "#14b8a6"
-_ACCENT_HOVER = "#5eead4"
-_RUN = "#14b8a6"
-_RUN_HOVER = "#0d9488"
+Cream-and-green light palette.  Every colour the GUI uses is defined here --
+the 3D viewports import :data:`VIEWPORT_THEME` rather than hard-coding their
+own, so retheming is a single-file change.
+
+Contrast was checked rather than eyeballed.  Body text sits at 12.3:1 on the
+main surface, muted text at 5.9:1, the accent at 5.0:1 and the Run button's
+label at 5.0:1 on its fill -- all past WCAG AA.  ``_TEXT_DIM`` is 3.9:1, which
+is AA for large text only; it is used for placeholder and disabled states, not
+for anything a user has to read.
+
+The two chart series pass the categorical-palette checks on the elevated
+surface: chroma above the grey floor, CVD separation ΔE 25.4 (deutan) / 13.5
+(tritan), and both above 3:1 against their background.  Green plus violet
+rather than the more obvious green plus orange, because green/orange is
+exactly the pair red-green colour blindness collapses.
+"""
+
+# Cream-and-green light palette
+_BG_DEEP = "#E8E1CC"
+_BG_MAIN = "#F3EDDC"
+_BG_PANEL = "#F9F5EA"
+_BG_ELEVATED = "#FDFBF2"
+_BG_INPUT = "#FFFFFF"
+_BORDER = "#CBBF9E"
+_BORDER_FOCUS = "#2A7340"
+_TEXT = "#1F2D21"
+_TEXT_MUTED = "#55634F"
+_TEXT_DIM = "#6E7A66"
+_ACCENT = "#2A7340"
+_ACCENT_BRIGHT = "#15803D"
+_ACCENT_DEEP = "#14532D"
+_ACCENT_HOVER = "#3D9A58"
+_RUN = "#15803D"
+_RUN_HOVER = "#14653A"
+# status colours, darkened for a light surface: the original amber and salmon
+# sat at 1.5:1 and 2.5:1 on cream, i.e. effectively invisible
+_WARN = "#8A5A0B"
+_ERROR = "#B3261E"
 
 CHART_THEME = {
     "figure_bg": _BG_PANEL,
     "axes_bg": _BG_ELEVATED,
     "text": _TEXT_MUTED,
-    "grid": "#2d3a4f",
-    "cd": _ACCENT_BRIGHT,
-    "cl": "#f472b6",
+    "grid": _BORDER,
+    "cd": "#127A38",
+    "cl": "#5B21B6",
     "empty": _TEXT_DIM,
+    # diverging, and conventional for pressure (blue low / red high).  It fills
+    # the axes completely, so its near-white midpoint never shows the cream
+    # surface through.
     "pressure_cmap": "coolwarm",
+}
+
+#: Colours for the 3D wind-tunnel viewports (matplotlib and PyVista paths).
+VIEWPORT_THEME = {
+    "background": _BG_ELEVATED,
+    "background_top": _BG_PANEL,
+    "axis_text": _TEXT_MUTED,
+    "pane_edge": _BORDER,
+    "tunnel": "#9AA38C",
+    "body": _ACCENT,
+    "scalar_bar_text": _TEXT,
 }
 
 DARK_STYLESHEET = f"""
@@ -307,10 +343,10 @@ QLabel#validationLine[validationStatus="pass"] {{
     color: {_ACCENT};
 }}
 QLabel#validationLine[validationStatus="warn"] {{
-    color: #fbbf24;
+    color: {_WARN};
 }}
 QLabel#validationLine[validationStatus="fail"] {{
-    color: #f87171;
+    color: {_ERROR};
 }}
 QLabel#validationLine[validationStatus="n/a"] {{
     color: {_TEXT_MUTED};
@@ -406,28 +442,29 @@ LIGHT_STYLESHEET = APP_STYLESHEET
 
 VIEWPORT_STYLESHEET = f"""
 QWidget#FlowViewportRoot {{
-    background-color: {_BG_DEEP};
-    color: {_ACCENT_BRIGHT};
+    background-color: {_BG_ELEVATED};
+    color: {_TEXT};
 }}
+/* No chip behind the status text: it is empty until a case loads, and a
+   filled box with nothing in it reads as a rendering fault. */
 QLabel#viewportStatus {{
-    color: {_ACCENT_BRIGHT};
-    background-color: rgba(10, 14, 20, 200);
+    color: {_TEXT_MUTED};
+    background-color: transparent;
     padding: 4px 8px;
-    border-radius: 4px;
 }}
 QPushButton#viewportButton {{
-    background-color: rgba(21, 28, 36, 230);
+    background-color: rgba(253, 251, 242, 235);
     border: 1px solid {_BORDER_FOCUS};
     color: {_ACCENT_BRIGHT};
     border-radius: 4px;
     padding: 5px 10px;
 }}
 QPushButton#viewportButton:hover {{
-    background-color: rgba(30, 42, 58, 240);
+    background-color: rgba(243, 237, 220, 245);
     border-color: {_ACCENT};
 }}
 QPushButton#viewportButton:disabled {{
-    background-color: rgba(15, 20, 25, 200);
+    background-color: rgba(232, 225, 204, 200);
     color: {_TEXT_DIM};
     border-color: {_BORDER};
 }}

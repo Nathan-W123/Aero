@@ -511,11 +511,8 @@ if HAS_QT:
             header = QtWidgets.QHBoxLayout()
             title = QtWidgets.QLabel("Wind Tunnel")
             title.setObjectName("panelTitle")
-            subtitle = QtWidgets.QLabel("Interactive 3D wind tunnel with animated flow vectors")
-            subtitle.setObjectName("panelSubtitle")
             header.addWidget(title)
             header.addStretch(1)
-            header.addWidget(subtitle)
             layout.addLayout(header)
 
             frame = QtWidgets.QFrame()
@@ -624,7 +621,7 @@ if HAS_QT:
             self.run_progress_detail.setText(message)
 
         def _on_3d_load_succeeded(self) -> None:
-            self.summary_label.setText("Interactive 3D wind tunnel — drag to rotate")
+            self.summary_label.setText("")
 
         def _on_3d_load_failed(self, message: str) -> None:
             self.summary_label.setText(f"3D load failed — {message}")
@@ -1228,7 +1225,7 @@ if HAS_QT:
             if returncode == 0 and self.config.mode == "3d" and not self._grid_study_active and not self._re_sweep_active:
                 QtCore.QTimer.singleShot(200, self._begin_3d_after_run)
             elif returncode == 0 and self.config.mode != "3d":
-                self.viewport.clear_scene("Run a 3D case to load the interactive wind tunnel.")
+                self.viewport.clear_scene("")
             if not self._grid_study_active and not self._re_sweep_active:
                 if returncode == 0:
                     detail = "Run complete"

@@ -15,7 +15,7 @@ except ImportError:
     QtWidgets = None  # type: ignore[assignment]
     HAS_QT = False
 
-from .styles import VIEWPORT_STYLESHEET
+from .styles import VIEWPORT_STYLESHEET, VIEWPORT_THEME
 
 _HAS_PYVISTA: Optional[bool] = None
 _HAS_QT_PYVISTA: Optional[bool] = None
@@ -96,7 +96,7 @@ if HAS_QT:
 
             overlay = QtWidgets.QHBoxLayout()
             overlay.setContentsMargins(8, 8, 8, 0)
-            self.status_label = QtWidgets.QLabel("Run a 3D case to load the wind tunnel")
+            self.status_label = QtWidgets.QLabel("")
             self.status_label.setObjectName("viewportStatus")
             overlay.addWidget(self.status_label, 1)
 
@@ -134,14 +134,13 @@ if HAS_QT:
             self._viewer_container.setMinimumSize(400, 320)
             self._viewer_layout = QtWidgets.QVBoxLayout(self._viewer_container)
             self._viewer_layout.setContentsMargins(0, 0, 0, 0)
-            self._placeholder = QtWidgets.QLabel(
-                "Interactive 3D wind tunnel\n\n"
-                "Drag to rotate · scroll to zoom · shift-drag to pan\n"
-                "Animated velocity vectors start automatically after each run"
-            )
+            # Empty until a case loads — no instructional copy.
+            self._placeholder = QtWidgets.QLabel("")
             self._placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self._placeholder.setWordWrap(True)
-            self._placeholder.setStyleSheet("color: #4de8ff; background-color: #000000;")
+            self._placeholder.setStyleSheet(
+                f'background-color: {VIEWPORT_THEME["background"]};'
+            )
             self._viewer_layout.addWidget(self._placeholder, 1)
             layout.addWidget(self._viewer_container, 1)
 
@@ -196,7 +195,7 @@ if HAS_QT:
                 self.status_label.setText("Initializing 3D renderer...")
                 QtWidgets.QApplication.processEvents()
                 plotter = qt_interactor(self._viewer_container, multi_samples=0)
-                plotter.set_background("#000000", top="#0a1020")
+                plotter.set_background(VIEWPORT_THEME["background"], top=VIEWPORT_THEME["background_top"])
                 plotter.enable_trackball_style()
                 self._plotter = plotter
                 self._viewer_layout.removeWidget(self._placeholder)
@@ -296,13 +295,13 @@ if HAS_QT:
             self._scalar_bar_shown = False
 
             self._plotter.clear()
-            self._plotter.set_background("#000000", top="#0a1020")
+            self._plotter.set_background(VIEWPORT_THEME["background"], top=VIEWPORT_THEME["background_top"])
 
             tunnel = scene["tunnel"]
             if tunnel.n_cells > 0:
                 self._plotter.add_mesh(
                     tunnel,
-                    color="#8899aa",
+                    color=VIEWPORT_THEME["tunnel"],
                     line_width=1.0,
                     opacity=0.45,
                     lighting=False,
@@ -313,7 +312,7 @@ if HAS_QT:
             if solid.n_cells > 0:
                 self._plotter.add_mesh(
                     solid,
-                    color="#5ec8e8",
+                    color=VIEWPORT_THEME["body"],
                     opacity=0.88,
                     smooth_shading=True,
                     name="solid",
@@ -374,7 +373,7 @@ if HAS_QT:
                     show_scalar_bar=not self._scalar_bar_shown,
                     scalar_bar_args={
                         "title": "|u|",
-                        "color": "#d7f0ff",
+                        "color": VIEWPORT_THEME["scalar_bar_text"],
                         "n_labels": 4,
                         "vertical": True,
                     },
@@ -403,7 +402,7 @@ if HAS_QT:
             self._init_particles()
             self.play_button.setText("Pause Flow")
             self._flow_timer.start()
-            self.status_label.setText("Drag to rotate · scroll to zoom · flow animating")
+            self.status_label.setText("")
             _log(f"scene ready: {self._loaded_volume_path.name if self._loaded_volume_path else '?'}")
 
         def _fail_load(self, message: str) -> None:
@@ -441,7 +440,7 @@ if HAS_QT:
             self.play_button.setText("Play Flow")
             if self._plotter is not None:
                 self._plotter.clear()
-                self._plotter.set_background("#000000", top="#0a1020")
+                self._plotter.set_background(VIEWPORT_THEME["background"], top=VIEWPORT_THEME["background_top"])
                 self._plotter.render()
 
         def pause_animation(self) -> None:

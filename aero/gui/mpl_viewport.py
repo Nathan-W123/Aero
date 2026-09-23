@@ -21,7 +21,7 @@ except ImportError:
     QtWidgets = None  # type: ignore[assignment]
     HAS_QT = False
 
-from .styles import VIEWPORT_STYLESHEET
+from .styles import VIEWPORT_THEME, VIEWPORT_STYLESHEET
 
 _N_STREAMLETS = 20
 _MAX_BODY_LEN = 14       # positions before tail starts following
@@ -119,7 +119,7 @@ if HAS_QT:
 
             overlay = QtWidgets.QHBoxLayout()
             overlay.setContentsMargins(8, 8, 8, 0)
-            self.status_label = QtWidgets.QLabel("Run a 3D case to load the wind tunnel")
+            self.status_label = QtWidgets.QLabel("")
             self.status_label.setObjectName("viewportStatus")
             overlay.addWidget(self.status_label, 1)
 
@@ -133,10 +133,12 @@ if HAS_QT:
             layout.addLayout(overlay)
 
             self.figure = Figure(figsize=(7.0, 5.5), dpi=100)
-            self.figure.set_facecolor("#000000")
+            self.figure.set_facecolor(VIEWPORT_THEME["background"])
             self.canvas = FigureCanvasQTAgg(self.figure)
             self.canvas.setMinimumSize(400, 320)
-            self.canvas.setStyleSheet("background-color: #000000;")
+            self.canvas.setStyleSheet(
+                f'background-color: {VIEWPORT_THEME["background"]};'
+            )
             layout.addWidget(self.canvas, 1)
             self.ax = self.figure.add_subplot(111, projection="3d")
             self._draw_placeholder()
@@ -160,32 +162,11 @@ if HAS_QT:
             self._load_pending = False
 
         def _draw_placeholder(self) -> None:
+            """Empty viewport before a case is loaded — no instructional copy."""
             self.figure.clf()
             self.ax = self.figure.add_subplot(111, projection="3d")
-            self.ax.set_facecolor("#000000")
+            self.ax.set_facecolor(VIEWPORT_THEME["background"])
             self.ax.set_axis_off()
-            self.ax.text2D(
-                0.5,
-                0.55,
-                "Interactive 3D wind tunnel",
-                transform=self.ax.transAxes,
-                ha="center",
-                va="center",
-                color="#4de8ff",
-                fontsize=13,
-                fontweight="bold",
-            )
-            self.ax.text2D(
-                0.5,
-                0.38,
-                "Drag to rotate · scroll to zoom · right-drag to pan\n"
-                "Streamlets grow from the inlet, sweep around the body, then fade out",
-                transform=self.ax.transAxes,
-                ha="center",
-                va="center",
-                color="#94a3b8",
-                fontsize=10,
-            )
             self.figure.tight_layout(pad=0.2)
             self.canvas.draw_idle()
 
@@ -277,24 +258,24 @@ if HAS_QT:
             self._speed_norm = Normalize(vmin=vmin, vmax=vmax)
 
         def _style_axes(self) -> None:
-            self.ax.set_facecolor("#000000")
+            self.ax.set_facecolor(VIEWPORT_THEME["background"])
             self.ax.xaxis.pane.fill = False
             self.ax.yaxis.pane.fill = False
             self.ax.zaxis.pane.fill = False
-            self.ax.xaxis.pane.set_edgecolor("#334155")
-            self.ax.yaxis.pane.set_edgecolor("#334155")
-            self.ax.zaxis.pane.set_edgecolor("#334155")
-            self.ax.tick_params(colors="#8899aa", labelsize=8)
-            self.ax.set_xlabel("x (flow)", color="#8899aa", fontsize=9)
-            self.ax.set_ylabel("y", color="#8899aa", fontsize=9)
-            self.ax.set_zlabel("z", color="#8899aa", fontsize=9)
+            self.ax.xaxis.pane.set_edgecolor(VIEWPORT_THEME["pane_edge"])
+            self.ax.yaxis.pane.set_edgecolor(VIEWPORT_THEME["pane_edge"])
+            self.ax.zaxis.pane.set_edgecolor(VIEWPORT_THEME["pane_edge"])
+            self.ax.tick_params(colors=VIEWPORT_THEME["axis_text"], labelsize=8)
+            self.ax.set_xlabel("x (flow)", color=VIEWPORT_THEME["axis_text"], fontsize=9)
+            self.ax.set_ylabel("y", color=VIEWPORT_THEME["axis_text"], fontsize=9)
+            self.ax.set_zlabel("z", color=VIEWPORT_THEME["axis_text"], fontsize=9)
 
         def _draw_scene(self, tunnel, solid) -> None:
             self._clear_stream_artists()
             self.figure.clf()
             self.ax = self.figure.add_subplot(111, projection="3d")
-            _plot_line_mesh(self.ax, tunnel, color="#8899aa", alpha=0.55, linewidth=0.6)
-            _plot_solid_mesh(self.ax, solid, color="#5ec8e8", alpha=0.88)
+            _plot_line_mesh(self.ax, tunnel, color=VIEWPORT_THEME["tunnel"], alpha=0.55, linewidth=0.6)
+            _plot_solid_mesh(self.ax, solid, color=VIEWPORT_THEME["body"], alpha=0.88)
             x0, x1, y0, y1, z0, z1 = self._grid.bounds  # type: ignore[union-attr]
             pad = 0.05 * max(x1 - x0, y1 - y0, z1 - z0, 1.0)
             self._view_bounds = (x0 - pad, x1 + pad, y0 - pad, y1 + pad, z0 - pad, z1 + pad)
