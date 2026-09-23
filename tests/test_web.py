@@ -178,3 +178,29 @@ def test_public_payload_never_leaks_the_png_bytes():
     pub = job.public()
     assert pub["has_preview"] is True
     assert "preview_png" not in pub
+
+
+def test_3d_job_reports_lift_and_stays_strict_json():
+    """
+    3D keeps its lift in Cly_history, not Cl_history.  Reading the wrong name
+    made cl NaN, json.dumps wrote a bare NaN token, and the browser's parser
+    threw -- the page just stopped updating, with nothing in the log.
+    """
+    job = web.Job(id="t6", params={
+        "mode": "3d", "shape": "sphere", "radius": 3, "re": 20, "u0": 0.05,
+        "nx": 32, "ny": 16, "nz": 16, "steps": 120, "backend": "numpy",
+    })
+    web._run_job(job)
+    assert job.state == "done", job.error
+    payload = json.dumps(job.public(), allow_nan=False)      # raises on NaN
+    assert "NaN" not in payload
+    c = job.result["coefficients"]
+    assert c["cl"] is not None and np.isfinite(c["cl"])
+    assert all(h["cl"] is not None for h in job.history)
+
+
+def test_num_turns_non_finite_into_none():
+    assert web._num(float("nan")) is None
+    assert web._num(float("inf")) is None
+    assert web._num("x") is None
+    assert web._num(1.23456789) == 1.23457

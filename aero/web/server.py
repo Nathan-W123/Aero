@@ -102,6 +102,12 @@ class Job:
     result: Dict[str, Any] = field(default_factory=dict)
     preview_png: Optional[bytes] = None
     figures: Dict[str, bytes] = field(default_factory=dict)
+    figure_step: int = -1
+    #: packed geometry (solid mask) and the latest downsampled velocity field,
+    #: for the browser-side 3D viewer -- see _pack for the wire format
+    geometry: Optional[bytes] = None
+    field_bytes: Optional[bytes] = None
+    field_step: int = -1
     _cancel: threading.Event = field(default_factory=threading.Event)
 
     def public(self) -> Dict[str, Any]:
@@ -117,6 +123,9 @@ class Job:
             "result": self.result,
             "has_preview": self.preview_png is not None,
             "figures": sorted(self.figures),
+            "figure_step": self.figure_step,
+            "has_geometry": self.geometry is not None,
+            "field_step": self.field_step,
             "params": self.params,
         }
 
@@ -236,6 +245,60 @@ def _build_solver(p: Dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
+# Binary payloads for the browser-side 3D viewer
+# ---------------------------------------------------------------------------
+
+def _pack(header: Dict[str, Any], *arrays: np.ndarray) -> bytes:
+    """
+    One JSON header line, padded so the data starts 8-byte aligned, then the
+    arrays back to back.  ``header["parts"]`` names each array with its dtype
+    and element count, so the client can walk the buffer with typed views and
+    no copies.  JSON for the numbers would be ~5x the bytes and a parse of a
+    few hundred thousand floats on every refresh.
+    """
+    parts = []
+    blobs = []
+    for name, arr in zip(header["names"], arrays):
+        arr = np.ascontiguousarray(arr)
+        parts.append({"name": name, "dtype": str(arr.dtype), "count": int(arr.size)})
+        blobs.append(arr.tobytes())
+    h = dict(header)
+    h.pop("names")
+    h["parts"] = parts
+    head = json.dumps(h).encode()
+    pad = (-(len(head) + 1)) % 8
+    return head + b" " * pad + b"\n" + b"".join(blobs)
+
+
+def _geometry_payload(solid: np.ndarray) -> bytes:
+    if solid.ndim == 2:
+        solid = solid[None]
+    return _pack({"shape": list(solid.shape), "names": ["solid"]},
+                 solid.astype(np.uint8))
+
+
+def _field_payload(solver, mode: str) -> bytes:
+    """Velocity, strided down so the largest axis has ~48 samples."""
+    if mode == "2d":
+        _, ux, uy = solver.macroscopic()
+        ux, uy = ux[None], uy[None]
+        uz = np.zeros_like(ux)
+    else:
+        _, ux, uy, uz = solver.macroscopic()
+    nz, ny, nx = ux.shape
+    f = max(1, int(np.ceil(max(nx, ny, nz) / 48)))
+    sl = (slice(None, None, f),) * 3
+    ux, uy, uz = ux[sl], uy[sl], uz[sl]
+    speed = np.sqrt(ux * ux + uy * uy + uz * uz)
+    umax = float(np.nanmax(speed)) if speed.size else 0.0
+    return _pack(
+        {"shape": list(ux.shape), "factor": f, "full": [nz, ny, nx],
+         "umax": umax, "names": ["ux", "uy", "uz"]},
+        ux.astype(np.float32), uy.astype(np.float32), uz.astype(np.float32),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -288,6 +351,30 @@ def _field_png(solver, mode: str, what: str = "speed") -> bytes:
     return _png(fig)
 
 
+def _lift_history(solver) -> List[float]:
+    """2D keeps Cl_history; 3D keeps Cly (wall-normal) and Clz (spanwise)."""
+    for name in ("Cl_history", "Cly_history"):
+        h = getattr(solver, name, None)
+        if h is not None:
+            return list(h)
+    return []
+
+
+def _num(x, nd: int = 5) -> Optional[float]:
+    """
+    A float the browser can parse, or None.
+
+    Python's json.dumps writes NaN/Infinity as bare tokens, which are not JSON;
+    ``response.json()`` in the browser throws on them and the page silently
+    stops updating.  Every number that reaches a payload goes through here.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return round(v, nd) if np.isfinite(v) else None
+
+
 # ---------------------------------------------------------------------------
 # The worker
 # ---------------------------------------------------------------------------
@@ -310,6 +397,10 @@ def _run_job(job: Job) -> None:
             "solid_cells": int(solver.solid.sum()),
         }
 
+        job.geometry = _geometry_payload(solver.solid)
+        job.field_bytes = _field_payload(solver, mode)
+        job.field_step = 0
+
         total = job.total = max(_i(p, "steps", 3000), 1)
         chunk = max(total // 60, 50)
         done = 0
@@ -325,7 +416,7 @@ def _run_job(job: Job) -> None:
             job.step = done
 
             cd_hist = list(getattr(solver, "Cd_history", []))
-            cl_hist = list(getattr(solver, "Cl_history", []))
+            cl_hist = _lift_history(solver)
             cd = float(cd_hist[-1]) if cd_hist else float("nan")
             cl = float(cl_hist[-1]) if cl_hist else float("nan")
             if not np.isfinite(cd):
@@ -333,12 +424,19 @@ def _run_job(job: Job) -> None:
                     f"the solution diverged at step {done} — lower Re, raise the "
                     f"grid resolution, or try the regularized collision operator"
                 )
-            job.history.append({"step": done, "cd": round(cd, 5), "cl": round(cl, 5)})
+            job.history.append({"step": done, "cd": _num(cd), "cl": _num(cl)})
             rate = done / max(time.time() - t0, 1e-9)
             job.message = f"step {done:,} of {total:,} · {rate:,.0f} steps/s"
+            try:
+                job.field_bytes = _field_payload(solver, mode)
+                job.field_step = done
+            except Exception:
+                pass
             if len(job.history) % 3 == 1:
                 try:
-                    job.preview_png = _field_png(solver, mode, p.get("field", "speed"))
+                    for what in ("speed", "vorticity", "pressure"):
+                        job.figures[what] = _field_png(solver, mode, what)
+                    job.figure_step = done
                 except Exception:
                     pass
 
@@ -348,15 +446,15 @@ def _run_job(job: Job) -> None:
 
         # final numbers over the settled tail
         cd_hist = np.asarray(getattr(solver, "Cd_history", []), dtype=float)
-        cl_hist = np.asarray(getattr(solver, "Cl_history", []), dtype=float)
+        cl_hist = np.asarray(_lift_history(solver), dtype=float)
         if cd_hist.size:
             tail = cd_hist[max(cd_hist.size // 2, 0):]
             tail_l = cl_hist[max(cl_hist.size // 2, 0):] if cl_hist.size else np.array([np.nan])
             job.result["coefficients"] = {
-                "cd": round(float(np.nanmean(tail)), 5),
-                "cd_std": round(float(np.nanstd(tail)), 5),
-                "cl": round(float(np.nanmean(tail_l)), 5),
-                "cl_std": round(float(np.nanstd(tail_l)), 5),
+                "cd": _num(np.nanmean(tail)),
+                "cd_std": _num(np.nanstd(tail)),
+                "cl": _num(np.nanmean(tail_l)),
+                "cl_std": _num(np.nanstd(tail_l)),
                 "note": "averaged over the second half of the run",
             }
         for what in ("speed", "vorticity", "pressure"):
@@ -364,6 +462,12 @@ def _run_job(job: Job) -> None:
                 job.figures[what] = _field_png(solver, mode, what)
             except Exception:
                 pass
+        job.figure_step = job.step
+        try:
+            job.field_bytes = _field_payload(solver, mode)
+            job.field_step = job.step
+        except Exception:
+            pass
         job.preview_png = job.figures.get(p.get("field", "speed")) or job.preview_png
 
     except Exception as exc:                       # surfaced verbatim in the UI
@@ -383,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "AeroWeb/1.0"
 
     def log_message(self, fmt, *args):             # quieter than the default
-        if "/api/status" not in (args[0] if args else ""):
+        if not any(k in (args[0] if args else "") for k in ("/api/status", "/api/field", "/api/figure")):
             print(f"  {self.address_string()} {fmt % args}")
 
     # -- helpers --
@@ -400,12 +504,14 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _json(self, obj, code=200):
-        self._send(code, json.dumps(obj).encode(), "application/json")
+        self._send(code, json.dumps(obj, allow_nan=False).encode(), "application/json")
 
     # -- routes --
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        if u.path == "/favicon.ico":
+            self.send_response(204); self.end_headers(); return
         if u.path in ("/", "/index.html"):
             html = (_HERE / "index.html").read_bytes()
             return self._send(200, html, "text/html; charset=utf-8")
@@ -421,6 +527,14 @@ class Handler(BaseHTTPRequestHandler):
             if job is None:
                 return self._json({"error": "no such run"}, 404)
             return self._json(job.public())
+        if u.path in ("/api/geometry", "/api/field"):
+            job = JOBS.get((q.get("id") or [""])[0])
+            if job is None:
+                return self._json({"error": "no such run"}, 404)
+            blob = job.geometry if u.path == "/api/geometry" else job.field_bytes
+            if not blob:
+                return self._json({"error": "not ready yet"}, 404)
+            return self._send(200, blob, "application/octet-stream")
         if u.path == "/api/figure":
             job = JOBS.get((q.get("id") or [""])[0])
             if job is None:
