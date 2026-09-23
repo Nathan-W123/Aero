@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aero CFD</title>
+<style>
+:root{
+  color-scheme: light;
+  --ground:#F3EDDC; --surface:#FDFBF2; --panel:#F9F5EA; --sunk:#E8E1CC;
+  --ink:#1F2D21; --muted:#55634F; --faint:#6E7A66;
+  --accent:#15803D; --accent-deep:#14653A; --accent-soft:#DFEFE3;
+  --line:#CBBF9E; --line-soft:#DED5BC;
+  --warn:#8A5A0B; --error:#B3261E;
+  --cd:#127A38; --cl:#5B21B6;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}   /* beats .row/.stats display:grid */
+html,body{height:100%}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font:14.5px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+h1,h2,h3{margin:0;font-weight:650;letter-spacing:-.01em}
+h1{font-size:17px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.09em;color:var(--accent);margin-bottom:10px}
+button{font:inherit;cursor:pointer}
+
+.topbar{
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:12px 20px;padding-top:calc(12px + env(safe-area-inset-top,0px));
+  background:var(--panel);border-bottom:1px solid var(--line);
+}
+.topbar .sp{flex:1 1 auto}
+.pill{font-size:12px;color:var(--muted);background:var(--sunk);border-radius:20px;padding:3px 11px}
+.btn{
+  border:1px solid var(--line);background:var(--surface);color:var(--ink);
+  border-radius:6px;padding:7px 15px;font-weight:550;
+}
+.btn:hover:not(:disabled){border-color:var(--accent)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover:not(:disabled){background:var(--accent-deep)}
+.btn.danger{color:var(--error);border-color:var(--line)}
+
+.layout{display:grid;grid-template-columns:330px minmax(0,1fr);gap:0;min-height:calc(100% - 54px)}
+@media (max-width:860px){.layout{grid-template-columns:1fr}}
+
+.side{background:var(--panel);border-right:1px solid var(--line);padding:18px 20px 40px;overflow-y:auto}
+.main{padding:18px 20px 48px;min-width:0}
+@media (max-width:860px){.side{border-right:none;border-bottom:1px solid var(--line)}}
+
+fieldset{border:none;margin:0 0 20px;padding:0}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:9px}
+.row.one{grid-template-columns:1fr}
+label{display:block;font-size:11.5px;color:var(--faint);margin-bottom:3px;letter-spacing:.02em}
+input,select{
+  width:100%;font:inherit;font-size:13.5px;padding:6px 9px;color:var(--ink);
+  background:#fff;border:1px solid var(--line);border-radius:5px;
+}
+input:focus,select:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+.check{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--muted);margin-bottom:9px}
+.check input{width:auto}
+
+.card{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:16px 18px;margin-bottom:16px}
+.status{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:13.5px;color:var(--muted)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
+.dot.running{background:var(--accent);animation:pulse 1.1s ease-in-out infinite}
+.dot.done{background:var(--accent)}
+.dot.error{background:var(--error)}
+.dot.stopped{background:var(--warn)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.dot.running{animation:none}}
+.bar{height:5px;background:var(--sunk);border-radius:3px;overflow:hidden;margin-top:11px}
+.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(122px,1fr));gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:16px}
+.stat{background:var(--surface);padding:11px 14px}
+.stat .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
+.stat .v{font-size:19px;font-weight:650;font-variant-numeric:tabular-nums;margin-top:2px}
+.stat .v small{font-size:12px;font-weight:400;color:var(--muted)}
+
+.err{background:#FBEAE8;border:1px solid #E4B9B4;color:var(--error);border-radius:8px;
+  padding:12px 15px;margin-bottom:16px;font-size:13.5px}
+.tabs{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}
+.tab{border:1px solid var(--line);background:var(--panel);border-radius:5px;padding:4px 11px;font-size:12.5px;color:var(--muted)}
+.tab[aria-selected="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:550}
+figure{margin:0;background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden;min-height:120px}
+figure img{display:block;width:100%;height:auto}
+.empty{color:var(--faint);font-size:13px;padding:34px 16px;text-align:center}
+svg.chart{display:block;width:100%;height:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin:8px 0 0}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.hint{font-size:12px;color:var(--faint);margin-top:6px}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>Aero CFD</h1>
+  <span class="pill mono" id="setupPill">no run yet</span>
+  <span class="sp"></span>
+  <button class="btn primary" id="runBtn">Run</button>
+  <button class="btn danger" id="stopBtn" disabled>Stop</button>
+</div>
+
+<div class="layout">
+  <aside class="side">
+    <fieldset>
+      <h2>Case</h2>
+      <div class="row">
+        <div><label for="mode">Mode</label>
+          <select id="mode"><option value="2d">2D</option><option value="3d">3D</option></select></div>
+        <div><label for="shape">Shape</label><select id="shape"></select></div>
+      </div>
+      <div class="row" id="dimRow"></div>
+      <div class="row">
+        <div><label for="re">Reynolds number</label><input id="re" type="number" value="100" min="0.1" step="10"></div>
+        <div><label for="u0">Inlet u₀</label><input id="u0" type="number" value="0.05" min="0.001" max="0.2" step="0.01"></div>
+      </div>
+      <div class="row" id="gridRow"></div>
+      <div class="row one">
+        <div><label for="steps">Steps</label><input id="steps" type="number" value="3000" min="50" step="500"></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <h2>Solver</h2>
+      <div class="row">
+        <div><label for="collision">Collision</label><select id="collision"></select></div>
+        <div><label for="backend">Backend</label><select id="backend"></select></div>
+      </div>
+      <div class="row" id="latticeRow" hidden>
+        <div><label for="lattice">Lattice</label><select id="lattice"></select></div>
+        <div></div>
+      </div>
+      <div class="row">
+        <div><label for="wall_bc">Wall BC</label><select id="wall_bc"></select></div>
+        <div><label for="outlet_bc">Outlet BC</label><select id="outlet_bc"></select></div>
+      </div>
+      <div class="check"><input type="checkbox" id="les"><label for="les" style="margin:0">Smagorinsky LES</label></div>
+      <div class="row one">
+        <div><label for="inlet_perturbation">Inlet perturbation (fraction of u₀)</label>
+          <input id="inlet_perturbation" type="number" value="0.02" min="0" max="0.5" step="0.01"></div>
+      </div>
+      <p class="hint">A small perturbation is what trips vortex shedding above Re ≈ 47.</p>
+    </fieldset>
+  </aside>
+
+  <main class="main">
+    <div class="card">
+      <div class="status">
+        <span class="dot" id="dot"></span>
+        <span id="statusText">Set a case and press Run.</span>
+        <span class="sp" style="flex:1"></span>
+        <span class="mono" id="elapsed" style="font-size:12.5px"></span>
+      </div>
+      <div class="bar"><i id="bar"></i></div>
+    </div>
+
+    <div id="errBox" hidden class="err"></div>
+
+    <div class="stats" id="stats" hidden></div>
+
+    <div class="card">
+      <h2>Convergence</h2>
+      <svg class="chart" id="chart" viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet" role="img"
+           aria-label="Drag and lift coefficient against step"></svg>
+      <p class="legend"><span><i style="background:var(--cd)"></i>C<sub>d</sub></span>
+        <span><i style="background:var(--cl)"></i>C<sub>l</sub></span></p>
+    </div>
+
+    <div class="card">
+      <h2>Flow field</h2>
+      <div class="tabs" id="tabs">
+        <button class="tab" data-f="speed" aria-selected="true">Velocity</button>
+        <button class="tab" data-f="vorticity" aria-selected="false">Vorticity</button>
+        <button class="tab" data-f="pressure" aria-selected="false">Pressure</button>
+      </div>
+      <figure id="fig"><div class="empty">The field appears here as the run progresses.</div></figure>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let schema = null, jobId = null, poll = null, field = "speed";
+
+const DIMS = {
+  "2d:cylinder":   [["radius","Radius",20]],
+  "2d:rectangle":  [["width","Width",40],["height","Height",20]],
+  "3d:sphere":     [["radius","Radius",7]],
+  "3d:box":        [["width","Width",10],["height","Height",10],["depth","Depth",10]],
+  "3d:cylinder":   [["radius","Radius",8],["length","Span length",24]],
+};
+const GRIDS = {"2d":[["nx","Nx",400],["ny","Ny",200]],
+               "3d":[["nx","Nx",96],["ny","Ny",48],["nz","Nz",48]]};
+
+function fill(sel, items){ sel.innerHTML = items.map(v=>`<option value="${v}">${v}</option>`).join(""); }
+function inputs(host, defs){
+  host.innerHTML = defs.map(([id,lab,val]) =>
+    `<div><label for="${id}">${lab}</label><input id="${id}" type="number" value="${val}" step="1" min="1"></div>`
+  ).join("");
+}
+function syncShape(){
+  const mode = $("#mode").value;
+  fill($("#shape"), mode === "2d" ? schema.shapes_2d : schema.shapes_3d);
+  $("#latticeRow").hidden = mode !== "3d";
+  inputs($("#gridRow"), GRIDS[mode]);
+  syncDims();
+}
+function syncDims(){
+  const key = $("#mode").value + ":" + $("#shape").value;
+  inputs($("#dimRow"), DIMS[key] || []);
+}
+function params(){
+  const p = {};
+  document.querySelectorAll("input,select").forEach(el=>{
+    if(!el.id) return;
+    p[el.id] = el.type === "checkbox" ? el.checked : el.value;
+  });
+  p.field = field;
+  return p;
+}
+
+// Reattach to a run from the URL fragment, so closing the tab mid-solve
+// does not lose it — reopen localhost:8017/#<id> and the run is still there.
+function attach(id){
+  jobId = id;
+  location.hash = id;
+  $("#runBtn").disabled = true; $("#stopBtn").disabled = false;
+  clearInterval(poll); poll = setInterval(tick, 700); tick();
+}
+
+async function boot(){
+  schema = await (await fetch("/api/schema")).json();
+  fill($("#collision"), schema.collisions);
+  fill($("#backend"),   schema.backends);
+  fill($("#lattice"),   schema.lattices);
+  fill($("#wall_bc"),   schema.wall_bcs);
+  fill($("#outlet_bc"), schema.outlet_bcs);
+  syncShape();
+  $("#mode").addEventListener("change", syncShape);
+  $("#shape").addEventListener("change", syncDims);
+
+  const fromUrl = location.hash.replace(/^#/, "").trim();
+  if(/^[a-f0-9]{6,32}$/.test(fromUrl)){
+    const probe = await fetch(`/api/status?id=${fromUrl}`);
+    if(probe.ok) attach(fromUrl);
+  }
+}
+
+$("#runBtn").addEventListener("click", async () => {
+  $("#errBox").hidden = true;
+  $("#runBtn").disabled = true; $("#stopBtn").disabled = false;
+  $("#stats").hidden = true;
+  $("#fig").innerHTML = '<div class="empty">rendering…</div>';
+  formSynced = true;   // the form is already the source of truth for this run
+  const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"},
+                                     body: JSON.stringify(params())});
+  attach((await r.json()).id);
+});
+
+$("#stopBtn").addEventListener("click", async () => {
+  if(!jobId) return;
+  await fetch("/api/stop", {method:"POST", headers:{"Content-Type":"application/json"},
+                            body: JSON.stringify({id: jobId})});
+});
+
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-selected", String(x === t)));
+  field = t.dataset.f;
+  if(jobId) showFigure(true);
+}));
+
+function showFigure(force){
+  const name = (lastState === "done" || lastState === "stopped") ? field : "preview";
+  const url = `/api/figure?id=${jobId}&name=${name}&t=${force ? Date.now() : figStamp}`;
+  const img = new Image();
+  img.alt = "Flow field";
+  img.onload = () => { $("#fig").innerHTML = ""; $("#fig").appendChild(img); };
+  img.onerror = () => {};
+  img.src = url;
+}
+
+let lastState = "", figStamp = 0, formSynced = false;
+async function tick(){
+  if(!jobId) return;
+  let j;
+  try { j = await (await fetch(`/api/status?id=${jobId}`)).json(); }
+  catch(e){ return; }
+  if(j.error){ return; }
+
+  lastState = j.state;
+  $("#dot").className = "dot " + j.state;
+  $("#statusText").textContent = j.message || j.state;
+  $("#elapsed").textContent = j.elapsed ? j.elapsed.toFixed(1) + " s" : "";
+  $("#bar").style.width = j.total ? (100 * j.step / j.total).toFixed(1) + "%" : "0%";
+
+  // On reattach the form still holds its defaults, which would contradict the
+  // run actually being shown. Fill it from the job's own parameters, once.
+  if(!formSynced && j.params){
+    formSynced = true;
+    $("#mode").value = j.params.mode || "2d"; syncShape();
+    if(j.params.shape){ $("#shape").value = j.params.shape; syncDims(); }
+    Object.entries(j.params).forEach(([k, v]) => {
+      const el = document.getElementById(k);
+      if(!el || k === "mode" || k === "shape") return;
+      if(el.type === "checkbox") el.checked = !!v; else el.value = v;
+    });
+  }
+
+  const s = j.result.setup;
+  if(s) $("#setupPill").textContent =
+    `${s.label} · ${s.grid.join("×")} · ω=${s.omega} · ν=${s.nu}`;
+
+  if(j.error || j.state === "error"){
+    $("#errBox").hidden = false;
+    $("#errBox").textContent = j.error || "the run failed";
+  }
+  drawChart(j.history);
+
+  const c = j.result.coefficients;
+  if(c){
+    $("#stats").hidden = false;
+    $("#stats").innerHTML = `
+      <div class="stat"><div class="k">C_d</div><div class="v">${c.cd.toFixed(4)}<small> ±${c.cd_std.toFixed(4)}</small></div></div>
+      <div class="stat"><div class="k">C_l</div><div class="v">${c.cl.toFixed(4)}<small> ±${c.cl_std.toFixed(4)}</small></div></div>
+      <div class="stat"><div class="k">Steps</div><div class="v">${j.step.toLocaleString()}</div></div>
+      <div class="stat"><div class="k">Wall clock</div><div class="v">${j.elapsed.toFixed(1)}<small> s</small></div></div>
+      <div class="stat"><div class="k">Cells</div><div class="v">${(s ? s.cells : 0).toLocaleString()}</div></div>`;
+  }
+
+  if(j.has_preview && (j.step !== figStamp || j.state === "done")){
+    figStamp = j.step; showFigure(false);
+  }
+
+  if(["done","error","stopped"].includes(j.state)){
+    clearInterval(poll); poll = null;
+    $("#runBtn").disabled = false; $("#stopBtn").disabled = true;
+  }
+}
+
+function drawChart(hist){
+  const svg = $("#chart"), W = 720, H = 240, L = 54, R = 14, T = 12, B = 30;
+  if(!hist || hist.length < 2){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="#6E7A66" font-size="13">no samples yet</text>`;
+    return;
+  }
+  const xs = hist.map(d=>d.step);
+  const all = hist.flatMap(d=>[d.cd, d.cl]).filter(Number.isFinite);
+  let lo = Math.min(...all), hi = Math.max(...all);
+  if(hi - lo < 1e-9){ hi += 0.5; lo -= 0.5; }
+  const pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
+  const X = v => L + (W-L-R) * (v - xs[0]) / Math.max(xs[xs.length-1] - xs[0], 1);
+  const Y = v => T + (H-T-B) * (1 - (v - lo) / (hi - lo));
+  const path = k => hist.filter(d=>Number.isFinite(d[k]))
+    .map((d,i)=>`${i?"L":"M"}${X(d.step).toFixed(1)} ${Y(d[k]).toFixed(1)}`).join(" ");
+
+  let g = "";
+  for(let i=0;i<=4;i++){
+    const v = lo + (hi-lo)*i/4, y = Y(v);
+    g += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}" stroke="#DED5BC" stroke-width="1"/>`
+       + `<text x="${L-8}" y="${(y+4).toFixed(1)}" text-anchor="end" font-size="10.5" fill="#6E7A66"
+          font-family="ui-monospace,monospace">${v.toFixed(2)}</text>`;
+  }
+  for(let i=0;i<=3;i++){
+    const v = xs[0] + (xs[xs.length-1]-xs[0])*i/3, x = X(v);
+    g += `<text x="${x.toFixed(1)}" y="${H-10}" text-anchor="middle" font-size="10.5" fill="#6E7A66"
+          font-family="ui-monospace,monospace">${Math.round(v).toLocaleString()}</text>`;
+  }
+  svg.innerHTML = g
+    + `<path d="${path("cl")}" fill="none" stroke="#5B21B6" stroke-width="1.6"/>`
+    + `<path d="${path("cd")}" fill="none" stroke="#127A38" stroke-width="2"/>`;
+}
+
+boot();
+drawChart([]);
+</script>
+</body>
+</html>

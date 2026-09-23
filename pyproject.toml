@@ -37,6 +37,7 @@ mpi = [
 [project.scripts]
 aero = "cli:main"
 aero-gui = "gui:main"
+aero-web = "webui:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
