@@ -115,6 +115,19 @@ class MPISolver3D:
         # Nz for inner solver includes 2 ghost layers
         Nz_inner = self._Nz_local + 2
 
+        # Every rank must normalise its forces by the *global* frontal area.
+        # reduce_forces() sums per-rank coefficients, which is only exact when
+        # the denominators agree; a rank left to measure the area from its own
+        # slab sees a partial body (or none at all and falls back to D^2), and
+        # the decomposed run drifts from the serial one by whatever fraction of
+        # the body it happens to hold.
+        from ..forces3d import projected_frontal_area
+        solver_kw = dict(solver_kw)
+        if solver_kw.get("ref_area") is None:
+            area = projected_frontal_area(np.asarray(solid_global, dtype=bool))
+            if area > 0.0:
+                solver_kw["ref_area"] = area
+
         # x and y are replicated, so every rank keeps the caller's streamwise
         # and wall BCs.  Overriding them here would silently turn an open wind
         # tunnel into a streamwise-periodic duct with no inlet and no outlet.
