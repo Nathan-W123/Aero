@@ -89,8 +89,8 @@ def test_sphere_re20_cd_literature_band():
     3D sphere Re=20 against Schiller-Naumann, confinement included.
 
     r=7 in a 48-cell tunnel is 29% blockage, which inflates drag by ~32% (a
-    measured sweep: +32.0% at 29%, +15.2% at 15%, extrapolating to within 2%
-    of the correlation at zero blockage).  The band is the corrected value
+    measured sweep: +32.0% at 29%, +15.2% at 15%, +12.9% at 10%, with a
+    zero-blockage intercept of +1.9% against the correlation).  The band is the corrected value
     +/-15%, so this is a real check rather than the 0.6x-2.5x envelope it used
     to be -- that envelope had been hiding a pi/4 normalisation error.
     """

@@ -66,10 +66,14 @@ def schiller_naumann_cd(re: float) -> float:
 
 #: Drag inflation per unit blockage for a sphere in this tunnel (slip walls in
 #: y, periodic in z -- effectively a square array of spheres).  Measured at
-#: Re=20 with the frontal-area normalisation in place: +32.0% at 29.2%
-#: blockage and +15.2% at 14.6%, i.e. excess ~ 1.1 x (D / span).  It is a
-#: calibration, not a law: it weakens somewhat with Re, so the bands below
-#: keep a +/-15% allowance around it.
+#: Re=20 (r = 7) with the frontal-area normalisation in place: +32.0% at 29.2%
+#: blockage, +15.2% at 14.6% and +12.9% at 9.7%.  A straight line through
+#: those has slope 1.02 and a zero-blockage intercept of +1.9%, which is the
+#: solver's residual against the correlation for a 14-cell sphere -- the
+#: actual validation figure.  The slope is rounded up to 1.1 so the band sits
+#: slightly high, where a coarse body tends to land.  It is a calibration,
+#: not a law: it weakens somewhat with Re, so the bands below keep a +/-15%
+#: allowance around it.
 SPHERE_CONFINEMENT_SLOPE = 1.1
 
 

@@ -199,7 +199,7 @@ def test_sphere_band_contains_the_measured_sweep_points():
     allowance, these have to keep passing.
     """
     from aero.benchmarks import assess_literature
-    for blockage, cd in ((14 / 48, 3.4456), (14 / 96, 3.0063)):
+    for blockage, cd in ((14 / 48, 3.4456), (14 / 96, 3.0063), (14 / 144, 2.9457)):
         status, msg = assess_literature(mode="3d", shape="sphere", re=20.0, cd=cd, blockage=blockage)
         assert status == "pass", msg
 
