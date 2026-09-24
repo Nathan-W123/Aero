@@ -64,8 +64,52 @@ def schiller_naumann_cd(re: float) -> float:
     return (24.0 / re) * (1.0 + 0.15 * (re ** 0.687))
 
 
-def literature_cd_range(mode: str, shape: str, re: float) -> Optional[Tuple[float, float, str]]:
-    """Return (cd_min, cd_max, reference_note) if a literature band exists."""
+#: Drag inflation per unit blockage for a sphere in this tunnel (slip walls in
+#: y, periodic in z -- effectively a square array of spheres).  Measured at
+#: Re=20 with the frontal-area normalisation in place: +32.0% at 29.2%
+#: blockage and +15.2% at 14.6%, i.e. excess ~ 1.1 x (D / span).  It is a
+#: calibration, not a law: it weakens somewhat with Re, so the bands below
+#: keep a +/-15% allowance around it.
+SPHERE_CONFINEMENT_SLOPE = 1.1
+
+
+def sphere_confinement_factor(blockage: Optional[float]) -> float:
+    """Multiplier on the unconfined sphere Cd for a given frontal blockage."""
+    if blockage is None:
+        return 1.0
+    return 1.0 + SPHERE_CONFINEMENT_SLOPE * max(float(blockage), 0.0)
+
+
+def sphere_expected_cd(re: float, blockage: Optional[float] = None) -> Tuple[float, float, str]:
+    """
+    (unconfined Cd, confined estimate, one-line note) for a sphere.
+
+    The unconfined value is Schiller-Naumann; the confined one applies the
+    measured blockage inflation.  Compare a run against the *confined* number
+    unless the tunnel is wide enough (blockage under ~5%) for the two to agree.
+    """
+    sn = schiller_naumann_cd(re)
+    if blockage is None:
+        return sn, sn, f"Schiller-Naumann Cd={sn:.2f} at Re={re:g} (unconfined; blockage unknown)"
+    conf = sn * sphere_confinement_factor(blockage)
+    return sn, conf, (
+        f"Schiller-Naumann Cd={sn:.2f} at Re={re:g}, x{sphere_confinement_factor(blockage):.2f} "
+        f"for {blockage*100:.0f}% blockage -> expect ~{conf:.2f}"
+    )
+
+
+def literature_cd_range(
+    mode: str, shape: str, re: float, blockage: Optional[float] = None
+) -> Optional[Tuple[float, float, str]]:
+    """
+    Return (cd_min, cd_max, reference_note) if a literature band exists.
+
+    For the sphere the band is the confinement-corrected Schiller-Naumann value
+    +/-15% when the blockage is known, and a wide envelope (covering blockage
+    up to ~45%) when it is not.  Before the frontal-area fix the sphere bands
+    were tuned around coefficients that read pi/4 low, which is why they
+    looked so generous.
+    """
     shape = shape.lower()
     mode = mode.lower()
     re = float(re)
@@ -77,16 +121,11 @@ def literature_cd_range(mode: str, shape: str, re: float) -> Optional[Tuple[floa
             "2D cylinder Re≈100 with ~20% blockage (Tritton/Fornberg + confinement)",
         )
 
-    if mode == "3d" and shape == "sphere":
-        if abs(re - 20.0) < 3.0:
-            cd_ref = schiller_naumann_cd(re)
-            return (
-                max(0.5, cd_ref * 0.6),
-                cd_ref * 2.5,
-                f"Sphere Re≈20 — Schiller–Naumann Cd≈{cd_ref:.2f} (confinement widens band)",
-            )
-        if abs(re - 100.0) < 10.0:
-            return (0.85, 1.25, "Sphere Re≈100 — literature Cd≈1.0 (confined tunnel)")
+    if mode == "3d" and shape == "sphere" and re <= 300.0:
+        sn, conf, note = sphere_expected_cd(re, blockage)
+        if blockage is None:
+            return (sn * 0.85, sn * 1.6, note + "; band spans blockage up to ~45%")
+        return (conf * 0.85, conf * 1.15, note)
 
     if mode == "3d" and shape == "box" and re <= 150.0:
         return (0.8, 3.5, "Box Re≤150 — qualitative band (geometry-dependent)")
@@ -100,11 +139,12 @@ def assess_literature(
     shape: str,
     re: float,
     cd: Optional[float],
+    blockage: Optional[float] = None,
 ) -> Tuple[str, str]:
     if cd is None or math.isnan(cd):
         return "fail", "Cd unavailable — simulation may have diverged."
 
-    band = literature_cd_range(mode, shape, re)
+    band = literature_cd_range(mode, shape, re, blockage)
     if band is None:
         return "n/a", "No literature benchmark configured for this case."
 
@@ -312,13 +352,14 @@ def build_validation_report(
     params: Dict[str, str],
     cd: Optional[float] = None,
     grid_cd_values: Optional[List[float]] = None,
+    blockage: Optional[float] = None,
 ) -> ValidationReport:
     re = float(params.get("re", "100"))
     u0 = float(params.get("u0", "0.05"))
     d = reference_length_cells(mode, shape, params)
     tau = derive_tau(re, u0, d)
 
-    b_status, b_msg = assess_literature(mode=mode, shape=shape, re=re, cd=cd)
+    b_status, b_msg = assess_literature(mode=mode, shape=shape, re=re, cd=cd, blockage=blockage)
     if grid_cd_values:
         g_status, g_msg = assess_grid_convergence(grid_cd_values)
     else:

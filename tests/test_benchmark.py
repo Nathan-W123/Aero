@@ -85,13 +85,23 @@ def test_cylinder_vortex_shedding_cl_oscillation():
 
 @pytest.mark.slow
 def test_sphere_re20_cd_literature_band():
-    """3D sphere Re=20 — Cd within Schiller–Naumann-informed band."""
+    """
+    3D sphere Re=20 against Schiller-Naumann, confinement included.
+
+    r=7 in a 48-cell tunnel is 29% blockage, which inflates drag by ~32% (a
+    measured sweep: +32.0% at 29%, +15.2% at 15%, extrapolating to within 2%
+    of the correlation at zero blockage).  The band is the corrected value
+    +/-15%, so this is a real check rather than the 0.6x-2.5x envelope it used
+    to be -- that envelope had been hiding a pi/4 normalisation error.
+    """
     solver = make_sphere_solver3d(re=20.0)
     result = solver.run(steps=3000, check_every=1000, verbose=True)
     cd = result["Cd_mean"]
     ref = schiller_naumann_cd(20.0)
-    print(f"\n[benchmark] sphere Re=20 Cd={cd:.4f}  (Schiller–Naumann ≈ {ref:.2f})")
-    status, msg = assess_literature(mode="3d", shape="sphere", re=20.0, cd=cd)
+    blockage = 14.0 / 48.0
+    print(f"\n[benchmark] sphere Re=20 Cd={cd:.4f}  (Schiller–Naumann ≈ {ref:.2f}, "
+          f"x1.32 at 29% blockage ≈ {ref*1.32:.2f})")
+    status, msg = assess_literature(mode="3d", shape="sphere", re=20.0, cd=cd, blockage=blockage)
     assert not np.isnan(cd)
     assert status in {"pass", "warn"}, msg
 

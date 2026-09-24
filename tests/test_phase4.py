@@ -457,8 +457,8 @@ class TestSphereValidation:
     Re=100 requires tau=0.53 (below the ~0.55 stability floor for 3D at finite
     blockage).  Re=20 gives tau=0.65 — comfortably stable.
 
-    Expected Cd for sphere at Re=20 ≈ 2–4 (Schiller-Naumann correlation: ~2.4).
-    Grid blockage = D/Ny = 14/48 ≈ 29 %; inflates Cd somewhat.
+    Schiller-Naumann gives Cd ≈ 2.61 at Re=20 unconfined.  Grid blockage is
+    D/Ny = 14/48 ≈ 29 %, which inflates it by ~32 % (measured), so ≈ 3.45 here.
     """
 
     def test_sphere_cd_range(self):
@@ -481,6 +481,6 @@ class TestSphereValidation:
         result = solver.run(steps=5000, check_every=1000, verbose=True)
 
         Cd = result["Cd_mean"]
-        print(f"\nSphere Re=20 Cd = {Cd:.4f}  (expected ≈ 2–5 with 29% blockage)")
+        print(f"\nSphere Re=20 Cd = {Cd:.4f}  (expected ≈ 3.45: Schiller-Naumann 2.61 x 1.32 at 29% blockage)")
         assert not np.isnan(Cd), "Cd is NaN — simulation diverged"
         assert 0.5 <= Cd <= 10.0, f"Cd={Cd:.4f} outside plausible 0.5–10 range"

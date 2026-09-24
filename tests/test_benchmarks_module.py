@@ -179,3 +179,48 @@ def test_run_scalar_diffusion_benchmark_2d_returns_validation():
     assert result["scalar"] is not None
     assert result["scalar_validation"]["status"] in {"pass", "warn"}
     assert result["scalar_validation"]["rmse"] < 0.08
+
+
+
+# ---------------------------------------------------------------------------
+# Sphere confinement band
+# ---------------------------------------------------------------------------
+
+def test_sphere_band_is_unconfined_at_zero_blockage():
+    from aero.benchmarks import sphere_expected_cd, schiller_naumann_cd
+    sn, conf, _ = sphere_expected_cd(20.0, 0.0)
+    assert sn == conf == schiller_naumann_cd(20.0)
+
+
+def test_sphere_band_contains_the_measured_sweep_points():
+    """
+    The two confinement measurements the slope was calibrated on, with the
+    frontal-area normalisation in place.  If someone retunes the slope or the
+    allowance, these have to keep passing.
+    """
+    from aero.benchmarks import assess_literature
+    for blockage, cd in ((14 / 48, 3.4456), (14 / 96, 3.0063)):
+        status, msg = assess_literature(mode="3d", shape="sphere", re=20.0, cd=cd, blockage=blockage)
+        assert status == "pass", msg
+
+
+def test_sphere_band_without_blockage_is_a_wide_envelope():
+    from aero.benchmarks import literature_cd_range, schiller_naumann_cd
+    lo, hi, note = literature_cd_range("3d", "sphere", 20.0)
+    sn = schiller_naumann_cd(20.0)
+    assert lo == pytest.approx(0.85 * sn) and hi == pytest.approx(1.6 * sn)
+    assert "blockage" in note
+
+
+def test_sphere_band_at_re100_accepts_a_ten_percent_blockage_run():
+    """A 192^3 sphere, r=10, read 1.18 once normalised correctly."""
+    from aero.benchmarks import assess_literature
+    status, msg = assess_literature(mode="3d", shape="sphere", re=100.0, cd=1.182, blockage=20 / 192)
+    assert status == "pass", msg
+
+
+def test_the_old_d_squared_number_now_fails_the_sharp_band():
+    """0.928 was the same run before the fix; it must no longer look right."""
+    from aero.benchmarks import assess_literature
+    status, _ = assess_literature(mode="3d", shape="sphere", re=100.0, cd=0.928, blockage=20 / 192)
+    assert status != "pass"

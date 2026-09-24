@@ -22,7 +22,7 @@ from typing import Tuple
 from aero.geometry3d.sphere import Sphere
 from aero.geometry3d.box import Box
 from aero.geometry3d.cylinder3d import Cylinder3D
-from aero.benchmarks import build_uncertainty_report, build_validation_report
+from aero.benchmarks import build_uncertainty_report, build_validation_report, sphere_expected_cd
 from aero.autoconfig import autoconfigure_3d
 from aero.lbm.solver3d import Solver3D
 from aero.case import SimulationCase
@@ -569,10 +569,8 @@ def main() -> int:
             f"range [{scalar_stats['min']:.4f}, {scalar_stats['max']:.4f}]"
         )
     if args.shape == "sphere":
-        if abs(args.re - 20.0) < 1e-12:
-            print(f"  Expected Cd  ≈ 2–5  (sphere Re=20; confinement can inflate drag)")
-        elif abs(args.re - 100.0) < 1e-12:
-            print(f"  Expected Cd  ≈ 1.0–1.1  (sphere Re=100, literature)")
+        _sn, _conf, _note = sphere_expected_cd(args.re, blockage)
+        print(f"  Expected Cd  ≈ {_conf:.2f}  ({_note})")
     print()
 
     if case is not None:
@@ -601,6 +599,7 @@ def main() -> int:
         params=vars(args),
         cd=result.get("Cd_mean"),
         grid_cd_values=result.get("grid_cd_values"),
+        blockage=blockage,
     )
     uncertainty = build_uncertainty_report(
         mode="3d",
