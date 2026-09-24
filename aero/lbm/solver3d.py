@@ -166,12 +166,19 @@ class Solver3D:
         self.u0 = u0
         self.D = D
         self.rho0 = rho0
-        self.ref_area = (
-            float(ref_area) if ref_area is not None
-            else projected_frontal_area(np.asarray(solid, dtype=bool))
-        )
+        if ref_area is not None:
+            self.ref_area = float(ref_area)
+        else:
+            self.ref_area = projected_frontal_area(np.asarray(solid, dtype=bool))
+            if self.ref_area <= 0.0:
+                # No body at all (a channel, a shear-wave box, a decomposition
+                # slab that happens to miss the obstacle).  There is nothing
+                # to normalise a force by, and nothing to compute one on, so
+                # keep the coefficients finite with the old D^2 convention
+                # rather than refusing to run.
+                self.ref_area = float(D) * float(D)
         if self.ref_area <= 0.0:
-            raise ValueError("ref_area must be positive (is the body empty?)")
+            raise ValueError("ref_area must be positive")
         self.wall_bc = wall_bc
         self.inlet_bc = inlet_bc
         self.outlet_bc = outlet_bc

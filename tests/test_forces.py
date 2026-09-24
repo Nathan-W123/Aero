@@ -246,3 +246,18 @@ def test_solver3d_normalises_by_the_frontal_area():
     # the analytic-area coefficient is the measured-area one rescaled by the
     # (voxel / exact) area ratio, and nothing else
     assert rb["Cd_mean"] == pytest.approx(ra["Cd_mean"] * a.ref_area / (math.pi * r * r), rel=1e-9)
+
+
+def test_solver3d_accepts_a_domain_with_no_body():
+    """
+    Channels, shear-wave boxes and decomposition slabs have nothing to
+    measure a frontal area from.  The first version of the area guard raised
+    here and took 28 tests down with it; the fallback is the old D^2
+    convention, since there is no force to normalise anyway.
+    """
+    from aero.lbm.solver3d import Solver3D
+    s = Solver3D(Nz=4, Ny=8, Nx=8, solid=np.zeros((4, 8, 8), dtype=bool),
+                 omega=1.5, u0=0.05, D=8.0, backend="numpy")
+    assert s.ref_area == 64.0
+    r = s.run(steps=5, check_every=10 ** 9, verbose=False)
+    assert np.isfinite(r["Cd_mean"])
