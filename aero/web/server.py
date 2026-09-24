@@ -241,7 +241,7 @@ def _build_solver(p: Dict[str, Any]):
     if lattice != "d3q19" and common["collision"] == "mrt":
         raise ValueError("MRT is implemented for D3Q19 only — pick another collision operator.")
     return Solver3D(Nz=nz, Ny=ny, Nx=nx, solid=solid, omega=omega, D=D,
-                    lattice=lattice, **common), label
+                    lattice=lattice, ref_area=geom.reference_area(), **common), label
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +395,8 @@ def _run_job(job: Job) -> None:
             "grid": (list(solver.solid.shape)),
             "cells": int(np.prod(solver.solid.shape)),
             "solid_cells": int(solver.solid.sum()),
+            # frontal area the coefficients are normalised by; 3D only
+            "ref_area": _num(getattr(solver, "ref_area", None), 2),
         }
 
         job.geometry = _geometry_payload(solver.solid)

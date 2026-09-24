@@ -48,6 +48,9 @@ class Cylinder3D(Geometry3D):
     def reference_length(self) -> float:
         return 2.0 * self.radius
 
+    def reference_area(self) -> float:
+        return float(2.0 * self.radius * self.length)   # diameter x span
+
     def sdf_field(self, Nz: int, Ny: int, Nx: int) -> Optional[np.ndarray]:
         cx, cy, cz = self.center(Nz, Ny, Nx)
         x = np.arange(Nx, dtype=np.float64) + 0.5

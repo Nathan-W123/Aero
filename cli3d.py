@@ -334,14 +334,19 @@ def main() -> int:
             solid = phi_field <= 0.0
         D = geom.reference_length()
         mesh_blockage_tuple = compute_frontal_blockage(solid)
+        ref_area = None                      # measured from the voxelised mesh
     elif args.shape == "sphere":
         D = 2.0 * args.radius
+        ref_area = math.pi * args.radius ** 2
     elif args.shape == "box":
         D = args.height
+        ref_area = args.height * args.depth
     elif args.shape == "cylinder":
         D = 2.0 * args.radius
+        ref_area = 2.0 * args.radius * args.length
     else:
         D = args.ny * 0.2
+        ref_area = None
 
     nu_lbm = args.u0 * D / args.re if args.re > 0 else 0.02
     tau    = 3.0 * nu_lbm + 0.5
@@ -382,6 +387,8 @@ def main() -> int:
     print(f"  Re        : {args.re:.2f}")
     print(f"  u0_lbm    : {args.u0:.5f}")
     print(f"  D (ref L) : {D:.1f} cells")
+    _area_print = ref_area if ref_area is not None else float(solid.any(axis=2).sum())
+    print(f"  Ref area  : {_area_print:.1f} cells^2  (frontal; coefficients use 1/2 rho u0^2 A)")
     print(f"  nu_lbm    : {nu_lbm:.6f}")
     print(f"  tau       : {tau:.6f}")
     print(f"  omega     : {omega:.6f}")
@@ -460,6 +467,7 @@ def main() -> int:
         backend=args.backend,
         collision=args.collision,
         lattice=args.lattice,
+        ref_area=ref_area,
         inlet_perturbation=args.inlet_perturbation,
         trt_lambda=args.trt_lambda,
         sponge_thickness=args.sponge_cells,

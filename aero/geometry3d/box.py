@@ -50,6 +50,9 @@ class Box(Geometry3D):
     def reference_length(self) -> float:
         return self.height  # cross-stream dimension
 
+    def reference_area(self) -> float:
+        return float(self.height * self.depth)   # the face the flow meets
+
     def sdf_field(self, Nz: int, Ny: int, Nx: int) -> Optional[np.ndarray]:
         cx, cy, cz = self.center(Nz, Ny, Nx)
         x = np.arange(Nx, dtype=np.float64) + 0.5

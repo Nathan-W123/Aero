@@ -39,6 +39,9 @@ class Sphere(Geometry3D):
     def center(self, Nz: int, Ny: int, Nx: int) -> Tuple[float, float, float]:
         return self.cx_frac * Nx, self.cy_frac * Ny, self.cz_frac * Nz
 
+    def reference_area(self) -> float:
+        return float(np.pi * self.radius * self.radius)
+
     def reference_length(self) -> float:
         return 2.0 * self.radius  # diameter
 

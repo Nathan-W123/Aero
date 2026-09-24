@@ -189,3 +189,60 @@ def test_surface_diagnostics_handles_an_empty_link_table():
     )
     assert diag["fx"] == 0.0 and diag["mz"] == 0.0
     assert diag["profile"]["fx"] == [0.0] * 6
+
+
+# ---------------------------------------------------------------------------
+# Reference area — the sphere normalisation bug
+# ---------------------------------------------------------------------------
+
+def test_sphere_reference_area_is_pi_r_squared():
+    """
+    A sphere's frontal area is pi r^2, not D^2.  The old code normalised every
+    3D coefficient by D^2, so sphere drag read pi/4 = 0.785 of its true value:
+    a 21.5% error that looked like a physics problem and was not.
+    """
+    import math
+    from aero.geometry3d.sphere import Sphere
+    from aero.geometry3d.box import Box
+    from aero.geometry3d.cylinder3d import Cylinder3D
+
+    assert Sphere(radius=10.0).reference_area() == pytest.approx(math.pi * 100.0)
+    assert Box(width=5.0, height=10.0, depth=8.0).reference_area() == 80.0
+    assert Cylinder3D(radius=4.0, length=24.0).reference_area() == 192.0
+
+
+def test_projected_area_of_a_voxel_sphere_matches_pi_r_squared():
+    """The measured default agrees with the analytic value to voxel accuracy."""
+    import math
+    from aero.forces3d import projected_frontal_area
+    from aero.geometry3d.sphere import Sphere
+
+    r = 10.0
+    solid = Sphere(radius=r, cx_frac=0.5).mark_solid(48, 48, 48)
+    area = projected_frontal_area(solid)
+    assert area == pytest.approx(math.pi * r * r, rel=0.03)
+
+
+def test_solver3d_normalises_by_the_frontal_area():
+    """
+    Same body, same force: the coefficient must scale with 1/area, and the
+    default area must be the projected one.
+    """
+    import math
+    from aero.forces3d import projected_frontal_area
+    from aero.geometry3d.sphere import Sphere
+    from aero.lbm.solver3d import Solver3D
+
+    r = 4.0
+    solid = Sphere(radius=r, cx_frac=1 / 3).mark_solid(20, 20, 40)
+    a = Solver3D(Nz=20, Ny=20, Nx=40, solid=solid, omega=1.5, u0=0.05, D=2 * r,
+                 backend="numpy")
+    assert a.ref_area == pytest.approx(projected_frontal_area(solid))
+    b = Solver3D(Nz=20, Ny=20, Nx=40, solid=solid, omega=1.5, u0=0.05, D=2 * r,
+                 backend="numpy", ref_area=math.pi * r * r)
+    ra = a.run(steps=30, check_every=10 ** 9, verbose=False)
+    rb = b.run(steps=30, check_every=10 ** 9, verbose=False)
+    assert ra["Cd_mean"] * a.ref_area == pytest.approx(rb["Cd_mean"] * b.ref_area, rel=1e-9)
+    # the analytic-area coefficient is the measured-area one rescaled by the
+    # (voxel / exact) area ratio, and nothing else
+    assert rb["Cd_mean"] == pytest.approx(ra["Cd_mean"] * a.ref_area / (math.pi * r * r), rel=1e-9)

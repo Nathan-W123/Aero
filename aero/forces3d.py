@@ -122,15 +122,40 @@ def compute_force_split_3d(
     )
 
 
+def projected_frontal_area(solid: np.ndarray) -> float:
+    """
+    Frontal area of a voxelised body: the number of (z, y) columns that hit
+    solid anywhere along the streamwise x axis.
+
+    This is the area the momentum-exchange force actually acts over, and it
+    works for any shape including an STL, so it is the solver's default
+    reference area.  For analytic bodies the geometry classes also expose the
+    exact value (pi r^2 for a sphere, h x d for a box) for comparison with
+    published coefficients; the two differ only by voxelisation, ~1-3%.
+    """
+    solid = np.asarray(solid, dtype=bool)
+    if solid.ndim != 3:
+        raise ValueError("projected_frontal_area expects a (Nz, Ny, Nx) mask")
+    return float(solid.any(axis=2).sum())
+
+
 def forces_to_coefficients_3d(
     Fx: float,
     Fy: float,
     Fz: float,
     rho0: float,
     u0: float,
-    D: float,
+    area: float,
 ) -> Tuple[float, float, float]:
-    F_dyn = 0.5 * rho0 * u0 * u0 * D * D
+    """
+    ``C = F / (1/2 rho0 u0^2 A)`` with ``A`` the frontal reference area.
+
+    ``area`` is an *area*, not a length.  An earlier version took the
+    reference length ``D`` and used ``D^2``, which is the frontal area of
+    nothing but a square box: for a sphere it under-reports every
+    coefficient by pi/4, a 21.5% error that looked like a physics problem.
+    """
+    F_dyn = 0.5 * rho0 * u0 * u0 * area
     if F_dyn == 0.0:
         return 0.0, 0.0, 0.0
     return Fx / F_dyn, Fy / F_dyn, Fz / F_dyn
@@ -145,9 +170,9 @@ def split_to_coefficients_3d(
     fz_v: float,
     rho0: float,
     u0: float,
-    D: float,
+    area: float,
 ) -> Tuple[float, float, float, float, float, float]:
-    F_dyn = 0.5 * rho0 * u0 * u0 * D * D
+    F_dyn = 0.5 * rho0 * u0 * u0 * area
     if F_dyn == 0.0:
         return (0.0,) * 6
     return (
@@ -193,9 +218,11 @@ def moments_to_coefficients_3d(
     mz: float,
     rho0: float,
     u0: float,
+    area: float,
     D: float,
 ) -> Tuple[float, float, float]:
-    denom = 0.5 * rho0 * u0 * u0 * D * D * D
+    """Moment coefficients, ``M / (1/2 rho0 u0^2 A D)``."""
+    denom = 0.5 * rho0 * u0 * u0 * area * D
     if denom == 0.0:
         return 0.0, 0.0, 0.0
     return mx / denom, my / denom, mz / denom

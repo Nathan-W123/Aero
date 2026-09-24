@@ -58,6 +58,7 @@ from ..forces3d import (
     spanwise_force_profile_3d,
     split_to_coefficients_3d,
     surface_diagnostics_3d,
+    projected_frontal_area,
 )
 from ..diagnostics import check_stability, detect_statistical_stationarity
 from ..statistics import FlowStatistics
@@ -95,6 +96,7 @@ class Solver3D:
         backend: str = "auto",
         collision: str = "bgk",
         lattice: str = "d3q19",
+        ref_area: Optional[float] = None,
         inlet_perturbation: float = 0.0,
         trt_lambda: float = 0.25,
         sponge_thickness: int = 0,
@@ -138,6 +140,11 @@ class Solver3D:
         omega       : float       — BGK relaxation rate (1/tau)
         u0          : float       — inlet velocity (lattice units)
         D           : float       — reference length (lattice cells)
+        ref_area    : float       — frontal area for the force coefficients
+                      (cells^2).  None measures it from the voxelised body,
+                      which is right for any shape; pass the analytic value
+                      (pi r^2 for a sphere) to match published coefficients
+                      exactly.
         rho0        : float       — reference density
         wall_bc     : "slip" | "noslip"
         inlet_bc    : "velocity"  (only option in Phase 4)
@@ -159,6 +166,12 @@ class Solver3D:
         self.u0 = u0
         self.D = D
         self.rho0 = rho0
+        self.ref_area = (
+            float(ref_area) if ref_area is not None
+            else projected_frontal_area(np.asarray(solid, dtype=bool))
+        )
+        if self.ref_area <= 0.0:
+            raise ValueError("ref_area must be positive (is the body empty?)")
         self.wall_bc = wall_bc
         self.inlet_bc = inlet_bc
         self.outlet_bc = outlet_bc
@@ -681,17 +694,17 @@ class Solver3D:
             lattice=self.lattice,
         )
         Cd, Cly, Clz = forces_to_coefficients_3d(
-            diag["fx"], diag["fy"], diag["fz"], self.rho0, self.u0, self.D
+            diag["fx"], diag["fy"], diag["fz"], self.rho0, self.u0, self.ref_area
         )
         cdp, _, _, cdv, _, _ = split_to_coefficients_3d(
             diag["fx_p"], diag["fy_p"], diag["fz_p"],
             diag["fx_v"], diag["fy_v"], diag["fz_v"],
-            self.rho0, self.u0, self.D,
+            self.rho0, self.u0, self.ref_area,
         )
         self._last_cd_p = cdp
         self._last_cd_v = cdv
         cmx, cmy, cmz = moments_to_coefficients_3d(
-            diag["mx"], diag["my"], diag["mz"], self.rho0, self.u0, self.D
+            diag["mx"], diag["my"], diag["mz"], self.rho0, self.u0, self.ref_area, self.D
         )
         self._last_cmx = cmx
         self._last_cmy = cmy
@@ -955,6 +968,7 @@ class Solver3D:
         solid_cpu = self.solid.get() if self._use_cupy else self.solid
         params = dict(
             Nz=self.Nz, Ny=self.Ny, Nx=self.Nx, omega=self.omega, u0=self.u0, D=self.D,
+            ref_area=self.ref_area,
             rho0=self.rho0, wall_bc=self.wall_bc, inlet_bc=self.inlet_bc,
             outlet_bc=self.outlet_bc, streamwise_bc=self.streamwise_bc,
             backend="numpy",  # always restart on CPU; user can switch after

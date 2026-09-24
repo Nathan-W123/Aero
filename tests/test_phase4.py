@@ -359,12 +359,13 @@ class TestForces3D:
         assert Fx == 0.0 and Fy == 0.0 and Fz == 0.0
 
     def test_force_coefficients_scaling(self):
-        Cd, Cly, Clz = forces_to_coefficients_3d(1.0, 0.0, 0.0, 1.0, 0.05, 20.0)
-        expected = 1.0 / (0.5 * 1.0 * 0.05**2 * 20.0**2)
+        area = 314.16                      # e.g. pi r^2 for r = 10
+        Cd, Cly, Clz = forces_to_coefficients_3d(1.0, 0.0, 0.0, 1.0, 0.05, area)
+        expected = 1.0 / (0.5 * 1.0 * 0.05**2 * area)
         assert Cd == pytest.approx(expected, rel=1e-10)
 
     def test_zero_dynamic_pressure(self):
-        assert forces_to_coefficients_3d(1.0, 2.0, 3.0, 1.0, 0.0, 20.0) == (0.0, 0.0, 0.0)
+        assert forces_to_coefficients_3d(1.0, 2.0, 3.0, 1.0, 0.0, 314.16) == (0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------

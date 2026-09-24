@@ -96,6 +96,12 @@ python3 cli.py \
 python3 cli3d.py --shape sphere --re 100 --nx 128 --ny 64 --nz 64 --steps 5000
 ```
 
+3D force coefficients are normalised by the body's **frontal area** (`1/2 rho u0^2 A`):
+`pi r^2` for a sphere, `height x depth` for a box, `2r x length` for a 3D cylinder, and
+the projected voxel area for an STL mesh.  Blockage above ~10% inflates drag noticeably
+(a sphere at 29% blockage reads ~30% above Schiller-Naumann); widen the tunnel before
+comparing with unconfined literature values.
+
 3D periodic/internal-flow style run:
 
 ```bash
