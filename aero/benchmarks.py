@@ -74,7 +74,10 @@ def schiller_naumann_cd(re: float) -> float:
 #:           frontal area).  Straight line: intercept +1.9%, slope 1.02 --
 #:           1.00 per unit blockage relative to the intercept.
 #:   Re=100  1.3607 at 29.2% and 1.2629 at 14.6% (tunnel length fixed at 96;
-#:           Cd on pi r^2): slope 0.58, intercept 1.165.
+#:           Cd on pi r^2): slope 0.58, intercept 1.165.  The same case with
+#:           the sphere 21 cells across reads 1.3177; Richardson-extrapolating
+#:           14 -> 21 cells (order 1 to 2) and removing the walls leaves
+#:           1.055-1.099 against Schiller-Naumann's 1.092.
 #:
 #: Confinement weakens as Re rises -- a thinner viscous region reaches the
 #: walls less -- so using the Re=20 slope at Re=100 overstated it almost 2x.
@@ -868,11 +871,15 @@ def _resolution_estimate(mode: str, shape: str, params: Dict[str, Any]) -> Dict[
         status = "warn"
     else:
         status = "fail"
+    message = (f"No grid study; estimate only: {d:.0f} cells across the body, "
+               f"boundary layer ≈ D/√Re = {bl:.1f} cells. Run Grid Study to measure.")
+    if mode == "3d" and str(shape).lower() == "sphere" and status != "pass":
+        message += (" For scale: at Re=100 a 14-cell sphere measured 6-10% high"
+                    " (14 -> 21 cells lowered Cd 3.2%).")
     return {
         "status": status,
         "value": {"cells_across_body": float(d), "cells_across_boundary_layer": float(bl)},
-        "message": (f"No grid study; estimate only: {d:.0f} cells across the body, "
-                    f"boundary layer ≈ D/√Re = {bl:.1f} cells. Run Grid Study to measure."),
+        "message": message,
     }
 
 

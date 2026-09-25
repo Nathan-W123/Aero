@@ -352,6 +352,7 @@ def test_resolution_estimate_flags_a_thin_boundary_layer():
     d = rep.components["discretization"]
     assert d["status"] == "warn"
     assert d["value"]["cells_across_boundary_layer"] == pytest.approx(1.4)
+    assert "6-10% high" in d["message"]          # the measured grid bias, for scale
 
 
 def test_blockage_message_quantifies_the_sphere_bias():
