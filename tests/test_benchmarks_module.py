@@ -224,3 +224,120 @@ def test_the_old_d_squared_number_now_fails_the_sharp_band():
     from aero.benchmarks import assess_literature
     status, _ = assess_literature(mode="3d", shape="sphere", re=100.0, cd=0.928, blockage=20 / 192)
     assert status != "pass"
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty of a correlated mean
+# ---------------------------------------------------------------------------
+
+def _ar1(phi, n, seed, burn=500):
+    rng = np.random.default_rng(seed)
+    e = rng.standard_normal(n + burn)
+    x = np.empty_like(e)
+    x[0] = 0.0
+    for i in range(1, e.size):
+        x[i] = phi * x[i - 1] + e[i]
+    return x[burn:]
+
+
+def test_autocorr_time_is_one_half_for_independent_samples():
+    from aero.benchmarks import integrated_autocorr_time
+    x = np.random.default_rng(1).standard_normal(20000)
+    assert integrated_autocorr_time(x) == pytest.approx(0.5, abs=0.05)
+
+
+@pytest.mark.parametrize("phi", [0.5, 0.9])
+def test_autocorr_time_matches_ar1_exactly(phi):
+    """AR(1) has tau_int = (1 + phi) / (2 (1 - phi)) in closed form."""
+    from aero.benchmarks import integrated_autocorr_time
+    tau = integrated_autocorr_time(_ar1(phi, 60000, seed=2))
+    assert tau == pytest.approx((1 + phi) / (2 * (1 - phi)), rel=0.1)
+
+
+def test_95_percent_interval_actually_covers_95_percent():
+    """
+    The old interval, 1.96 sigma / sqrt(N) over raw steps, claimed 95% and
+    covered the true mean about one time in five on a correlated signal.
+    A coefficient trace is exactly that kind of signal.
+    """
+    from aero.benchmarks import mean_uncertainty
+    trials, hit, naive = 150, 0, 0
+    for k in range(trials):
+        x = _ar1(0.95, 1500, seed=100 + k)
+        m = mean_uncertainty(x)
+        hit += abs(m["mean"]) <= m["sem95"]
+        naive += abs(x.mean()) <= 1.96 * x.std(ddof=1) / np.sqrt(x.size)
+    assert hit / trials >= 0.85
+    assert naive / trials <= 0.40          # documents what the old estimator did
+
+
+def test_statistical_component_counts_effective_not_raw_samples():
+    from aero.benchmarks import _statistical_component
+    x = 1.3 + 0.05 * _ar1(0.98, 3000, seed=7) / 5.0
+    comp = _statistical_component("3d", {"Cd_history": x.tolist(), "analysis_window": 1500})
+    v = comp["value"]
+    naive = 1.96 * np.std(x[-1500:], ddof=1) / np.sqrt(1500)
+    assert v["n_eff"] < 1500 / 10
+    assert v["cd_sem95"] > 3 * naive
+    assert "effective samples" in comp["message"]
+
+
+def test_drift_is_reported_when_the_run_has_not_settled():
+    from aero.benchmarks import mean_uncertainty, _statistical_component
+    rng = np.random.default_rng(3)
+    x = 1.0 + np.linspace(0.0, 0.2, 2000) + 0.002 * rng.standard_normal(2000)
+    assert mean_uncertainty(x)["stationary"] is False
+    comp = _statistical_component("3d", {"Cd_history": x.tolist(), "analysis_window": 2000})
+    assert comp["status"] in ("warn", "fail") and "drifting" in comp["message"]
+
+
+def test_a_settled_signal_is_stationary():
+    from aero.benchmarks import mean_uncertainty
+    x = 1.2 + 0.01 * np.random.default_rng(4).standard_normal(3000)
+    assert mean_uncertainty(x)["stationary"] is True
+
+
+# ---------------------------------------------------------------------------
+# Shedding advice and a-priori resolution
+# ---------------------------------------------------------------------------
+
+def test_sphere_below_its_onset_is_told_to_drop_the_perturbation():
+    """
+    47 is the 2D cylinder's shedding onset.  Applying it to a sphere told users
+    to perturb a wake that is steady until Re ~ 210.
+    """
+    w = validate_bc_config(mode="3d", wall_bc="slip", outlet_bc="convective",
+                           re=100.0, inlet_perturbation=0.02, shape="sphere")
+    assert any("steady" in m and "set it to 0" in m for m in w)
+    w0 = validate_bc_config(mode="3d", wall_bc="slip", outlet_bc="convective",
+                            re=100.0, inlet_perturbation=0.0, shape="sphere")
+    assert not any("shedding may not trigger" in m for m in w0)
+
+
+def test_sphere_above_its_onset_still_gets_the_shedding_hint():
+    w = validate_bc_config(mode="3d", wall_bc="slip", outlet_bc="convective",
+                           re=300.0, inlet_perturbation=0.0, shape="sphere")
+    assert any("270" in m for m in w)
+
+
+def test_resolution_estimate_flags_a_thin_boundary_layer():
+    from aero.benchmarks import build_uncertainty_report
+    rep = build_uncertainty_report(
+        mode="3d", shape="sphere",
+        params={"radius": "7", "re": "100", "nx": "96", "ny": "48", "nz": "48"},
+        result={"Cd_history": [1.0] * 100},
+    )
+    d = rep.components["discretization"]
+    assert d["status"] == "warn"
+    assert d["value"]["cells_across_boundary_layer"] == pytest.approx(1.4)
+
+
+def test_blockage_message_quantifies_the_sphere_bias():
+    from aero.benchmarks import build_uncertainty_report
+    rep = build_uncertainty_report(
+        mode="3d", shape="sphere",
+        params={"radius": "7", "re": "100", "nx": "96", "ny": "48", "nz": "48"},
+        result={"Cd_history": [1.0] * 100},
+    )
+    b = rep.components["blockage"]
+    assert b["status"] == "fail" and "raise a sphere's Cd" in b["message"]

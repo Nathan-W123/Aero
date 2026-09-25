@@ -260,6 +260,29 @@ def grid_study(
     )
 
 
+#: Reynolds number at which the wake stops being steady, by body.  47 is the
+#: circular cylinder's (2D, or spanwise-periodic 3D); a square cylinder's is
+#: close to it.  A sphere's wake stays steady and axisymmetric to Re ~ 210,
+#: steady but asymmetric to ~ 270, and only then sheds (Johnson & Patel 1999);
+#: a cube's sequence is similar, ~216 then ~270 (Saha 2004).  Using 47 for a
+#: sphere told users to perturb a flow that should be steady, which only adds
+#: forcing noise to the drag.
+SHEDDING_ONSET_RE = {
+    ("2d", "cylinder"): 47.0,
+    ("2d", "rectangle"): 47.0,
+    ("3d", "cylinder"): 47.0,
+    ("3d", "sphere"): 270.0,
+    ("3d", "box"): 270.0,
+}
+
+
+def shedding_onset_re(mode: str, shape: Optional[str]) -> Optional[float]:
+    """Onset of unsteady shedding for a known body, or None if not tabulated."""
+    if not shape:
+        return None
+    return SHEDDING_ONSET_RE.get((str(mode).lower(), str(shape).lower()))
+
+
 def validate_bc_config(
     *,
     mode: str,
@@ -268,8 +291,12 @@ def validate_bc_config(
     inlet_bc: str = "velocity",
     re: float = 100.0,
     inlet_perturbation: float = 0.0,
+    shape: Optional[str] = None,
 ) -> List[str]:
     warnings: List[str] = []
+    onset = shedding_onset_re(mode, shape)
+    if onset is None:
+        onset = 47.0     # unknown body: keep the historical default
     wall_bc = (wall_bc or "slip").lower()
     outlet_bc = (outlet_bc or "convective").lower()
     inlet_bc = (inlet_bc or "velocity").lower()
@@ -282,19 +309,25 @@ def validate_bc_config(
             warnings.append(f"Unknown wall_bc '{wall_bc}' — use slip, noslip, or moving.")
         if inlet_bc not in {"velocity", "pressure"}:
             warnings.append(f"Unknown inlet_bc '{inlet_bc}' — use velocity or pressure.")
-        if re > 47 and inlet_perturbation <= 0 and wall_bc == "slip":
+        if re > onset and inlet_perturbation <= 0 and wall_bc == "slip":
             warnings.append(
-                "Re > 47 with slip walls and no inlet perturbation — "
+                f"Re > {onset:g} with slip walls and no inlet perturbation — "
                 "vortex shedding may not trigger; try inlet_perturbation ≥ 0.02 or noslip walls."
             )
     else:
         if wall_bc not in {"slip", "noslip", "moving"}:
             warnings.append(f"Unknown wall_bc '{wall_bc}' — use slip, noslip, or moving.")
-        if re > 47 and inlet_perturbation <= 0 and wall_bc == "slip":
+        if re > onset and inlet_perturbation <= 0 and wall_bc == "slip":
             warnings.append(
-                "Re > 47 with slip walls and no inlet perturbation — "
+                f"Re > {onset:g} with slip walls and no inlet perturbation — "
                 "3D shedding may not trigger; try inlet_perturbation ≥ 0.02."
             )
+
+    if re <= onset and inlet_perturbation > 0 and shape:
+        warnings.append(
+            f"The wake is steady at Re={re:g} (shedding starts near Re≈{onset:g} for a "
+            f"{shape}); the inlet perturbation only forces noise into Cd — set it to 0."
+        )
 
     if outlet_bc == "zerogradient" and re > 200:
         warnings.append("Zero-gradient outlet at high Re may reflect spurious waves — prefer convective.")
@@ -376,6 +409,7 @@ def build_validation_report(
         inlet_bc=params.get("inlet_bc") or "velocity",
         re=re,
         inlet_perturbation=float(params.get("inlet_perturbation", "0") or "0"),
+        shape=shape,
     )
     c_status, c_msg = assess_collision(
         re=re, tau=tau, collision=params.get("collision") or "bgk",
@@ -605,6 +639,9 @@ def _blockage_component(mode: str, shape: str, params: Dict[str, Any]) -> Dict[s
         status = "warn"
     else:
         status = "fail"
+    if mode == "3d" and str(shape).lower() == "sphere":
+        detail += (f" Expected to raise a sphere's Cd by ~{(sphere_confinement_factor(ratio)-1)*100:.0f}%"
+                   " (measured blockage sweep).")
     return {
         "status": status,
         "value": float(ratio),
@@ -632,43 +669,198 @@ def _domain_length_component(mode: str, shape: str, params: Dict[str, Any]) -> D
     }
 
 
+# ---------------------------------------------------------------------------
+# Statistics of a correlated time series
+# ---------------------------------------------------------------------------
+#
+# A force coefficient sampled every LBM step is not a set of independent
+# measurements.  The trace carries acoustic sloshing (pressure waves bouncing
+# between slip walls and the inlet, periods of ~100-300 steps, barely damped at
+# low viscosity) and, above the shedding threshold, the shedding cycle itself.
+# Neighbouring samples are nearly identical, so sigma / sqrt(N) over-counts the
+# information in the run by the correlation time -- routinely 10x or more.
+# Everything below works in terms of the *effective* sample size instead.
+
+def integrated_autocorr_time(x: Any, c: float = 5.0) -> float:
+    """
+    Integrated autocorrelation time, in samples, with Sokal's automatic window.
+
+    tau = 1/2 + sum_{t=1..M} rho(t), with M the smallest lag satisfying
+    M >= c * tau(M).  Independent samples give 1/2; the effective sample size
+    is N / (2 tau).  Clamped below at 1/2: an oscillating trace can make the
+    raw sum smaller, but claiming better-than-independent samples is never the
+    safe direction for an uncertainty.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.size
+    if n < 4:
+        return 0.5
+    x = x - x.mean()
+    if not np.any(x):
+        return 0.5
+    f = np.fft.rfft(x, n=2 * n)
+    acf = np.fft.irfft(f * np.conj(f))[:n]
+    acf = acf / acf[0]
+    taus = 0.5 + np.cumsum(acf[1:])
+    lags = np.arange(1, n)
+    ok = lags >= c * taus
+    tau = float(taus[int(np.argmax(ok))]) if ok.any() else float(taus[-1])
+    return max(tau, 0.5)
+
+
+def _t_quantile_975(dof: float) -> float:
+    """Student-t 97.5% quantile, Cornish-Fisher to O(1/dof^2); 1.96 as dof -> inf."""
+    z = 1.959963984540054
+    if not np.isfinite(dof) or dof > 1e6:
+        return z
+    v = max(float(dof), 1.0)
+    return (z + (z ** 3 + z) / (4 * v)
+            + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * v * v))
+
+
+def mean_uncertainty(x: Any, n_batches: int = 10) -> Dict[str, Any]:
+    """
+    Mean of a correlated series and an honest 95% interval for it.
+
+    Two estimates of the standard error, and the larger is kept:
+      * sigma / sqrt(N_eff) with N_eff = N / (2 tau_int);
+      * batch means -- the scatter of the means of ``n_batches`` equal blocks,
+        which also catches slow drift that the autocorrelation sum can miss.
+    The 95% half-width uses a Student-t quantile on the effective degrees of
+    freedom, which matters when N_eff is ten rather than ten thousand.
+
+    Also reports a stationarity check: the difference between the means of
+    the window's two halves, against its own uncertainty.  A run still
+    relaxing from its start-up shows up here even when every other number
+    looks tidy.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    n = int(x.size)
+    if n == 0:
+        return {"n": 0, "mean": None, "sigma": None, "sem95": None, "n_eff": 0.0,
+                "tau_int": None, "drift": None, "drift_sigma": None, "stationary": None}
+    mean = float(x.mean())
+    sigma = float(x.std(ddof=1)) if n > 1 else 0.0
+    tau = integrated_autocorr_time(x)
+    n_eff = max(n / (2.0 * tau), 1.0)
+    sem_acf = sigma / np.sqrt(n_eff)
+
+    sem_batch = 0.0
+    b = min(n_batches, n // 2)
+    if b >= 2:
+        L = n // b
+        means = x[: L * b].reshape(b, L).mean(axis=1)
+        sem_batch = float(means.std(ddof=1) / np.sqrt(b))
+    if sem_batch > sem_acf:
+        sem, dof = sem_batch, b - 1
+    else:
+        sem, dof = sem_acf, n_eff - 1
+    sem95 = float(_t_quantile_975(dof) * sem)
+
+    drift = drift_sigma = None
+    stationary = None
+    if n >= 8:
+        h1, h2 = x[: n // 2], x[n // 2:]
+        s1 = h1.std(ddof=1) / np.sqrt(max(h1.size / (2 * integrated_autocorr_time(h1)), 1.0))
+        s2 = h2.std(ddof=1) / np.sqrt(max(h2.size / (2 * integrated_autocorr_time(h2)), 1.0))
+        drift = float(h2.mean() - h1.mean())
+        drift_sigma = float(np.hypot(s1, s2))
+        stationary = bool(abs(drift) <= 2.0 * drift_sigma + 1e-12 * max(abs(mean), 1.0))
+    return {"n": n, "mean": mean, "sigma": sigma, "tau_int": float(tau), "n_eff": float(n_eff),
+            "sem": float(sem), "sem95": sem95, "drift": drift, "drift_sigma": drift_sigma,
+            "stationary": stationary}
+
+
 def _statistical_component(mode: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Statistical uncertainty of the mean Cd over the averaging window.
+
+    ``result["analysis_window"]`` sets the window (samples from the end); the
+    default is the last fifth of the run, matching the CLI's printed mean.
+
+    Before this used 1.96 sigma / sqrt(N) with N the raw sample count, which
+    treats every step as an independent measurement and understated the
+    uncertainty by roughly sqrt(2 tau_int) -- about 10x on a typical trace.
+    """
     cd_history = np.asarray(result.get("Cd_history", []), dtype=np.float64)
     if cd_history.size == 0:
         return {"status": "n/a", "value": None, "message": "No coefficient history available."}
-    window = max(int(min(cd_history.size, max(cd_history.size // 5, 20))), 1)
-    tail = cd_history[-window:]
-    cd_mean = float(np.mean(tail))
-    cd_std = float(np.std(tail, ddof=1)) if tail.size > 1 else 0.0
-    cd_sem95 = 1.96 * cd_std / max(np.sqrt(tail.size), 1.0)
+    window = result.get("analysis_window")
+    if not window:
+        window = max(int(min(cd_history.size, max(cd_history.size // 5, 20))), 1)
+    window = int(min(max(int(window), 1), cd_history.size))
+    st = mean_uncertainty(cd_history[-window:])
     lift_key = "Cl_history" if mode == "2d" else "Cly_history"
     lift_history = np.asarray(result.get(lift_key, []), dtype=np.float64)
-    lift_tail = lift_history[-window:] if lift_history.size else np.asarray([], dtype=np.float64)
-    lift_sem95 = 0.0
-    if lift_tail.size > 1:
-        lift_sem95 = float(1.96 * np.std(lift_tail, ddof=1) / np.sqrt(lift_tail.size))
-    rel_cd = abs(cd_sem95) / max(abs(cd_mean), 1e-12)
+    lift = mean_uncertainty(lift_history[-window:]) if lift_history.size else {"sem95": None}
+    rel_cd = abs(st["sem95"] or 0.0) / max(abs(st["mean"] or 0.0), 1e-12)
     if rel_cd < 0.01:
         status = "pass"
     elif rel_cd < 0.05:
         status = "warn"
     else:
         status = "fail"
+    message = (f"95% statistical uncertainty of the mean Cd is {rel_cd*100:.2f}% "
+               f"({st['n_eff']:.0f} effective samples of {window}; "
+               f"correlation time {st['tau_int']:.0f} steps).")
+    if st["stationary"] is False:
+        status = "fail" if status == "fail" else "warn"
+        message += (f" The two halves of the window differ by {st['drift']:+.4f} "
+                    f"(> 2 x {st['drift_sigma']:.4f}): still drifting, run longer.")
     return {
         "status": status,
         "value": {
             "window": int(window),
-            "cd_sem95": float(cd_sem95),
+            "cd_mean": st["mean"],
+            "cd_sigma": st["sigma"],
+            "cd_sem95": st["sem95"],
             "cd_relative_sem95": float(rel_cd),
-            "lift_sem95": float(lift_sem95),
+            "n_eff": st["n_eff"],
+            "tau_int": st["tau_int"],
+            "drift": st["drift"],
+            "stationary": st["stationary"],
+            "lift_sem95": lift.get("sem95"),
         },
-        "message": f"Trailing-window 95% Cd uncertainty is {rel_cd*100:.2f}% over {window} samples.",
+        "message": message,
     }
 
 
-def _discretization_component(result: Dict[str, Any]) -> Dict[str, Any]:
+def _resolution_estimate(mode: str, shape: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    A-priori resolution check when no grid study is attached.
+
+    Counts cells across the body and across the laminar boundary layer, whose
+    thickness scales as D / sqrt(Re).  It is a heuristic -- only a grid study
+    measures the discretisation error -- but it catches the common case of a
+    body a dozen cells across at Re ~ 100, where the boundary layer is barely
+    one cell thick.
+    """
+    d = reference_length_cells(mode, shape, params)
+    re = max(float(params.get("re", 100.0) or 100.0), 1e-6)
+    bl = d / np.sqrt(re)
+    if d >= 30 and bl >= 3:
+        status = "pass"
+    elif d >= 10 and bl >= 1:
+        status = "warn"
+    else:
+        status = "fail"
+    return {
+        "status": status,
+        "value": {"cells_across_body": float(d), "cells_across_boundary_layer": float(bl)},
+        "message": (f"No grid study; estimate only: {d:.0f} cells across the body, "
+                    f"boundary layer ≈ D/√Re = {bl:.1f} cells. Run Grid Study to measure."),
+    }
+
+
+def _discretization_component(
+    result: Dict[str, Any], mode: Optional[str] = None,
+    shape: Optional[str] = None, params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     grid_cd_values = result.get("grid_cd_values")
     if not grid_cd_values:
+        if mode and shape and params:
+            return _resolution_estimate(mode, shape, params)
         return {
             "status": "n/a",
             "value": None,
@@ -715,7 +907,9 @@ def _convergence_component(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _bc_sensitivity_component(mode: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def _bc_sensitivity_component(
+    mode: str, params: Dict[str, Any], shape: Optional[str] = None
+) -> Dict[str, Any]:
     warnings = validate_bc_config(
         mode=mode,
         wall_bc=str(params.get("wall_bc", "slip")),
@@ -723,6 +917,7 @@ def _bc_sensitivity_component(mode: str, params: Dict[str, Any]) -> Dict[str, An
         inlet_bc=str(params.get("inlet_bc", "velocity")),
         re=float(params.get("re", 100.0) or 100.0),
         inlet_perturbation=float(params.get("inlet_perturbation", 0.0) or 0.0),
+        shape=shape,
     )
     streamwise_bc = str(params.get("streamwise_bc", "") or "")
     if streamwise_bc in {"periodic", "recycling"}:
@@ -752,12 +947,12 @@ def build_uncertainty_report(
     and boundary-condition sensitivity.
     """
     components = {
-        "discretization": _discretization_component(result),
+        "discretization": _discretization_component(result, mode, shape, params),
         "blockage": _blockage_component(mode, shape, params),
         "domain_length": _domain_length_component(mode, shape, params),
         "statistical": _statistical_component(mode, result),
         "convergence": _convergence_component(result),
-        "bc_sensitivity": _bc_sensitivity_component(mode, params),
+        "bc_sensitivity": _bc_sensitivity_component(mode, params, shape),
     }
     overall_status = _combine_statuses([component["status"] for component in components.values()])
     summary = "; ".join(

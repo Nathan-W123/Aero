@@ -50,6 +50,10 @@ import matplotlib
 matplotlib.use("Agg")                      # no display server anywhere near this
 import matplotlib.pyplot as plt
 
+from ..benchmarks import (
+    build_uncertainty_report, literature_cd_range, mean_uncertainty,
+    reference_length_cells, schiller_naumann_cd, sphere_expected_cd,
+)
 from ..lbm.lattice3d import LATTICES
 from ..lbm.physics import base_nu_from_omega
 
@@ -351,6 +355,84 @@ def _field_png(solver, mode: str, what: str = "speed") -> bytes:
     return _png(fig)
 
 
+def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int) -> Dict[str, Any]:
+    """The run's uncertainty budget, reduced to status + message per check."""
+    shape = p.get("shape", "cylinder" if mode == "2d" else "sphere")
+    result = {
+        "Cd_history": list(getattr(solver, "Cd_history", [])),
+        "Cl_history" if mode == "2d" else "Cly_history": _lift_history(solver),
+        "analysis_window": window,
+    }
+    try:
+        rep = build_uncertainty_report(mode=mode, shape=shape, params=dict(p), result=result)
+    except Exception as exc:                        # never let the budget sink a finished run
+        return {"error": str(exc)}
+    out = {}
+    for name, comp in rep.components.items():
+        if comp.get("status") == "n/a":
+            continue
+        out[name] = {"status": comp["status"], "message": comp.get("message", ""),
+                     "short": _short_label(name, comp.get("value"), mode, shape)}
+    return out
+
+
+def _short_label(name: str, v: Any, mode: str, shape: str) -> str:
+    """A few words for the chip, so the finding is readable without hovering."""
+    try:
+        if name == "statistical":
+            s = f"±{v['cd_relative_sem95']*100:.1f}% stat. · {v['n_eff']:.0f} indep. samples"
+            return s + (" · still drifting" if v.get("stationary") is False else "")
+        if name == "blockage":
+            s = f"blockage {v*100:.0f}%"
+            if mode == "3d" and shape == "sphere":
+                from ..benchmarks import sphere_confinement_factor
+                s += f" · ~+{(sphere_confinement_factor(v)-1)*100:.0f}% on Cd"
+            return s
+        if name == "domain_length":
+            return f"{v['upstream_D']:.1f}D upstream · {v['downstream_D']:.1f}D downstream"
+        if name == "discretization":
+            if isinstance(v, dict) and "cells_across_body" in v:
+                return (f"{v['cells_across_body']:.0f} cells across · "
+                        f"boundary layer ≈ {v['cells_across_boundary_layer']:.1f} cells")
+            return "grid study"
+        if name == "bc_sensitivity":
+            w = (v or {}).get("warnings") or []
+            return "boundary conditions ok" if not w else f"{len(w)} boundary-condition note{'s' if len(w) > 1 else ''}"
+    except Exception:
+        pass
+    return name.replace("_", " ")
+
+
+def _reference(p: Dict[str, Any], mode: str, cd: Optional[float]) -> Optional[Dict[str, Any]]:
+    """
+    What the drag *should* be for this case, including the tunnel's confinement.
+
+    The comparison a user makes by eye -- against the unconfined textbook value
+    -- is the wrong one for a confined tunnel, and a statistical error bar can
+    never cover a systematic bias.  This states the expected value for the run
+    as configured, so the two can be compared honestly.
+    """
+    shape = p.get("shape", "cylinder" if mode == "2d" else "sphere")
+    re = _f(p, "re", 100.0)
+    d = reference_length_cells(mode, shape, p)
+    if mode == "3d":
+        span = min(_f(p, "ny", 48.0), _f(p, "nz", 48.0))
+        blockage = d / max(span, 1.0)
+    else:
+        blockage = d / max(_f(p, "ny", 200.0), 1.0)
+    band = literature_cd_range(mode, shape, re, blockage if mode == "3d" else None)
+    if band is None:
+        return None
+    lo, hi, note = band
+    out = {"band": [_num(lo, 3), _num(hi, 3)], "note": note, "blockage": _num(blockage, 3)}
+    if mode == "3d" and shape == "sphere":
+        sn, conf, _ = sphere_expected_cd(re, blockage)
+        out.update({"unconfined": _num(sn, 3), "expected": _num(conf, 3)})
+    if cd is not None:
+        out["status"] = "pass" if lo <= cd <= hi else "fail"
+    return out
+
+
 def _lift_history(solver) -> List[float]:
     """2D keeps Cl_history; 3D keeps Cly (wall-normal) and Clz (spanwise)."""
     for name in ("Cl_history", "Cly_history"):
@@ -454,15 +536,25 @@ def _run_job(job: Job) -> None:
         cd_hist = np.asarray(getattr(solver, "Cd_history", []), dtype=float)
         cl_hist = np.asarray(_lift_history(solver), dtype=float)
         if cd_hist.size:
-            tail = cd_hist[max(cd_hist.size // 2, 0):]
-            tail_l = cl_hist[max(cl_hist.size // 2, 0):] if cl_hist.size else np.array([np.nan])
+            n = cd_hist.size
+            window = n - n // 2                        # second half: first half is start-up
+            st = mean_uncertainty(cd_hist[-window:])
+            sl = mean_uncertainty(cl_hist[-window:]) if cl_hist.size else {}
             job.result["coefficients"] = {
-                "cd": _num(np.nanmean(tail)),
-                "cd_std": _num(np.nanstd(tail)),
-                "cl": _num(np.nanmean(tail_l)),
-                "cl_std": _num(np.nanstd(tail_l)),
+                "cd": _num(st["mean"]),
+                # sigma is the size of the *fluctuation*, not an uncertainty; the
+                # page used to print it as "±", which read as an error bar
+                "cd_std": _num(st["sigma"]),
+                "cd_sem95": _num(st["sem95"]),
+                "cd_n_eff": _num(st["n_eff"], 1),
+                "cd_stationary": st["stationary"],
+                "cl": _num(sl.get("mean")),
+                "cl_std": _num(sl.get("sigma")),
+                "cl_sem95": _num(sl.get("sem95")),
                 "note": "averaged over the second half of the run",
             }
+            job.result["uncertainty"] = _uncertainty(p, mode, solver, window)
+            job.result["reference"] = _reference(p, mode, job.result["coefficients"]["cd"])
         for what in ("speed", "vorticity", "pressure"):
             try:
                 job.figures[what] = _field_png(solver, mode, what)

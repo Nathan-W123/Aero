@@ -204,3 +204,29 @@ def test_num_turns_non_finite_into_none():
     assert web._num(float("inf")) is None
     assert web._num("x") is None
     assert web._num(1.23456789) == 1.23457
+
+
+def test_job_reports_an_uncertainty_budget_and_a_reference():
+    """
+    The page used to print mean ± sigma, which read as an error bar and could
+    never cover a systematic bias.  The job now carries the 95% statistical
+    uncertainty, the budget's checks, and the expected value for the case as
+    configured -- confinement included.
+    """
+    job = web.Job(id="t7", params={
+        "mode": "3d", "shape": "sphere", "radius": 3, "re": 20, "u0": 0.05,
+        "nx": 32, "ny": 16, "nz": 16, "steps": 200, "backend": "numpy",
+    })
+    web._run_job(job)
+    assert job.state == "done", job.error
+    c = job.result["coefficients"]
+    assert c["cd_sem95"] is not None and c["cd_sem95"] >= 0
+    assert c["cd_std"] is not None
+    u = job.result["uncertainty"]
+    for name in ("statistical", "blockage", "domain_length", "discretization"):
+        assert u[name]["status"] in ("pass", "warn", "fail")
+        assert u[name]["short"]
+    r = job.result["reference"]
+    assert r["expected"] > r["unconfined"]            # 6/16 blockage raises it
+    assert r["status"] in ("pass", "fail")
+    json.dumps(job.public(), allow_nan=False)

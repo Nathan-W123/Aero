@@ -40,6 +40,35 @@ from aero.case import SimulationCase
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+
+def _stat_line(label: str, mean: float, history) -> str:
+    """
+    "mean ± 95% statistical uncertainty, sigma" for one coefficient.
+
+    The window matches the solver's printed mean (the last fifth of the run).
+    The ± counts *effective* independent samples; sigma is the size of the
+    per-step fluctuation, which is what "±" used to print.
+    """
+    from aero.benchmarks import mean_uncertainty
+    h = list(history or [])
+    w = max(1, len(h) // 5)
+    st = mean_uncertainty(h[-w:]) if h else {"sem95": None, "sigma": None}
+    if st.get("sem95") is None:
+        return f"  {label} = {mean:.4f}"
+    return (f"  {label} = {mean:.4f}  ± {st['sem95']:.4f} (95% stat.)"
+            f"   σ {st['sigma']:.4f} (fluctuation)")
+
+
+def _print_uncertainty(report) -> None:
+    """One line per budget check; the statistical ± above excludes all of these."""
+    marks = {"pass": "ok ", "warn": "!  ", "fail": "✗  "}
+    print("  === UNCERTAINTY BUDGET ===")
+    for name, comp in report.components.items():
+        if comp.get("status") == "n/a":
+            continue
+        print(f"  {marks.get(comp['status'], '?  ')}{name:15s} {comp.get('message', '')}")
+    print()
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="2D LBM Wind Tunnel CFD Simulator",
@@ -491,8 +520,8 @@ def main() -> int:
 
     print()
     print("  === RESULTS ===")
-    print(f"  Cd (mean) = {result['Cd_mean']:.4f}  ±  {result['Cd_std']:.4f}")
-    print(f"  Cl (mean) = {result['Cl_mean']:.4f}  ±  {result['Cl_std']:.4f}")
+    print(_stat_line("Cd (mean)", result["Cd_mean"], result.get("Cd_history")))
+    print(_stat_line("Cl (mean)", result["Cl_mean"], result.get("Cl_history")))
     if "Cd_p_mean" in result:
         print(f"  Cd_press  = {result['Cd_p_mean']:.4f}  (pressure drag)")
         print(f"  Cd_visc   = {result['Cd_v_mean']:.4f}  (viscous drag)")
@@ -539,6 +568,7 @@ def main() -> int:
         params=vars(args),
         result=result,
     )
+    _print_uncertainty(uncertainty)
     write_run_manifest(
         output_dir,
         {

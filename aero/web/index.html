@@ -79,6 +79,12 @@ input:focus,select:focus{outline:2px solid var(--accent-soft);border-color:var(-
 .stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
 .stat .v{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}
 .stat .v small{font-size:11px;font-weight:400;color:var(--muted)}
+.checks{flex:0 0 100%;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);background:var(--panel);
+  border:1px solid var(--line-soft);border-radius:12px;padding:2px 9px;cursor:help;white-space:nowrap}
+.chip i{width:7px;height:7px;border-radius:50%;flex:none;background:var(--faint)}
+.chip.pass i{background:var(--accent)} .chip.warn i{background:var(--warn)} .chip.fail i{background:var(--error)}
+.chip.ref{color:var(--ink);font-weight:550}
 .err{background:#FBEAE8;border:1px solid #E4B9B4;color:var(--error);border-radius:6px;padding:6px 10px;font-size:13px;flex:0 0 100%}
 
 .midrow{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:10px;min-height:0}
@@ -151,7 +157,7 @@ figure .empty{color:var(--faint);font-size:12.5px}
         <div><label for="inlet_perturbation">Inlet perturbation (fraction of u₀)</label>
           <input id="inlet_perturbation" type="number" value="0.02" min="0" max="0.5" step="0.01"></div>
       </div>
-      <p class="hint">A small perturbation is what trips vortex shedding above Re ≈ 47.</p>
+      <p class="hint" id="pertHint">A small perturbation is what trips vortex shedding above Re ≈ 47.</p>
     </fieldset>
   </aside>
 
@@ -161,6 +167,7 @@ figure .empty{color:var(--faint);font-size:12.5px}
       <div class="stats" id="stats"></div>
       <span class="mono" id="elapsed" style="font-size:12px;color:var(--muted)"></span>
       <div class="bar"><i id="bar"></i></div>
+      <div class="checks" id="checks" hidden></div>
       <div id="errBox" hidden class="err"></div>
     </div>
 
@@ -217,6 +224,12 @@ function syncShape(){
   $("#latticeRow").hidden = mode !== "3d";
   inputs($("#gridRow"), GRIDS[mode]);
   $("#gridRow").className = "row " + (mode === "3d" ? "three" : "");
+  // A sphere's wake is steady until Re ≈ 210 and sheds only above ≈ 270, so a
+  // perturbation tuned for the 2D cylinder (onset 47) just forces noise into Cd.
+  $("#inlet_perturbation").value = mode === "3d" ? "0" : "0.02";
+  $("#pertHint").textContent = mode === "3d"
+    ? "Only needed to trip shedding: a sphere's wake is steady below Re ≈ 210 and sheds above ≈ 270. Leave at 0 below that — it adds noise, not physics."
+    : "A small perturbation is what trips vortex shedding above Re ≈ 47.";
   syncDims();
 }
 function syncDims(){ inputs($("#dimRow"), DIMS[$("#mode").value + ":" + $("#shape").value] || []); }
@@ -243,7 +256,7 @@ async function boot(){
   if(/^[a-f0-9]{6,32}$/.test(fromUrl) && (await fetch(`/api/status?id=${fromUrl}`)).ok) attach(fromUrl);
 }
 $("#runBtn").addEventListener("click", async () => {
-  $("#errBox").hidden = true; $("#stats").innerHTML = "";
+  $("#errBox").hidden = true; $("#stats").innerHTML = ""; $("#checks").hidden = true;
   for(const k of ["speed","vorticity","pressure"]) $("#fig_"+k).innerHTML = '<span class="empty">rendering…</span>';
   formSynced = true;
   const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(params())});
@@ -296,10 +309,13 @@ async function tick(){
   const c = j.result.coefficients;
   const f4 = v => (v === null || v === undefined) ? "—" : v.toFixed(4);
   if(c) $("#stats").innerHTML = `
-    <div class="stat"><span class="k">C_d</span><span class="v">${f4(c.cd)}<small> ±${f4(c.cd_std)}</small></span></div>
-    <div class="stat"><span class="k">C_l</span><span class="v">${f4(c.cl)}<small> ±${f4(c.cl_std)}</small></span></div>
+    <div class="stat" title="± is the 95% statistical uncertainty of the mean, from ${c.cd_n_eff ?? "?"} effective independent samples. It does not include systematic errors such as blockage or resolution — see the checks below."><span class="k">C_d · 95% stat.</span><span class="v">${f4(c.cd)}<small> ±${f4(c.cd_sem95)}</small></span></div>
+    <div class="stat" title="Standard deviation of the per-step drag signal: how much it fluctuates, not how uncertain the mean is."><span class="k">C_d fluctuation σ</span><span class="v">${f4(c.cd_std)}</span></div>
+    <div class="stat"><span class="k">C_l · 95% stat.</span><span class="v">${f4(c.cl)}<small> ±${f4(c.cl_sem95)}</small></span></div>
     <div class="stat"><span class="k">Steps</span><span class="v">${j.step.toLocaleString()}</span></div>
     <div class="stat"><span class="k">Cells</span><span class="v">${(s ? s.cells : 0).toLocaleString()}</span></div>`;
+
+  renderChecks(j.result);
 
   if(j.has_geometry && !geomLoaded){
     const g = await fetchPacked(`/api/geometry?id=${jobId}`);
@@ -321,6 +337,29 @@ async function tick(){
     clearInterval(poll); poll = null;
     $("#runBtn").disabled = false; $("#stopBtn").disabled = true;
   }
+}
+
+// -------------------------------------------------------------- checks ----
+// The uncertainty budget: a statistical ± can never cover a systematic bias,
+// so each systematic effect gets its own chip, and the expected value for the
+// run *as configured* (confinement included) sits first.
+const CHECK_ORDER = ["statistical", "blockage", "domain_length", "discretization", "bc_sensitivity", "convergence"];
+function esc(t){ return String(t).replace(/[&<>"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch])); }
+function renderChecks(res){
+  const box = $("#checks"), u = res.uncertainty, r = res.reference;
+  if(!u && !r){ box.hidden = true; return; }
+  let html = "";
+  if(r){
+    const exp = r.expected != null ? `expected ≈ ${r.expected.toFixed(2)}` : "literature";
+    const band = r.band ? ` [${r.band[0].toFixed(2)}–${r.band[1].toFixed(2)}]` : "";
+    const un = r.unconfined != null ? ` · unconfined ${r.unconfined.toFixed(2)}` : "";
+    html += `<span class="chip ref ${r.status || ""}" title="${esc(r.note || "")}"><i></i>${exp}${band}${un}</span>`;
+  }
+  for(const name of CHECK_ORDER){
+    const c = u && u[name]; if(!c) continue;
+    html += `<span class="chip ${c.status}" title="${esc(c.message)}"><i></i>${esc(c.short || name)}</span>`;
+  }
+  box.innerHTML = html; box.hidden = false;
 }
 
 // --------------------------------------------------------------- chart ----
