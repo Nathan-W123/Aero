@@ -289,7 +289,7 @@ async function tick(){
   }
   const s = j.result.setup;
   if(s) $("#setupPill").textContent = `${s.label} · ${s.grid.join("×")} · ω=${s.omega} · ν=${s.nu}`
-      + (s.ref_area ? ` · A=${s.ref_area}` : "");
+      + (s.ref_area ? ` · A=${s.ref_area}` : "") + (s.backend ? ` · ${s.backend}` : "");
   if(j.state === "error"){ $("#errBox").hidden = false; $("#errBox").textContent = j.error || "the run failed"; }
 
   drawChart(j.history);

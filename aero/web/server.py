@@ -393,6 +393,8 @@ def _run_job(job: Job) -> None:
             "nu": round(float(nu), 6),
             "tau": round(1.0 / float(solver.omega), 4),
             "grid": (list(solver.solid.shape)),
+            # the backend that was actually resolved ("auto" is not an answer)
+            "backend": getattr(solver, "backend", p.get("backend", "auto")),
             "cells": int(np.prod(solver.solid.shape)),
             "solid_cells": int(solver.solid.sum()),
             # frontal area the coefficients are normalised by; 3D only
@@ -428,7 +430,9 @@ def _run_job(job: Job) -> None:
                 )
             job.history.append({"step": done, "cd": _num(cd), "cl": _num(cl)})
             rate = done / max(time.time() - t0, 1e-9)
-            job.message = f"step {done:,} of {total:,} · {rate:,.0f} steps/s"
+            mlups = rate * float(np.prod(solver.solid.shape)) / 1e6
+            job.message = (f"step {done:,} of {total:,} · {rate:,.0f} steps/s · "
+                           f"{mlups:,.1f} MLUPS on {getattr(solver, 'backend', '?')}")
             try:
                 job.field_bytes = _field_payload(solver, mode)
                 job.field_step = done
