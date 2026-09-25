@@ -674,12 +674,13 @@ def _domain_length_component(mode: str, shape: str, params: Dict[str, Any]) -> D
 # ---------------------------------------------------------------------------
 #
 # A force coefficient sampled every LBM step is not a set of independent
-# measurements.  The trace carries acoustic sloshing (pressure waves bouncing
-# between slip walls and the inlet, periods of ~100-300 steps, barely damped at
-# low viscosity) and, above the shedding threshold, the shedding cycle itself.
+# measurements.  The trace carries acoustic modes of the tunnel cross-section
+# (period ~ span / c_s: 83 and 59 steps in a 48-cell tunnel, barely damped at
+# low viscosity), whatever the inlet perturbation forces (a 37-step travelling
+# wave), and above the shedding threshold the shedding cycle itself.
 # Neighbouring samples are nearly identical, so sigma / sqrt(N) over-counts the
-# information in the run by the correlation time -- routinely 10x or more.
-# Everything below works in terms of the *effective* sample size instead.
+# information in the run: by about 3x on a Re=100 sphere trace, more on slow
+# shedding.  Everything below works in terms of the *effective* sample size.
 
 def integrated_autocorr_time(x: Any, c: float = 5.0) -> float:
     """
@@ -781,7 +782,7 @@ def _statistical_component(mode: str, result: Dict[str, Any]) -> Dict[str, Any]:
 
     Before this used 1.96 sigma / sqrt(N) with N the raw sample count, which
     treats every step as an independent measurement and understated the
-    uncertainty by roughly sqrt(2 tau_int) -- about 10x on a typical trace.
+    uncertainty by roughly sqrt(2 tau_int) -- about 3x on a Re=100 sphere.
     """
     cd_history = np.asarray(result.get("Cd_history", []), dtype=np.float64)
     if cd_history.size == 0:
