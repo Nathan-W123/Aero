@@ -64,24 +64,44 @@ def schiller_naumann_cd(re: float) -> float:
     return (24.0 / re) * (1.0 + 0.15 * (re ** 0.687))
 
 
-#: Drag inflation per unit blockage for a sphere in this tunnel (slip walls in
-#: y, periodic in z -- effectively a square array of spheres).  Measured at
-#: Re=20 (r = 7) with the frontal-area normalisation in place: +32.0% at 29.2%
-#: blockage, +15.2% at 14.6% and +12.9% at 9.7%.  A straight line through
-#: those has slope 1.02 and a zero-blockage intercept of +1.9%, which is the
-#: solver's residual against the correlation for a 14-cell sphere -- the
-#: actual validation figure.  The slope is rounded up to 1.1 so the band sits
-#: slightly high, where a coarse body tends to land.  It is a calibration,
-#: not a law: it weakens somewhat with Re, so the bands below keep a +/-15%
-#: allowance around it.
-SPHERE_CONFINEMENT_SLOPE = 1.1
+#: Drag inflation per unit blockage (b = D / tunnel span) for a sphere in this
+#: tunnel -- slip walls in y, periodic in z, so effectively a square array of
+#: spheres -- as (Re, slope) points of Cd(b) = Cd(0) * (1 + slope * b).  Both
+#: were measured with r = 7 (14 cells across the sphere):
+#:
+#:   Re=20   +32.0 / +15.2 / +12.9% over Schiller-Naumann at 29.2 / 14.6 / 9.7%
+#:           blockage (tunnel length grown with the span; Cd on the voxel
+#:           frontal area).  Straight line: intercept +1.9%, slope 1.02 --
+#:           1.00 per unit blockage relative to the intercept.
+#:   Re=100  1.3607 at 29.2% and 1.2629 at 14.6% (tunnel length fixed at 96;
+#:           Cd on pi r^2): slope 0.58, intercept 1.165.
+#:
+#: Confinement weakens as Re rises -- a thinner viscous region reaches the
+#: walls less -- so using the Re=20 slope at Re=100 overstated it almost 2x.
+#: Between the points the slope is interpolated in log Re; outside them it
+#: is held at the nearest one.  A calibration, not a law: the bands below keep
+#: a +/-15% allowance around it.
+SPHERE_CONFINEMENT_SLOPES: Tuple[Tuple[float, float], ...] = ((20.0, 1.00), (100.0, 0.58))
 
 
-def sphere_confinement_factor(blockage: Optional[float]) -> float:
-    """Multiplier on the unconfined sphere Cd for a given frontal blockage."""
+def sphere_confinement_slope(re: float) -> float:
+    """Drag inflation per unit blockage at this Re (see SPHERE_CONFINEMENT_SLOPES)."""
+    pts = SPHERE_CONFINEMENT_SLOPES
+    re = float(re)
+    if re <= pts[0][0]:
+        return pts[0][1]
+    for (re0, k0), (re1, k1) in zip(pts, pts[1:]):
+        if re <= re1:
+            t = (math.log(re) - math.log(re0)) / (math.log(re1) - math.log(re0))
+            return k0 + t * (k1 - k0)
+    return pts[-1][1]
+
+
+def sphere_confinement_factor(blockage: Optional[float], re: float) -> float:
+    """Multiplier on the unconfined sphere Cd for a given frontal blockage at Re."""
     if blockage is None:
         return 1.0
-    return 1.0 + SPHERE_CONFINEMENT_SLOPE * max(float(blockage), 0.0)
+    return 1.0 + sphere_confinement_slope(re) * max(float(blockage), 0.0)
 
 
 def sphere_expected_cd(re: float, blockage: Optional[float] = None) -> Tuple[float, float, str]:
@@ -95,9 +115,10 @@ def sphere_expected_cd(re: float, blockage: Optional[float] = None) -> Tuple[flo
     sn = schiller_naumann_cd(re)
     if blockage is None:
         return sn, sn, f"Schiller-Naumann Cd={sn:.2f} at Re={re:g} (unconfined; blockage unknown)"
-    conf = sn * sphere_confinement_factor(blockage)
+    factor = sphere_confinement_factor(blockage, re)
+    conf = sn * factor
     return sn, conf, (
-        f"Schiller-Naumann Cd={sn:.2f} at Re={re:g}, x{sphere_confinement_factor(blockage):.2f} "
+        f"Schiller-Naumann Cd={sn:.2f} at Re={re:g}, x{factor:.2f} "
         f"for {blockage*100:.0f}% blockage -> expect ~{conf:.2f}"
     )
 
@@ -640,7 +661,8 @@ def _blockage_component(mode: str, shape: str, params: Dict[str, Any]) -> Dict[s
     else:
         status = "fail"
     if mode == "3d" and str(shape).lower() == "sphere":
-        detail += (f" Expected to raise a sphere's Cd by ~{(sphere_confinement_factor(ratio)-1)*100:.0f}%"
+        re = max(float(params.get("re", 100.0) or 100.0), 1e-6)
+        detail += (f" Expected to raise a sphere's Cd by ~{(sphere_confinement_factor(ratio, re)-1)*100:.0f}%"
                    " (measured blockage sweep).")
     return {
         "status": status,

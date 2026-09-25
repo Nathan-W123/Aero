@@ -226,6 +226,28 @@ def test_the_old_d_squared_number_now_fails_the_sharp_band():
     assert status != "pass"
 
 
+def test_sphere_confinement_weakens_with_re():
+    """Measured: blockage costs a sphere roughly half as much drag at Re=100 as at Re=20."""
+    from aero.benchmarks import sphere_confinement_factor, sphere_confinement_slope
+    assert sphere_confinement_slope(20.0) == pytest.approx(1.00)
+    assert sphere_confinement_slope(100.0) == pytest.approx(0.58)
+    assert sphere_confinement_slope(20.0) > sphere_confinement_slope(45.0) > sphere_confinement_slope(100.0)
+    assert sphere_confinement_slope(5.0) == sphere_confinement_slope(20.0)       # held outside
+    assert sphere_confinement_slope(300.0) == sphere_confinement_slope(100.0)
+    assert sphere_confinement_factor(None, 100.0) == 1.0
+
+
+def test_sphere_band_contains_the_re100_confinement_pair():
+    """The Re=100 pair the slope was calibrated on (r=7, 96-long tunnel, Cd on pi r^2)."""
+    from aero.benchmarks import assess_literature, sphere_expected_cd
+    for blockage, cd in ((14 / 48, 1.3607), (14 / 96, 1.2629)):
+        status, msg = assess_literature(mode="3d", shape="sphere", re=100.0, cd=cd, blockage=blockage)
+        assert status == "pass", msg
+    # 29% blockage at Re=100: the Re=20 slope said ~1.44; the measured one says ~1.28.
+    _, conf, _ = sphere_expected_cd(100.0, 14 / 48)
+    assert conf == pytest.approx(1.276, abs=0.01)
+
+
 # ---------------------------------------------------------------------------
 # Uncertainty of a correlated mean
 # ---------------------------------------------------------------------------

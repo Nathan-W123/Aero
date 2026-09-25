@@ -372,11 +372,11 @@ def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int) -> Dict[str,
         if comp.get("status") == "n/a":
             continue
         out[name] = {"status": comp["status"], "message": comp.get("message", ""),
-                     "short": _short_label(name, comp.get("value"), mode, shape)}
+                     "short": _short_label(name, comp.get("value"), mode, shape, _f(p, "re", 100.0))}
     return out
 
 
-def _short_label(name: str, v: Any, mode: str, shape: str) -> str:
+def _short_label(name: str, v: Any, mode: str, shape: str, re: float = 100.0) -> str:
     """A few words for the chip, so the finding is readable without hovering."""
     try:
         if name == "statistical":
@@ -386,7 +386,7 @@ def _short_label(name: str, v: Any, mode: str, shape: str) -> str:
             s = f"blockage {v*100:.0f}%"
             if mode == "3d" and shape == "sphere":
                 from ..benchmarks import sphere_confinement_factor
-                s += f" · ~+{(sphere_confinement_factor(v)-1)*100:.0f}% on Cd"
+                s += f" · ~+{(sphere_confinement_factor(v, re)-1)*100:.0f}% on Cd"
             return s
         if name == "domain_length":
             return f"{v['upstream_D']:.1f}D upstream · {v['downstream_D']:.1f}D downstream"
