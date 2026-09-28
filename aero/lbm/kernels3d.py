@@ -29,6 +29,64 @@ _TILE = 64
 
 
 if HAS_NUMBA:
+    @nb.njit(cache=True, inline="always")
+    def _store_row(f_post, i, z, y, x0, n, out_t, stream, exi, eyi, ezi):
+        """
+        Write one tile of post-collision values for direction ``i``.
+
+        In place when ``stream`` is False; otherwise pushed to
+        ``(z+ez, y+ey, x+ex)`` with periodic wrap, exactly as
+        :func:`stream_kernel_3d` would move them.  The x shift stays a
+        unit-stride block move plus at most one wrapped element.
+        """
+        _, nz, ny, nx = f_post.shape
+        if not stream:
+            for k in range(n):
+                f_post[i, z, y, x0 + k] = out_t[k]
+            return
+        zn = (z + ezi) % nz
+        yn = (y + eyi) % ny
+        if exi == 0:
+            for k in range(n):
+                f_post[i, zn, yn, x0 + k] = out_t[k]
+        elif exi == 1:
+            m = n
+            if x0 + n == nx:
+                m = n - 1
+                f_post[i, zn, yn, 0] = out_t[n - 1]
+            for k in range(m):
+                f_post[i, zn, yn, x0 + k + 1] = out_t[k]
+        elif exi == -1:
+            k0 = 0
+            if x0 == 0:
+                k0 = 1
+                f_post[i, zn, yn, nx - 1] = out_t[0]
+            for k in range(k0, n):
+                f_post[i, zn, yn, x0 + k - 1] = out_t[k]
+        else:
+            for k in range(n):
+                f_post[i, zn, yn, (x0 + k + exi) % nx] = out_t[k]
+
+    @nb.njit(cache=True)
+    def gather_prestream_3d(f_post, f_pre, node_z, node_y, node_x, ex, ey, ez):
+        """
+        Recover post-collision values at the given nodes after a fused
+        collide-and-stream step: what left node ``p`` in direction ``i`` now
+        sits at ``p + e_i``.  Must run before any boundary condition writes
+        into ``f_post``.
+        """
+        q, nz, ny, nx = f_post.shape
+        for p in range(node_z.shape[0]):
+            z = node_z[p]
+            y = node_y[p]
+            x = node_x[p]
+            for i in range(q):
+                f_pre[i, z, y, x] = f_post[
+                    i, (z + ez[i]) % nz, (y + ey[i]) % ny, (x + ex[i]) % nx
+                ]
+
+
+if HAS_NUMBA:
     @nb.njit(cache=True, parallel=True)
     def collision_kernel_3d(
         f: np.ndarray,
@@ -45,6 +103,7 @@ if HAS_NUMBA:
         acc_field: np.ndarray,
         force_mode: int,
         h3: float = 0.0,
+        stream: bool = False,
     ) -> None:
         """
         Fused macroscopic + BGK collision for D3Q19/D3Q27, with Guo forcing.
@@ -61,6 +120,10 @@ if HAS_NUMBA:
         D3Q27, 0.0 on D3Q19, where the lattice lacks the moment to support it.
         At 0.0 the extra term is multiplied by exactly zero, so D3Q19 results
         are bit-identical to not having it.
+
+        With ``stream`` the result is pushed straight to its streamed position
+        in ``f_post``, saving the separate streaming pass over memory; the
+        values are the same, only where they are written differs.
         """
         Q, Nz, Ny, Nx = f.shape
         for z in nb.prange(Nz):
@@ -74,6 +137,7 @@ if HAS_NUMBA:
             ay_t = np.zeros(_TILE)
             az_t = np.zeros(_TILE)
             ua_t = np.zeros(_TILE)
+            out_t = np.empty(_TILE)
 
             for y in range(Ny):
                 for x0 in range(0, Nx, _TILE):
@@ -146,9 +210,8 @@ if HAS_NUMBA:
                                     + h3 * 4.5 * (eu * eu * eu - eu * usq_t[k])
                                 )
                                 om = om_t[k]
-                                f_post[i, z, y, x0 + k] = (
-                                    (1.0 - om) * f[i, z, y, x0 + k] + om * feqi
-                                )
+                                out_t[k] = (1.0 - om) * f[i, z, y, x0 + k] + om * feqi
+                            _store_row(f_post, i, z, y, x0, n, out_t, stream, exi, eyi, ezi)
                     else:
                         for i in range(Q):
                             exi = ex[i]
@@ -166,9 +229,8 @@ if HAS_NUMBA:
                                 src = (1.0 - 0.5 * om) * wi * rho_t[k] * (
                                     3.0 * (ea - ua_t[k]) + 9.0 * eu * ea
                                 )
-                                f_post[i, z, y, x0 + k] = (
-                                    (1.0 - om) * f[i, z, y, x0 + k] + om * feqi + src
-                                )
+                                out_t[k] = (1.0 - om) * f[i, z, y, x0 + k] + om * feqi + src
+                            _store_row(f_post, i, z, y, x0, n, out_t, stream, exi, eyi, ezi)
 
     @nb.njit(cache=True, parallel=True)
     def stream_kernel_3d(

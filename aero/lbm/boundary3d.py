@@ -17,16 +17,109 @@ out by hand is exactly the kind of thing whose transcription errors survive
 review and then show up as a slow momentum leak.
 """
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
 from .lattice3d import D3Q19, Lattice3D, compute_feq, compute_macroscopic
 
+try:
+    import numba as nb
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+    nb = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Inlet: Zou-He 3D velocity BC at x=0
 # ---------------------------------------------------------------------------
+
+if _HAS_NUMBA:
+    @nb.njit(cache=True)
+    def _zou_he_x_kernel(f, ux_t, uy_t, uz_t, c, minus, zero, plus, opp_plus,
+                         ex, ey, ez, w, s, rho):
+        """
+        :func:`_zou_he_x_inlet` one face cell at a time.
+
+        The NumPy form makes some forty passes over a face that is strided by
+        Nx in memory; this makes one.  Every cell sees the same operations in
+        the same order (sums run over the index groups in index order, as
+        NumPy's do), so the result is bit-identical.
+        """
+        nz, ny = rho.shape
+        for z in range(nz):
+            for y in range(ny):
+                km = f[minus[0], z, y, c]
+                for j in range(1, minus.size):
+                    km = km + f[minus[j], z, y, c]
+                kz = f[zero[0], z, y, c]
+                for j in range(1, zero.size):
+                    kz = kz + f[zero[j], z, y, c]
+                ux = ux_t[z, y]
+                uy = uy_t[z, y]
+                uz = uz_t[z, y]
+                den = 1.0 - ux
+                if den < 1e-10:
+                    den = 1e-10
+                r = (2.0 * km + kz) / den
+                rho[z, y] = r
+                cy = 0.0
+                cz = 0.0
+                for j in range(zero.size):
+                    i = zero[j]
+                    cy = cy + ey[i] * f[i, z, y, c]
+                for j in range(zero.size):
+                    i = zero[j]
+                    cz = cz + ez[i] * f[i, z, y, c]
+                for k in range(plus.size):
+                    i = plus[k]
+                    eu = ex[i] * ux + ey[i] * uy + ez[i] * uz
+                    f[i, z, y, c] = f[opp_plus[k], z, y, c] + 6.0 * w[i] * r * eu
+                lam_y = ((2.0 / 3.0) * r * uy - cy) / s
+                lam_z = ((2.0 / 3.0) * r * uz - cz) / s
+                for k in range(plus.size):
+                    i = plus[k]
+                    if ey[i] != 0.0:
+                        f[i, z, y, c] += lam_y * w[i] * ey[i]
+                    if ez[i] != 0.0:
+                        f[i, z, y, c] += lam_z * w[i] * ez[i]
+
+    @nb.njit(cache=True, parallel=True)
+    def _outlet_convective_kernel(f, prev, u):
+        """:func:`apply_outlet_convective_3d` in one pass over the strided face."""
+        q, nz, ny, nx = f.shape
+        for z in nb.prange(nz):
+            for i in range(q):
+                for y in range(ny):
+                    new = (1.0 - u) * prev[i, z, y] + u * f[i, z, y, nx - 2]
+                    f[i, z, y, nx - 1] = new
+                    prev[i, z, y] = new
+
+
+# Lattice index groups for the compiled inlet, built once per lattice (the
+# Lattice3D properties rebuild their arrays on every access).
+_ZOU_HE_TABLES: Dict[str, tuple] = {}
+
+
+def _zou_he_tables(lat: Lattice3D) -> tuple:
+    t = _ZOU_HE_TABLES.get(lat.name)
+    if t is None:
+        plus = lat.x_plus.astype(np.int64)
+        t = (
+            lat.x_minus.astype(np.int64), lat.x_zero.astype(np.int64), plus,
+            lat.OPP[plus].astype(np.int64),
+            lat.ex, lat.ey, lat.ez, np.ascontiguousarray(lat.W, dtype=np.float64),
+            float(lat.transverse_norm),
+        )
+        _ZOU_HE_TABLES[lat.name] = t
+    return t
+
+
+def _compiled(f) -> bool:
+    """True when ``f`` can go through the Numba boundary kernels."""
+    return _HAS_NUMBA and type(f) is np.ndarray and f.dtype == np.float64
+
 
 def _zou_he_x_inlet(
     f: np.ndarray,
@@ -64,6 +157,14 @@ def _zou_he_x_inlet(
     unchanged, where the unknown set is nine directions rather than five and
     three of them carry ``e_y > 0`` instead of one.
     """
+    if _compiled(f):
+        shape = (f.shape[1], f.shape[2])
+        targets = [np.ascontiguousarray(np.broadcast_to(t, shape), dtype=np.float64)
+                   for t in (ux_t, uy_t, uz_t)]
+        rho = np.empty(shape)
+        _zou_he_x_kernel(f, *targets, int(c), *_zou_he_tables(lat), rho)
+        return rho
+
     U = lat.x_plus
     opp_u = lat.OPP[U].astype(np.intp)
     ex, ey, ez, w = lat.ex, lat.ey, lat.ez, lat.W
@@ -195,6 +296,9 @@ def apply_outlet_convective_3d(
     Same advection scheme as the 2D version; f_outlet_prev has shape (Q,Nz,Ny).
     """
     u = float(np.clip(u_conv, 0.0, 1.0))
+    if _compiled(f) and type(f_outlet_prev) is np.ndarray and f_outlet_prev.flags.c_contiguous:
+        _outlet_convective_kernel(f, f_outlet_prev, u)
+        return
     new_outlet = (1.0 - u) * f_outlet_prev + u * f[:,:,:,-2]
     f[:,:,:,-1] = new_outlet
     f_outlet_prev[:] = new_outlet

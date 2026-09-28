@@ -6,6 +6,9 @@ Timestep loop:
   2. Push streaming f_pre → f_post.  Streaming never writes to its source, so
      f_pre stays available as the post-collision / pre-streaming state for
      bounce-back and forces.
+     With Numba, BGK and regularized collide straight into f_post instead
+     (one pass over memory, not two) and f_pre is refilled at the
+     surface-link nodes only, which are all that read it.
   3. BCs: bounce-back → inlet → outlet → walls
   4. Forces: momentum exchange → Cd, Cl_y, Cl_z
 
@@ -472,12 +475,34 @@ class Solver3D:
         mode = resolve_force_mode(self._acc_uniform, None)
         return mode, self._acc_uniform_dev, self._acc_dummy_dev
 
-    def _step(self) -> tuple:
-        f = self.f
+    def _work_buffers(self, f) -> tuple:
+        """
+        The pre- and post-streaming arrays for this step, recycled.
 
-        force_mode, acc_u, acc_f = self._build_acceleration()
-        self._last_acc = (force_mode, acc_f)
+        Allocating two Q x Nz x Ny x Nx arrays every step cost more than the
+        streaming itself: fresh pages fault in on first write (about 9 ms a
+        step on a 96x48x48 grid).  Three arrays rotate instead.  The array in
+        ``self.f`` is never handed out, and one set from outside (a test, a
+        checkpoint) is never taken into the pool, so nothing a caller holds
+        is overwritten.  A reference kept to ``solver.f`` itself is only valid
+        until the step after next -- copy it to keep it longer.
+        """
+        owned = getattr(self, "_pool", [])
+        free = [b for b in owned if b is not f and b.shape == f.shape and b.dtype == f.dtype]
+        while len(free) < 2:
+            free.append(self._xp.empty_like(f))
+        self._pool = free[:2] + [b for b in owned if b is f]
+        return free[0], free[1]
 
+    def _relaxation_field(self, f) -> tuple:
+        """
+        (omega_field, use_omega_field) for the state ``f``.
+
+        The subgrid model's local omega, then the wall model's on wall cells,
+        so wall cells take the modelled value and everything else keeps the
+        subgrid one.  Shared by the step and :meth:`surface_fields`, so the
+        wall shear stress is read with the viscosity the step relaxed with.
+        """
         omega_field = self._omega_dummy
         use_omega_field = False
         if self.les:
@@ -489,8 +514,6 @@ class Solver3D:
             )
             use_omega_field = True
         if self.wall_model:
-            # Runs after the subgrid model so wall cells take the modelled
-            # value and everything else keeps the subgrid one.
             if not use_omega_field:
                 omega_field = np.full((self.Nz, self.Ny, self.Nx), self.omega)
                 use_omega_field = True
@@ -504,28 +527,58 @@ class Solver3D:
                 omega_field, (_ux_w, _uy_w, _uz_w), solid_cpu, self._base_nu,
                 wall_distance=self.wall_model_distance, mask=self._wall_mask,
             )
+        return omega_field, use_omega_field
+
+    def _link_nodes(self) -> tuple:
+        """(z, y, x) of every fluid node with a surface link, cached per link table."""
+        links = self.surface_links
+        cached = getattr(self, "_link_nodes_cache", None)
+        if cached is None or cached[0] is not links:
+            nodes = np.unique(np.asarray(links)[:, 1:4].astype(np.int64), axis=0)
+            cached = (links, tuple(np.ascontiguousarray(nodes[:, j]) for j in range(3)))
+            self._link_nodes_cache = cached
+        return cached[1]
+
+    def _step(self) -> tuple:
+        f = self.f
+
+        force_mode, acc_u, acc_f = self._build_acceleration()
+        self._last_acc = (force_mode, acc_f)
+
+        omega_field, use_omega_field = self._relaxation_field(f)
         omega_use = self.omega
 
         # Collision. `f_pre` is the post-collision, pre-streaming state:
         # streaming always reads it and writes into a separate array, so it
         # stays valid for mid-link bounce-back and the force evaluation
         # without needing a snapshot copy.
+        #
+        # The BGK and regularized kernels can instead push each value straight
+        # to its streamed position (`fuse`), which saves a full pass over
+        # memory.  Only the surface-link nodes ever read `f_pre` (bounce-back
+        # and the momentum-exchange force), so it is then filled at those
+        # nodes alone, from where the values landed.
         xp = self._xp
+        f_pre, f_post = self._work_buffers(f)
+        fuse = (
+            self._use_numba and not self._use_cupy and not self.bouzidi
+            and (self.collision == "bgk" and _k3.HAS_NUMBA
+                 or self.collision == "regularized" and _kreg3._HAS_NUMBA)
+        )
+        f_coll = f_post if fuse else f_pre
         if self.collision == "mrt":
-            f_pre = np.empty_like(f)
             self._mrt_kernel.collide(
                 f, f_pre, self.solid, self._ex, self._ey, self._ez, self._w,
                 omega_field if use_omega_field else None,
                 acc_u, acc_f, force_mode,
             )
         elif self.collision == "regularized":
-            f_pre = np.empty_like(f)
             if self._use_numba and _kreg3._HAS_NUMBA:
                 _kreg3.regularized_collision_kernel_3d(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_coll, self.solid, omega_use,
                     self._ex, self._ey, self._ez, self._w,
                     omega_field, use_omega_field,
-                    acc_u, acc_f, force_mode, self.lattice.h3_factor,
+                    acc_u, acc_f, force_mode, self.lattice.h3_factor, fuse,
                 )
             else:
                 _kreg3.regularized_collision_numpy_3d(
@@ -537,7 +590,6 @@ class Solver3D:
                 )
 
         elif self.collision == "trt":
-            f_pre = np.empty_like(f)
             if self._use_numba and _ktrt3._HAS_NUMBA:
                 _ktrt3.trt_collision_kernel_3d(
                     f, f_pre, self.solid, omega_use,
@@ -555,7 +607,6 @@ class Solver3D:
                     self.lattice,
                 )
         elif self._use_cupy:
-            f_pre = xp.empty_like(f)
             collision_kernel_3d_xp(
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
@@ -563,17 +614,15 @@ class Solver3D:
                 acc_u, acc_f, force_mode, xp=xp, h3=self.lattice.h3_factor,
             )
         elif self._use_numba:
-            f_pre = np.empty_like(f)
             _k3.collision_kernel_3d(
-                f, f_pre, self.solid, omega_use,
+                f, f_coll, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
-                acc_u, acc_f, force_mode, self.lattice.h3_factor,
+                acc_u, acc_f, force_mode, self.lattice.h3_factor, fuse,
             )
         else:
             # Pure-NumPy path — never dispatches to the JIT kernels even when
             # Numba is installed, so `backend="numpy"` means what it says.
-            f_pre = np.empty_like(f)
             _k3.collision_kernel_3d_numpy(
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
@@ -582,14 +631,14 @@ class Solver3D:
             )
 
         # Push streaming into a fresh array (never writes to its source)
-        if self._use_cupy:
-            f_post = xp.empty_like(f_pre)
+        if fuse:
+            _k3.gather_prestream_3d(f_post, f_pre, *self._link_nodes(),
+                                    self._ex, self._ey, self._ez)
+        elif self._use_cupy:
             stream_kernel_3d_xp(f_pre, f_post, self._ex, self._ey, self._ez, xp=xp)
         elif self._use_numba:
-            f_post = np.empty_like(f_pre)
             _k3.stream_kernel_3d(f_pre, f_post, self._ex, self._ey, self._ez)
         else:
-            f_post = np.empty_like(f_pre)
             _k3.stream_kernel_3d_numpy(f_pre, f_post, self._ex, self._ey, self._ez)
 
         # BCs
@@ -933,15 +982,11 @@ class Solver3D:
         f_cpu = self.f.get() if self._use_cupy else self.f
         links = self.surface_links.get() if self._use_cupy else self.surface_links
         solid = self.solid.get() if self._use_cupy else self.solid
-        omega_field = None
-        if self.les:
-            omega_field = build_omega_field_3d(
-                f_cpu, solid, ~solid, self._base_nu, self.omega,
-                self.les_cs, les_model=self.les_model, phi=self.phi,
-                van_driest=self.van_driest, van_driest_A=self.van_driest_A,
-                lattice=self.lattice,
-            wall_model=self.wall_model, wall_model_distance=self.wall_model_distance,
-            )
+        omega_field, varies = self._relaxation_field(self.f)
+        if not varies:
+            omega_field = None
+        elif self._use_cupy and not isinstance(omega_field, np.ndarray):
+            omega_field = omega_field.get()
         return surface_fields(
             f_cpu, links, e=self.lattice.E, w=self.lattice.W, omega=self.omega,
             rho_ref=self.rho0, u_ref=self.u0, omega_field=omega_field,

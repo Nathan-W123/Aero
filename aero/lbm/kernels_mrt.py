@@ -33,6 +33,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 if _HAS_NUMBA:
+    # x-tile length: five Q x tile scratch arrays have to stay in cache.
+    _TILE = 32
+
     @nb.njit(cache=True, parallel=True)
     def _mrt_collision_2d(
         f:     np.ndarray,   # (9, Ny, Nx)
@@ -52,95 +55,143 @@ if _HAS_NUMBA:
         acc_field: np.ndarray,
         force_mode: int,
     ) -> None:
+        """
+        MRT collision with Guo forcing, parallel over rows, tiled along x so
+        the moment transforms vectorise.  Per cell every sum runs in the same
+        order as the one-cell-at-a-time form, so results are bit-identical.
+        """
         Q, Ny, Nx = f.shape
         for y in nb.prange(Ny):
-            # Scratch hoisted out of the cell loop: allocating these per cell
-            # costs one heap allocation per cell per timestep.
-            feq = np.empty(Q)
-            m = np.empty(Q)
-            m_eq = np.empty(Q)
-            m_post = np.empty(Q)
-            src = np.empty(Q)
-            s_cell = s.copy()
-            for x in range(Nx):
-                if use_omega_field:
-                    # Subgrid viscosity only moves the viscous rates; the
-                    # conserved and ghost modes keep their tuned values.
-                    sv = omega_field[y, x]
-                    for k in range(visc_modes.shape[0]):
-                        s_cell[visc_modes[k]] = sv
-                    sq_local = 8.0 * (2.0 - sv) / (8.0 - sv)
-                    for k in range(flux_modes.shape[0]):
-                        s_cell[flux_modes[k]] = sq_local
+            # which rates the subgrid viscosity replaces: 1 viscous, 2 the flux
+            # rates tied to it (assigned second, so they win a tie)
+            kind = np.zeros(Q, dtype=np.int64)
+            for kk in range(visc_modes.shape[0]):
+                kind[visc_modes[kk]] = 1
+            for kk in range(flux_modes.shape[0]):
+                kind[flux_modes[kk]] = 2
+            rho_t = np.empty(_TILE)
+            ux_t = np.empty(_TILE)
+            uy_t = np.empty(_TILE)
+            usq_t = np.empty(_TILE)
+            ua_t = np.empty(_TILE)
+            ax_t = np.empty(_TILE)
+            ay_t = np.empty(_TILE)
+            sv_t = np.empty(_TILE)
+            sq_t = np.empty(_TILE)
+            acc_t = np.empty(_TILE)
+            feq_t = np.empty((Q, _TILE))
+            src_t = np.empty((Q, _TILE))
+            m_t = np.empty((Q, _TILE))
+            meq_t = np.empty((Q, _TILE))
+            mpost_t = np.empty((Q, _TILE))
+            for x0 in range(0, Nx, _TILE):
+                n = Nx - x0
+                if n > _TILE:
+                    n = _TILE
+
                 # --- macroscopic ---
-                rho = 0.0; mx = 0.0; my = 0.0
+                for k in range(n):
+                    rho_t[k] = 0.0
+                    ux_t[k] = 0.0
+                    uy_t[k] = 0.0
                 for i in range(Q):
-                    fi = f[i, y, x]; rho += fi
-                    mx += ex[i] * fi; my += ey[i] * fi
-                inv_rho = 1.0 / rho if rho > 0.0 else 0.0
+                    exi = ex[i]
+                    eyi = ey[i]
+                    for k in range(n):
+                        fi = f[i, y, x0 + k]
+                        rho_t[k] += fi
+                        ux_t[k] += exi * fi
+                        uy_t[k] += eyi * fi
+                for k in range(n):
+                    rho = rho_t[k]
+                    inv_rho = 1.0 / rho if rho > 0.0 else 0.0
+                    ax = 0.0
+                    ay = 0.0
+                    if force_mode == 1:
+                        ax = acc_uniform[0]
+                        ay = acc_uniform[1]
+                    elif force_mode == 2:
+                        ax = acc_field[0, y, x0 + k]
+                        ay = acc_field[1, y, x0 + k]
+                    if solid[y, x0 + k]:
+                        ux = 0.0; uy = 0.0
+                        ax = 0.0; ay = 0.0
+                    else:
+                        # half-force correction: rho u = sum e_i f_i + F/2
+                        ux = ux_t[k] * inv_rho + 0.5 * ax
+                        uy = uy_t[k] * inv_rho + 0.5 * ay
+                    ux_t[k] = ux
+                    uy_t[k] = uy
+                    ax_t[k] = ax
+                    ay_t[k] = ay
+                    usq_t[k] = ux * ux + uy * uy
+                    ua_t[k] = ux * ax + uy * ay
+                    if use_omega_field:
+                        sv = omega_field[y, x0 + k]
+                        sv_t[k] = sv
+                        sq_t[k] = 8.0 * (2.0 - sv) / (8.0 - sv)
 
-                ax = 0.0
-                ay = 0.0
-                if force_mode == 1:
-                    ax = acc_uniform[0]
-                    ay = acc_uniform[1]
-                elif force_mode == 2:
-                    ax = acc_field[0, y, x]
-                    ay = acc_field[1, y, x]
-
-                if solid[y, x]:
-                    ux = 0.0; uy = 0.0
-                    ax = 0.0; ay = 0.0
-                else:
-                    # half-force correction: rho u = sum e_i f_i + F/2
-                    ux = mx * inv_rho + 0.5 * ax
-                    uy = my * inv_rho + 0.5 * ay
-
-                usq = ux * ux + uy * uy
-                ua = ux * ax + uy * ay
-
-                # --- feq ---
+                # --- feq and the Guo source in distribution space ---
                 for i in range(Q):
-                    eu = ex[i] * ux + ey[i] * uy
-                    feq[i] = w[i] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq)
-
-                # --- Guo source in distribution space ---
-                if force_mode != 0:
-                    for i in range(Q):
-                        eu = ex[i] * ux + ey[i] * uy
-                        ea = ex[i] * ax + ey[i] * ay
-                        src[i] = w[i] * rho * (3.0 * (ea - ua) + 9.0 * eu * ea)
+                    exi = ex[i]
+                    eyi = ey[i]
+                    wi = w[i]
+                    for k in range(n):
+                        eu = exi * ux_t[k] + eyi * uy_t[k]
+                        feq_t[i, k] = wi * rho_t[k] * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*usq_t[k])
+                    if force_mode != 0:
+                        for k in range(n):
+                            eu = exi * ux_t[k] + eyi * uy_t[k]
+                            ea = exi * ax_t[k] + eyi * ay_t[k]
+                            src_t[i, k] = wi * rho_t[k] * (3.0 * (ea - ua_t[k]) + 9.0 * eu * ea)
 
                 # --- m = M @ f, m_eq = M @ feq ---
                 for a in range(Q):
-                    acc_m = 0.0
-                    acc_eq = 0.0
+                    for k in range(n):
+                        m_t[a, k] = 0.0
+                        meq_t[a, k] = 0.0
                     for b in range(Q):
-                        acc_m += M[a, b] * f[b, y, x]
-                        acc_eq += M[a, b] * feq[b]
-                    m[a] = acc_m
-                    m_eq[a] = acc_eq
+                        mab = M[a, b]
+                        for k in range(n):
+                            m_t[a, k] += mab * f[b, y, x0 + k]
+                            meq_t[a, k] += mab * feq_t[b, k]
 
                 # --- relax: m_post = m - s*(m - m_eq) + (I - S/2) M src ---
-                if force_mode == 0:
-                    for a in range(Q):
-                        m_post[a] = m[a] - s_cell[a] * (m[a] - m_eq[a])
-                else:
-                    for a in range(Q):
-                        acc_s = 0.0
+                for a in range(Q):
+                    sa = s[a]
+                    ka = kind[a] if use_omega_field else 0
+                    if force_mode != 0:
+                        for k in range(n):
+                            acc_t[k] = 0.0
                         for b in range(Q):
-                            acc_s += M[a, b] * src[b]
-                        m_post[a] = (
-                            m[a] - s_cell[a] * (m[a] - m_eq[a])
-                            + (1.0 - 0.5 * s_cell[a]) * acc_s
-                        )
+                            mab = M[a, b]
+                            for k in range(n):
+                                acc_t[k] += mab * src_t[b, k]
+                    for k in range(n):
+                        if ka == 1:
+                            sk = sv_t[k]
+                        elif ka == 2:
+                            sk = sq_t[k]
+                        else:
+                            sk = sa
+                        if force_mode == 0:
+                            mpost_t[a, k] = m_t[a, k] - sk * (m_t[a, k] - meq_t[a, k])
+                        else:
+                            mpost_t[a, k] = (
+                                m_t[a, k] - sk * (m_t[a, k] - meq_t[a, k])
+                                + (1.0 - 0.5 * sk) * acc_t[k]
+                            )
 
                 # --- f_post = Minv @ m_post ---
                 for i in range(Q):
-                    acc = 0.0
+                    for k in range(n):
+                        acc_t[k] = 0.0
                     for a in range(Q):
-                        acc += Minv[i, a] * m_post[a]
-                    f_post[i, y, x] = acc
+                        mia = Minv[i, a]
+                        for k in range(n):
+                            acc_t[k] += mia * mpost_t[a, k]
+                    for k in range(n):
+                        f_post[i, y, x0 + k] = acc_t[k]
 
 else:
     def _mrt_collision_2d(f, f_post, solid, s, M, Minv, ex, ey, w,

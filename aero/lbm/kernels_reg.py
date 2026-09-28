@@ -118,6 +118,9 @@ def regularized_collision_numpy(
 
 
 if _HAS_NUMBA:
+    # x-tile length, as in kernels.collision_kernel.
+    _TILE = 64
+
     @nb.njit(cache=True, parallel=True)
     def regularized_collision_kernel(
         f: np.ndarray,
@@ -133,75 +136,122 @@ if _HAS_NUMBA:
         acc_field: np.ndarray,
         force_mode: int,
     ) -> None:
+        """
+        Regularized collision with Guo forcing, parallel over rows.
+
+        Tiled like the BGK kernel so every inner loop runs along x at unit
+        stride and vectorises; per cell the operations and their order are
+        those of the one-cell-at-a-time form, so results are bit-identical.
+        """
         q, ny, nx = f.shape
         for y in nb.prange(ny):
-            feq = np.empty(q)
-            for x in range(nx):
-                rho = 0.0
-                mx = 0.0
-                my = 0.0
+            rho_t = np.empty(_TILE)
+            ux_t = np.empty(_TILE)
+            uy_t = np.empty(_TILE)
+            usq_t = np.empty(_TILE)
+            ua_t = np.empty(_TILE)
+            om_t = np.empty(_TILE)
+            ax_t = np.empty(_TILE)
+            ay_t = np.empty(_TILE)
+            pxx_t = np.empty(_TILE)
+            pxy_t = np.empty(_TILE)
+            pyy_t = np.empty(_TILE)
+            feq_t = np.empty((q, _TILE))
+
+            for x0 in range(0, nx, _TILE):
+                n = nx - x0
+                if n > _TILE:
+                    n = _TILE
+
+                for k in range(n):
+                    rho_t[k] = 0.0
+                    ux_t[k] = 0.0
+                    uy_t[k] = 0.0
                 for i in range(q):
-                    fi = f[i, y, x]
-                    rho += fi
-                    mx += ex[i] * fi
-                    my += ey[i] * fi
-                inv_r = 1.0 / rho if rho > 0.0 else 0.0
+                    exi = ex[i]
+                    eyi = ey[i]
+                    for k in range(n):
+                        fi = f[i, y, x0 + k]
+                        rho_t[k] += fi
+                        ux_t[k] += exi * fi
+                        uy_t[k] += eyi * fi
 
-                ax = 0.0
-                ay = 0.0
-                if force_mode == 1:
-                    ax = acc_uniform[0]
-                    ay = acc_uniform[1]
-                elif force_mode == 2:
-                    ax = acc_field[0, y, x]
-                    ay = acc_field[1, y, x]
-
-                if solid[y, x]:
-                    ux = 0.0
-                    uy = 0.0
+                for k in range(n):
+                    rho = rho_t[k]
+                    inv_r = 1.0 / rho if rho > 0.0 else 0.0
                     ax = 0.0
                     ay = 0.0
-                else:
-                    ux = mx * inv_r + 0.5 * ax
-                    uy = my * inv_r + 0.5 * ay
-                usq = ux * ux + uy * uy
-                ua = ux * ax + uy * ay
+                    if force_mode == 1:
+                        ax = acc_uniform[0]
+                        ay = acc_uniform[1]
+                    elif force_mode == 2:
+                        ax = acc_field[0, y, x0 + k]
+                        ay = acc_field[1, y, x0 + k]
+                    if solid[y, x0 + k]:
+                        ux = 0.0
+                        uy = 0.0
+                        ax = 0.0
+                        ay = 0.0
+                    else:
+                        ux = ux_t[k] * inv_r + 0.5 * ax
+                        uy = uy_t[k] * inv_r + 0.5 * ay
+                    ux_t[k] = ux
+                    uy_t[k] = uy
+                    ax_t[k] = ax
+                    ay_t[k] = ay
+                    usq_t[k] = ux * ux + uy * uy
+                    ua_t[k] = ux * ax + uy * ay
+                    om_t[k] = omega_field[y, x0 + k] if use_omega_field else omega
+                    pxx_t[k] = 0.0
+                    pxy_t[k] = 0.0
+                    pyy_t[k] = 0.0
 
+                # equilibrium and the second moment of the non-equilibrium part
                 for i in range(q):
-                    eu = ex[i] * ux + ey[i] * uy
-                    feq[i] = w[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq)
-
-                # second-order moment of the non-equilibrium part
-                pxx = 0.0
-                pxy = 0.0
-                pyy = 0.0
-                for i in range(q):
-                    d = f[i, y, x] - feq[i]
-                    pxx += ex[i] * ex[i] * d
-                    pxy += ex[i] * ey[i] * d
-                    pyy += ey[i] * ey[i] * d
+                    exi = ex[i]
+                    eyi = ey[i]
+                    wi = w[i]
+                    cxx = exi * exi
+                    cxy = exi * eyi
+                    cyy = eyi * eyi
+                    for k in range(n):
+                        eu = exi * ux_t[k] + eyi * uy_t[k]
+                        feq = wi * rho_t[k] * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq_t[k])
+                        feq_t[i, k] = feq
+                        d = f[i, y, x0 + k] - feq
+                        pxx_t[k] += cxx * d
+                        pxy_t[k] += cxy * d
+                        pyy_t[k] += cyy * d
 
                 if force_mode != 0:
                     # fold the force's own second moment in
-                    fx = rho * ax
-                    fy = rho * ay
-                    pxx += ux * fx
-                    pxy += 0.5 * (ux * fy + uy * fx)
-                    pyy += uy * fy
+                    for k in range(n):
+                        rho = rho_t[k]
+                        ux = ux_t[k]
+                        uy = uy_t[k]
+                        fx = rho * ax_t[k]
+                        fy = rho * ay_t[k]
+                        pxx_t[k] += ux * fx
+                        pxy_t[k] += 0.5 * (ux * fy + uy * fx)
+                        pyy_t[k] += uy * fy
 
-                om = omega_field[y, x] if use_omega_field else omega
                 for i in range(q):
-                    hxx = ex[i] * ex[i] - CS2
-                    hxy = ex[i] * ey[i]
-                    hyy = ey[i] * ey[i] - CS2
-                    f1 = HERMITE2 * w[i] * (hxx * pxx + 2.0 * hxy * pxy + hyy * pyy)
-                    out = feq[i] + (1.0 - om) * f1
-                    if force_mode != 0:
-                        eu = ex[i] * ux + ey[i] * uy
-                        ea = ex[i] * ax + ey[i] * ay
-                        # prefactor 1/2, not (1 - omega/2)
-                        out += 0.5 * w[i] * rho * (3.0 * (ea - ua) + 9.0 * eu * ea)
-                    f_post[i, y, x] = out
+                    exi = ex[i]
+                    eyi = ey[i]
+                    wi = w[i]
+                    hxx = exi * exi - CS2
+                    hxy = exi * eyi
+                    hyy = eyi * eyi - CS2
+                    hw = HERMITE2 * wi
+                    for k in range(n):
+                        f1 = hw * (hxx * pxx_t[k] + 2.0 * hxy * pxy_t[k] + hyy * pyy_t[k])
+                        out = feq_t[i, k] + (1.0 - om_t[k]) * f1
+                        if force_mode != 0:
+                            eu = exi * ux_t[k] + eyi * uy_t[k]
+                            ea = exi * ax_t[k] + eyi * ay_t[k]
+                            # prefactor 1/2, not (1 - omega/2)
+                            out += 0.5 * wi * rho_t[k] * (3.0 * (ea - ua_t[k]) + 9.0 * eu * ea)
+                        f_post[i, y, x0 + k] = out
 else:
     def regularized_collision_kernel(*args, **kwargs):  # type: ignore[misc]
         raise ImportError("Numba required for the JIT regularized kernel")

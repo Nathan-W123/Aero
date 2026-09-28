@@ -362,13 +362,32 @@ class Solver:
         mode = resolve_force_mode(self._acc_uniform, None)
         return mode, self._acc_uniform, self._acc_dummy
 
-    def _step(self) -> tuple:
-        """Execute one LBM timestep. Returns instantaneous (Cd, Cl)."""
-        f = self.f
+    def _work_buffers(self, f) -> tuple:
+        """
+        The pre- and post-streaming arrays for this step, recycled.
 
-        force_mode, acc_u, acc_f = self._build_acceleration()
-        self._last_acc = (force_mode, acc_f)
+        Allocating two fresh Q x Ny x Nx arrays every step costs page faults
+        on first write; three arrays rotate instead.  The array in ``self.f``
+        is never handed out, and one set from outside is never taken into the
+        pool, so nothing a caller holds is overwritten.  A reference kept to
+        ``solver.f`` itself is valid until the step after next.
+        """
+        owned = getattr(self, "_pool", [])
+        free = [b for b in owned if b is not f and b.shape == f.shape and b.dtype == f.dtype]
+        while len(free) < 2:
+            free.append(np.empty_like(f))
+        self._pool = free[:2] + [b for b in owned if b is f]
+        return free[0], free[1]
 
+    def _relaxation_field(self, f) -> tuple:
+        """
+        (omega_field, use_omega_field) for the state ``f``.
+
+        The subgrid model's local omega, then the wall model's on wall cells,
+        so wall cells take the modelled value and everything else keeps the
+        subgrid one.  Shared by the step and :meth:`surface_fields`, so the
+        wall shear stress is read with the viscosity the step relaxed with.
+        """
         omega_field = self._omega_dummy
         use_omega_field = False
         if self.les:
@@ -379,8 +398,6 @@ class Solver:
             )
             use_omega_field = True
         if self.wall_model:
-            # Runs after the subgrid model so wall cells take the modelled
-            # value and everything else keeps the subgrid one.
             if not use_omega_field:
                 omega_field = np.full((self.Ny, self.Nx), self.omega)
                 use_omega_field = True
@@ -391,14 +408,24 @@ class Solver:
                 omega_field, (_ux_w, _uy_w), self.solid, self._base_nu,
                 wall_distance=self.wall_model_distance, mask=self._wall_mask,
             )
+        return omega_field, use_omega_field
+
+    def _step(self) -> tuple:
+        """Execute one LBM timestep. Returns instantaneous (Cd, Cl)."""
+        f = self.f
+
+        force_mode, acc_u, acc_f = self._build_acceleration()
+        self._last_acc = (force_mode, acc_f)
+
+        omega_field, use_omega_field = self._relaxation_field(f)
         omega_use = self.omega
 
         # 1+2. Collision (with Guo forcing).  `f_pre` is the post-collision,
         #      pre-streaming state: streaming always reads it and writes into a
         #      separate array, so it stays valid for mid-link bounce-back and
         #      the force evaluation without needing a snapshot copy.
+        f_pre, f_post = self._work_buffers(f)
         if self.collision == "mrt":
-            f_pre = np.empty_like(f)
             self._mrt_kernel.collide(
                 f, f_pre, self.solid, self._ex, self._ey, self._w,
                 omega_field if use_omega_field else None,
@@ -406,7 +433,6 @@ class Solver:
             )
 
         elif self.collision == "regularized":
-            f_pre = np.empty_like(f)
             if self._use_numba and _kreg._HAS_NUMBA:
                 _kreg.regularized_collision_kernel(
                     f, f_pre, self.solid, omega_use,
@@ -423,7 +449,6 @@ class Solver:
                 )
 
         elif self.collision == "trt":
-            f_pre = np.empty_like(f)
             if self._use_numba and _ktrt._HAS_NUMBA:
                 _ktrt.trt_collision_kernel(
                     f, f_pre, self.solid, omega_use,
@@ -442,7 +467,6 @@ class Solver:
 
         elif self._use_numba:
             # Fused macroscopic + BGK collision
-            f_pre = np.empty_like(f)
             _kernels.collision_kernel(
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._w,
@@ -453,7 +477,6 @@ class Solver:
         else:
             # Pure-NumPy path — never dispatches to the JIT kernels even when
             # Numba is installed, so `backend="numpy"` means what it says.
-            f_pre = np.empty_like(f)
             _kernels.collision_kernel_numpy(
                 f, f_pre, self.solid, omega_use,
                 self._ex, self._ey, self._w,
@@ -462,7 +485,6 @@ class Solver:
             )
 
         # 3. Push streaming into a fresh array (never writes to its source)
-        f_post = np.empty_like(f_pre)
         if self._use_numba:
             _kernels.stream_kernel(f_pre, f_post, self._ex, self._ey)
         else:
@@ -756,13 +778,9 @@ class Solver:
 
     def surface_fields(self) -> dict:
         """Per-link Cp, wall shear stress, friction velocity and y+."""
-        omega_field = None
-        if self.les:
-            omega_field = build_omega_field_2d(
-                self.f, self.solid, self.fluid, self._base_nu, self.omega,
-                self.les_cs, les_model=self.les_model, phi=self.phi,
-                van_driest=self.van_driest, van_driest_A=self.van_driest_A,
-            )
+        omega_field, varies = self._relaxation_field(self.f)
+        if not varies:
+            omega_field = None
         return surface_fields(
             self.f, self.surface_links, e=E, w=W, omega=self.omega,
             rho_ref=self.rho0, u_ref=self.u0, omega_field=omega_field,
