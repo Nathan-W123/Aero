@@ -213,3 +213,21 @@ def test_2d_surface_fields_use_the_wall_modelled_viscosity():
     assert s._relaxation_field(s.f)[1]
     fields = s.surface_fields()
     assert np.isfinite(np.asarray(fields["tau_wall"], dtype=float)).all()
+
+
+def test_numpy_backend_never_calls_numba_boundary_kernels(monkeypatch):
+    """
+    ``backend="numpy"`` has to mean NumPy throughout.  The compiled inlet and
+    outlet once ran regardless of the backend, which (among other things)
+    made Numba's colour handling write terminal escapes into the output of
+    MPI runs on the NumPy backend.
+    """
+    def boom(*args, **kwargs):
+        raise AssertionError("Numba boundary kernel called on the NumPy backend")
+
+    monkeypatch.setattr(b3, "_zou_he_x_kernel", boom)
+    monkeypatch.setattr(b3, "_outlet_convective_kernel", boom)
+    s = _solver3d(backend="numpy", outlet_bc="convective", inlet_perturbation=0.02)
+    for _ in range(3):
+        s._step()
+    assert np.isfinite(s.f).all()

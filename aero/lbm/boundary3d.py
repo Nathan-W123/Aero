@@ -116,8 +116,15 @@ def _zou_he_tables(lat: Lattice3D) -> tuple:
     return t
 
 
-def _compiled(f) -> bool:
-    """True when ``f`` can go through the Numba boundary kernels."""
+def _compiled(f, use_numba: Optional[bool] = None) -> bool:
+    """
+    True when ``f`` should go through the Numba boundary kernels.
+
+    ``use_numba`` is the solver's backend choice; None means "if available".
+    A solver on ``backend="numpy"`` passes False, and gets NumPy throughout.
+    """
+    if use_numba is False:
+        return False
     return _HAS_NUMBA and type(f) is np.ndarray and f.dtype == np.float64
 
 
@@ -128,6 +135,7 @@ def _zou_he_x_inlet(
     uz_t: np.ndarray,
     lat: Lattice3D,
     c: int = 0,
+    use_numba: Optional[bool] = None,
 ) -> np.ndarray:
     """
     Impose ``(ux, uy, uz) = (ux_t, uy_t, uz_t)`` on the x-normal face ``c``.
@@ -157,7 +165,7 @@ def _zou_he_x_inlet(
     unchanged, where the unknown set is nine directions rather than five and
     three of them carry ``e_y > 0`` instead of one.
     """
-    if _compiled(f):
+    if _compiled(f, use_numba):
         shape = (f.shape[1], f.shape[2])
         targets = [np.ascontiguousarray(np.broadcast_to(t, shape), dtype=np.float64)
                    for t in (ux_t, uy_t, uz_t)]
@@ -201,6 +209,7 @@ def apply_inlet_zou_he_3d(
     uz_amp: float = 0.0,
     step: int = 0,
     lattice: Lattice3D = D3Q19,
+    use_numba: Optional[bool] = None,
 ) -> None:
     """
     3D Zou-He velocity BC at left face (x=0): impose ux=u0, uy≈0, uz≈0.
@@ -226,7 +235,7 @@ def apply_inlet_zou_he_3d(
                 * np.sin(2.0 * np.pi * zz / max(nz, 1) + phase)
             )[:, None]
 
-    _zou_he_x_inlet(f, ux_t, uy_t, uz_t, lattice)
+    _zou_he_x_inlet(f, ux_t, uy_t, uz_t, lattice, use_numba=use_numba)
 
 
 def apply_inlet_velocity_field_3d(
@@ -236,6 +245,7 @@ def apply_inlet_velocity_field_3d(
     uz_target: np.ndarray,
     *,
     lattice: Lattice3D = D3Q19,
+    use_numba: Optional[bool] = None,
 ) -> None:
     """3D Zou-He inlet with per-cell target velocity fields at x=0."""
     _zou_he_x_inlet(
@@ -244,6 +254,7 @@ def apply_inlet_velocity_field_3d(
         np.asarray(uy_target, dtype=np.float64),
         np.asarray(uz_target, dtype=np.float64),
         lattice,
+        use_numba=use_numba,
     )
 
 
@@ -255,6 +266,7 @@ def apply_inlet_sem_3d(
     w_prime: np.ndarray,
     *,
     lattice: Lattice3D = D3Q19,
+    use_numba: Optional[bool] = None,
 ) -> None:
     """
     Zou-He 3D velocity BC at x=0 with SEM fluctuations.
@@ -271,6 +283,7 @@ def apply_inlet_sem_3d(
         np.asarray(v_prime, dtype=np.float64),
         np.asarray(w_prime, dtype=np.float64),
         lattice,
+        use_numba=use_numba,
     )
 
 
@@ -287,6 +300,7 @@ def apply_outlet_convective_3d(
     f: np.ndarray,
     f_outlet_prev: np.ndarray,
     u_conv: float,
+    use_numba: Optional[bool] = None,
 ) -> None:
     """
     Convective outflow BC at right face (x=Nx-1).
@@ -296,7 +310,8 @@ def apply_outlet_convective_3d(
     Same advection scheme as the 2D version; f_outlet_prev has shape (Q,Nz,Ny).
     """
     u = float(np.clip(u_conv, 0.0, 1.0))
-    if _compiled(f) and type(f_outlet_prev) is np.ndarray and f_outlet_prev.flags.c_contiguous:
+    if (_compiled(f, use_numba) and type(f_outlet_prev) is np.ndarray
+            and f_outlet_prev.flags.c_contiguous):
         _outlet_convective_kernel(f, f_outlet_prev, u)
         return
     new_outlet = (1.0 - u) * f_outlet_prev + u * f[:,:,:,-2]

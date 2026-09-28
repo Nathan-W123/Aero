@@ -659,7 +659,8 @@ class Solver3D:
                     self._sem.step()
                     du, dv, dw = self._sem.fluctuation()
                     apply_inlet_sem_3d(
-                        f_post, self.u0, du, dv, dw, lattice=self.lattice
+                        f_post, self.u0, du, dv, dw, lattice=self.lattice,
+                        use_numba=self._use_numba,
                     )
                 elif self.synthetic_inflow:
                     uy_in, uz_in = self._update_synthetic_inflow()
@@ -669,6 +670,7 @@ class Solver3D:
                         uy_in,
                         uz_in,
                         lattice=self.lattice,
+                        use_numba=self._use_numba,
                     )
                 else:
                     apply_inlet_zou_he_3d(
@@ -677,10 +679,12 @@ class Solver3D:
                         uz_amp=self.inlet_perturbation,
                         step=self.step_count + 1,
                         lattice=self.lattice,
+                        use_numba=self._use_numba,
                     )
 
             if self.outlet_bc == "convective":
-                apply_outlet_convective_3d(f_post, self._f_outlet_prev, self.u0)
+                apply_outlet_convective_3d(f_post, self._f_outlet_prev, self.u0,
+                                           use_numba=self._use_numba)
             else:
                 apply_outlet_zero_gradient_3d(f_post)
         elif self.streamwise_bc == "periodic":
