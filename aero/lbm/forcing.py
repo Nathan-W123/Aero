@@ -151,16 +151,27 @@ def dummy_force_field(ndim: int) -> np.ndarray:
     return np.zeros((ndim,) + (1,) * ndim, dtype=np.float64)
 
 
+def ibm_weight(phi: np.ndarray, width: float = 1.0) -> np.ndarray:
+    """
+    How much of each cell the immersed body occupies, from its signed distance.
+
+    1 inside (``phi <= -width/2``), 0 outside (``phi >= width/2``), linear in
+    between, so the half-way point -- where the forcing is exactly half on --
+    sits on the surface ``phi = 0``.  ``phi`` is in lattice cells, negative
+    inside the body.
+    """
+    return np.clip(0.5 - np.asarray(phi, dtype=np.float64) / float(width), 0.0, 1.0)
+
+
 def ibm_acceleration(
     rho: np.ndarray,
     momentum: Tuple[np.ndarray, ...],
     u_wall: Tuple[np.ndarray, ...],
     phi: np.ndarray,
-    solid: np.ndarray,
-    band: float = 1.5,
+    width: float = 1.0,
 ) -> np.ndarray:
     """
-    Direct-forcing IBM acceleration inside the band ``0 < phi <= band``.
+    Direct-forcing immersed-boundary acceleration, ``(D, *grid)``.
 
     Direct forcing asks the *corrected* velocity to reach the wall velocity::
 
@@ -170,15 +181,21 @@ def ibm_acceleration(
     target in one step under the half-force convention; without it the wall
     condition is under-relaxed.
 
-    Returns a ``(D, *grid)`` acceleration field, zero outside the band.
+    The forcing is weighted by :func:`ibm_weight`: full inside the body, off
+    outside, blended across one cell at the surface.  Forcing a whole band of
+    fluid *outside* the surface to rest, as this once did, holds that band
+    still and makes the body behave as if it were a band-width larger on every
+    side.  The solver treats every cell as fluid when this is on -- the body
+    exists only through this force -- and reports as drag the reaction to it,
+    ``-sum rho a``: the momentum the body takes out of the flow each step.
     """
     from .physics import inv_positive
 
     inv_rho = inv_positive(rho)
-    active = (~solid) & (phi > 0.0) & (phi <= band) & (rho > 0.0)
-    acc = np.zeros((len(momentum),) + rho.shape, dtype=np.float64)
+    weight = ibm_weight(phi, width) * (rho > 0.0)
+    acc = np.zeros((len(momentum),) + np.shape(rho), dtype=np.float64)
     for d, (m, uw) in enumerate(zip(momentum, u_wall)):
-        acc[d] = np.where(active, 2.0 * (uw - m * inv_rho), 0.0)
+        acc[d] = 2.0 * weight * (uw - m * inv_rho)
     return acc
 
 

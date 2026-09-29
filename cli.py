@@ -522,7 +522,9 @@ def main() -> int:
     print("  === RESULTS ===")
     print(_stat_line("Cd (mean)", result["Cd_mean"], result.get("Cd_history")))
     print(_stat_line("Cl (mean)", result["Cl_mean"], result.get("Cl_history")))
-    if "Cd_p_mean" in result:
+    if "Cd_p_mean" in result and math.isnan(result["Cd_p_mean"]):
+        print("  Cd_press/visc = n/a  (an immersed body has no surface to split the drag on)")
+    elif "Cd_p_mean" in result:
         print(f"  Cd_press  = {result['Cd_p_mean']:.4f}  (pressure drag)")
         print(f"  Cd_visc   = {result['Cd_v_mean']:.4f}  (viscous drag)")
     if St is not None:

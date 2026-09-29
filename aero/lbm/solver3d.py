@@ -73,7 +73,7 @@ from .physics import base_nu_from_omega
 from .wall_model import apply_wall_model, wall_adjacent_mask
 from . import kernels3d_trt as _ktrt3
 from . import kernels3d_reg as _kreg3
-from .ibm_guo import ibm_acceleration_3d
+from .ibm_guo import ibm_cells, ibm_forcing
 from .forcing import (
     FORCE_NONE, FORCE_UNIFORM, FORCE_FIELD,
     boussinesq_acceleration, dummy_force_field, resolve_force_mode,
@@ -289,10 +289,20 @@ class Solver3D:
         self._mrt_kernel = None
 
         self.solid = np.ascontiguousarray(solid, dtype=np.bool_)
+        # With the immersed boundary on, the body exists only as a force:
+        # every cell collides as fluid and there are no bounce-back links.
+        # `solid` stays the geometric mask for display, area and diagnostics.
+        self._collide_solid = np.zeros_like(self.solid) if self.ibm_enabled else self.solid
         _phi_for_q = phi if (bouzidi and phi is not None) else None
         self.surface_links, self.q_vals = build_surface_links_3d(
-            self.solid, _phi_for_q, lattice=_lat
+            self._collide_solid, _phi_for_q, lattice=_lat
         )
+        self._ibm_cells = self._ibm_weights = None
+        self._ibm_force = None
+        if self.ibm_enabled:
+            if phi is None:
+                raise ValueError("ibm_enabled needs phi, the signed distance to the body.")
+            self._ibm_cells, self._ibm_weights = ibm_cells(np.asarray(phi))
 
         # Initialize f to equilibrium
         rho_init = np.full((Nz, Ny, Nx), rho0)
@@ -335,6 +345,8 @@ class Solver3D:
             self.f = xp.asarray(self.f)
             self._f_outlet_prev = xp.asarray(self._f_outlet_prev)
             self.solid = xp.asarray(self.solid)
+            self._collide_solid = (xp.asarray(self._collide_solid) if self.ibm_enabled
+                                   else self.solid)
             self._ex = xp.asarray(self._ex)
             self._ey = xp.asarray(self._ey)
             self._ez = xp.asarray(self._ez)
@@ -456,13 +468,12 @@ class Solver3D:
                 extract_T(self.g), self.T_ref, self.g_gravity, self.beta, 3, axis=1
             )
 
-        if self.ibm_enabled and self.phi is not None:
+        if self.ibm_enabled:
             f_cpu = self.f.get() if self._use_cupy else self.f
-            solid_cpu = self.solid.get() if self._use_cupy else self.solid
-            ibm = ibm_acceleration_3d(
-                f_cpu, self.phi,
-                self._u_wall_x_np, self._u_wall_y_np, self._u_wall_z_np,
-                self._ex_np, self._ey_np, self._ez_np, solid_cpu,
+            ibm, self._ibm_force = ibm_forcing(
+                f_cpu, self._ibm_cells, self._ibm_weights,
+                (self._u_wall_x_np, self._u_wall_y_np, self._u_wall_z_np),
+                (self._ex_np, self._ey_np, self._ez_np),
             )
             field = ibm if field is None else field + ibm
 
@@ -539,6 +550,37 @@ class Solver3D:
             self._link_nodes_cache = cached
         return cached[1]
 
+    def _ibm_diagnostics(self) -> dict:
+        """
+        Force, moments and spanwise profile on an immersed body.
+
+        The body is a force field, so what it feels is the reaction to it:
+        ``-rho a`` summed over the forced cells, the momentum it takes out of
+        the flow each step.  There is no surface to split that into pressure
+        and friction, so those come back as NaN rather than a guess.
+        """
+        nan = float("nan")
+        out = {k: nan for k in ("fx_p", "fy_p", "fz_p", "fx_v", "fy_v", "fz_v")}
+        body = -self._ibm_force                               # (3, n): x, y, z
+        z, y, x = np.unravel_index(self._ibm_cells, (self.Nz, self.Ny, self.Nx))
+        rx = x - float(self._ref_center_x)
+        ry = y - float(self._ref_center_y)
+        rz = z - float(self._ref_center_z)
+        fx, fy, fz = body
+        out.update({
+            "fx": float(fx.sum()), "fy": float(fy.sum()), "fz": float(fz.sum()),
+            "mx": float(np.sum(ry * fz - rz * fy)),
+            "my": float(np.sum(rz * fx - rx * fz)),
+            "mz": float(np.sum(rx * fy - ry * fx)),
+            "profile": {
+                "z": list(range(self.Nz)),
+                "fx": np.bincount(z, weights=fx, minlength=self.Nz).tolist(),
+                "fy": np.bincount(z, weights=fy, minlength=self.Nz).tolist(),
+                "fz": np.bincount(z, weights=fz, minlength=self.Nz).tolist(),
+            },
+        })
+        return out
+
     def _step(self) -> tuple:
         f = self.f
 
@@ -568,21 +610,21 @@ class Solver3D:
         f_coll = f_post if fuse else f_pre
         if self.collision == "mrt":
             self._mrt_kernel.collide(
-                f, f_pre, self.solid, self._ex, self._ey, self._ez, self._w,
+                f, f_pre, self._collide_solid, self._ex, self._ey, self._ez, self._w,
                 omega_field if use_omega_field else None,
                 acc_u, acc_f, force_mode,
             )
         elif self.collision == "regularized":
             if self._use_numba and _kreg3._HAS_NUMBA:
                 _kreg3.regularized_collision_kernel_3d(
-                    f, f_coll, self.solid, omega_use,
+                    f, f_coll, self._collide_solid, omega_use,
                     self._ex, self._ey, self._ez, self._w,
                     omega_field, use_omega_field,
                     acc_u, acc_f, force_mode, self.lattice.h3_factor, fuse,
                 )
             else:
                 _kreg3.regularized_collision_numpy_3d(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_pre, self._collide_solid, omega_use,
                     self._ex, self._ey, self._ez, self._w,
                     omega_field if use_omega_field else None,
                     self._acc_as_field(force_mode, acc_u, acc_f),
@@ -592,7 +634,7 @@ class Solver3D:
         elif self.collision == "trt":
             if self._use_numba and _ktrt3._HAS_NUMBA:
                 _ktrt3.trt_collision_kernel_3d(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_pre, self._collide_solid, omega_use,
                     self._ex, self._ey, self._ez, self._w,
                     self.lattice.OPP.astype(np.int32), self.trt_lambda,
                     omega_field, use_omega_field,
@@ -600,7 +642,7 @@ class Solver3D:
                 )
             else:
                 _ktrt3.trt_collision_numpy_3d(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_pre, self._collide_solid, omega_use,
                     self._ex, self._ey, self._ez, self._w, self.trt_lambda,
                     omega_field if use_omega_field else None,
                     self._acc_as_field(force_mode, acc_u, acc_f),
@@ -608,14 +650,14 @@ class Solver3D:
                 )
         elif self._use_cupy:
             collision_kernel_3d_xp(
-                f, f_pre, self.solid, omega_use,
+                f, f_pre, self._collide_solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
                 acc_u, acc_f, force_mode, xp=xp, h3=self.lattice.h3_factor,
             )
         elif self._use_numba:
             _k3.collision_kernel_3d(
-                f, f_coll, self.solid, omega_use,
+                f, f_coll, self._collide_solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
                 acc_u, acc_f, force_mode, self.lattice.h3_factor, fuse,
@@ -624,7 +666,7 @@ class Solver3D:
             # Pure-NumPy path — never dispatches to the JIT kernels even when
             # Numba is installed, so `backend="numpy"` means what it says.
             _k3.collision_kernel_3d_numpy(
-                f, f_pre, self.solid, omega_use,
+                f, f_pre, self._collide_solid, omega_use,
                 self._ex, self._ey, self._ez, self._w,
                 omega_field, use_omega_field,
                 acc_u, acc_f, force_mode, self.lattice.h3_factor,
@@ -753,6 +795,8 @@ class Solver3D:
             nz=self.Nz,
             lattice=self.lattice,
         )
+        if self.ibm_enabled:
+            diag = self._ibm_diagnostics()
         Cd, Cly, Clz = forces_to_coefficients_3d(
             diag["fx"], diag["fy"], diag["fz"], self.rho0, self.u0, self.ref_area
         )

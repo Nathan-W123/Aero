@@ -73,7 +73,7 @@ from .physics import base_nu_from_omega
 from .wall_model import apply_wall_model, wall_adjacent_mask
 from . import kernels_trt as _ktrt
 from . import kernels_reg as _kreg
-from .ibm_guo import ibm_acceleration_2d
+from .ibm_guo import ibm_cells, ibm_forcing
 from .forcing import (
     FORCE_NONE, FORCE_UNIFORM, FORCE_FIELD,
     boussinesq_acceleration, dummy_force_field, resolve_force_mode,
@@ -231,9 +231,20 @@ class Solver:
         # Ensure solid is bool and C-contiguous (required by Numba kernels)
         self.solid = np.ascontiguousarray(solid, dtype=np.bool_)
 
+        # With the immersed boundary on, the body exists only as a force:
+        # every cell collides as fluid and there are no bounce-back links.
+        # `solid` stays the geometric mask for display, area and diagnostics.
+        self._collide_solid = np.zeros_like(self.solid) if self.ibm_enabled else self.solid
+        self._ibm_cells = self._ibm_weights = None
+        self._ibm_force = None
+        if self.ibm_enabled:
+            if phi is None:
+                raise ValueError("ibm_enabled needs phi, the signed distance to the body.")
+            self._ibm_cells, self._ibm_weights = ibm_cells(np.asarray(phi))
+
         # Precompute surface links for bounce-back
         _phi_for_q = phi if (bouzidi and phi is not None) else None
-        self.surface_links, self.q_vals = build_surface_links(self.solid, _phi_for_q)
+        self.surface_links, self.q_vals = build_surface_links(self._collide_solid, _phi_for_q)
 
         # Initialize f to equilibrium everywhere (including solid cells).
         # Must be C-contiguous float64 for Numba kernels.
@@ -348,10 +359,10 @@ class Solver:
                 extract_T(self.g), self.T_ref, self.g_gravity, self.beta, 2, axis=1
             )
 
-        if self.ibm_enabled and self.phi is not None:
-            ibm = ibm_acceleration_2d(
-                self.f, self.phi, self._u_wall_x, self._u_wall_y,
-                self._ex, self._ey, self.solid,
+        if self.ibm_enabled:
+            ibm, self._ibm_force = ibm_forcing(
+                self.f, self._ibm_cells, self._ibm_weights,
+                (self._u_wall_x, self._u_wall_y), (self._ex, self._ey),
             )
             field = ibm if field is None else field + ibm
 
@@ -410,6 +421,31 @@ class Solver:
             )
         return omega_field, use_omega_field
 
+    def _ibm_diagnostics(self) -> dict:
+        """
+        Force, moment and sectional profile on an immersed body.
+
+        The body is a force field, so what it feels is the reaction to it:
+        ``-rho a`` summed over the forced cells, the momentum it takes out of
+        the flow each step.  There is no surface to split that into pressure
+        and friction, so those come back as NaN rather than a guess.
+        """
+        nan = float("nan")
+        fx, fy = -self._ibm_force
+        y, x = np.unravel_index(self._ibm_cells, (self.Ny, self.Nx))
+        rx = x - float(self._ref_center_x)
+        ry = y - float(self._ref_center_y)
+        return {
+            "fx": float(fx.sum()), "fy": float(fy.sum()),
+            "mz": float(np.sum(rx * fy - ry * fx)),
+            "fx_p": nan, "fy_p": nan, "fx_v": nan, "fy_v": nan,
+            "profile": {
+                "y": list(range(self.Ny)),
+                "fx": np.bincount(y, weights=fx, minlength=self.Ny).tolist(),
+                "fy": np.bincount(y, weights=fy, minlength=self.Ny).tolist(),
+            },
+        }
+
     def _step(self) -> tuple:
         """Execute one LBM timestep. Returns instantaneous (Cd, Cl)."""
         f = self.f
@@ -427,7 +463,7 @@ class Solver:
         f_pre, f_post = self._work_buffers(f)
         if self.collision == "mrt":
             self._mrt_kernel.collide(
-                f, f_pre, self.solid, self._ex, self._ey, self._w,
+                f, f_pre, self._collide_solid, self._ex, self._ey, self._w,
                 omega_field if use_omega_field else None,
                 acc_u, acc_f, force_mode,
             )
@@ -435,14 +471,14 @@ class Solver:
         elif self.collision == "regularized":
             if self._use_numba and _kreg._HAS_NUMBA:
                 _kreg.regularized_collision_kernel(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_pre, self._collide_solid, omega_use,
                     self._ex, self._ey, self._w,
                     omega_field, use_omega_field,
                     acc_u, acc_f, force_mode,
                 )
             else:
                 _kreg.regularized_collision_numpy(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_pre, self._collide_solid, omega_use,
                     self._ex, self._ey, self._w,
                     omega_field if use_omega_field else None,
                     self._acc_as_field(force_mode, acc_u, acc_f),
@@ -451,7 +487,7 @@ class Solver:
         elif self.collision == "trt":
             if self._use_numba and _ktrt._HAS_NUMBA:
                 _ktrt.trt_collision_kernel(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_pre, self._collide_solid, omega_use,
                     self._ex, self._ey, self._w,
                     OPP.astype(np.int32), self.trt_lambda,
                     omega_field, use_omega_field,
@@ -459,7 +495,7 @@ class Solver:
                 )
             else:
                 _ktrt.trt_collision_numpy(
-                    f, f_pre, self.solid, omega_use,
+                    f, f_pre, self._collide_solid, omega_use,
                     self._ex, self._ey, self._w, self.trt_lambda,
                     omega_field if use_omega_field else None,
                     self._acc_as_field(force_mode, acc_u, acc_f),
@@ -468,7 +504,7 @@ class Solver:
         elif self._use_numba:
             # Fused macroscopic + BGK collision
             _kernels.collision_kernel(
-                f, f_pre, self.solid, omega_use,
+                f, f_pre, self._collide_solid, omega_use,
                 self._ex, self._ey, self._w,
                 omega_field, use_omega_field,
                 acc_u, acc_f, force_mode,
@@ -478,7 +514,7 @@ class Solver:
             # Pure-NumPy path — never dispatches to the JIT kernels even when
             # Numba is installed, so `backend="numpy"` means what it says.
             _kernels.collision_kernel_numpy(
-                f, f_pre, self.solid, omega_use,
+                f, f_pre, self._collide_solid, omega_use,
                 self._ex, self._ey, self._w,
                 omega_field, use_omega_field,
                 acc_u, acc_f, force_mode,
@@ -565,6 +601,8 @@ class Solver:
             center_y=self._ref_center_y,
             ny=self.Ny,
         )
+        if self.ibm_enabled:
+            diag = self._ibm_diagnostics()
         Cd, Cl = forces_to_coefficients(
             diag["fx"], diag["fy"], self.rho0, self.u0, self.D
         )

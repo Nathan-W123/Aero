@@ -22,6 +22,7 @@ from aero.lbm.forcing import (
     guo_source_term,
     half_force_velocity,
     ibm_acceleration,
+    ibm_weight,
     resolve_force_mode,
     uniform_acceleration,
 )
@@ -123,9 +124,8 @@ def test_half_force_velocity_matches_the_definition():
 
 def test_ibm_direct_forcing_reaches_the_wall_velocity():
     """
-    Direct forcing must put the *corrected* velocity on the wall velocity.
-
-    a = 2 (u_wall - u_raw), so u_raw + a/2 = u_wall exactly.
+    Inside the body, direct forcing must put the *corrected* velocity on the
+    wall velocity: a = 2 (u_wall - u_raw), so u_raw + a/2 = u_wall exactly.
     """
     ny, nx = 5, 5
     rho = np.ones((ny, nx))
@@ -135,26 +135,29 @@ def test_ibm_direct_forcing_reaches_the_wall_velocity():
         np.einsum("i,iyx->yx", E[:, 1].astype(float), f),
     )
     u_wall = (np.full((ny, nx), 0.05), np.zeros((ny, nx)))
-    phi = np.full((ny, nx), 1.0)
-    solid = np.zeros((ny, nx), dtype=bool)
+    phi = np.full((ny, nx), -1.0)                      # inside the body
 
-    acc = ibm_acceleration(rho, momentum, u_wall, phi, solid)
+    acc = ibm_acceleration(rho, momentum, u_wall, phi)
     ux, _ = half_force_velocity(momentum, rho, (acc[0], acc[1]))
     assert ux[2, 2] == pytest.approx(0.05)
 
 
-def test_ibm_acceleration_is_confined_to_the_band():
-    ny, nx = 4, 4
+def test_ibm_weight_is_centred_on_the_surface():
+    """
+    Full inside, off outside, exactly half on the surface phi = 0.  Forcing a
+    band of fluid *outside* the surface, as this once did, makes the body act
+    a band-width larger on every side.
+    """
+    phi = np.array([-3.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.4, 3.0])
+    assert np.allclose(ibm_weight(phi), [1.0, 1.0, 0.75, 0.5, 0.25, 0.0, 0.0, 0.0])
+
+    ny, nx = 2, len(phi)
     rho = np.ones((ny, nx))
     momentum = (np.zeros((ny, nx)), np.zeros((ny, nx)))
     u_wall = (np.full((ny, nx), 0.05), np.zeros((ny, nx)))
-    phi = np.array([[-1.0, 0.5, 1.4, 3.0]] * ny)      # solid / band / band / free
-    solid = np.zeros((ny, nx), dtype=bool)
-    acc = ibm_acceleration(rho, momentum, u_wall, phi, solid)
-    assert np.all(acc[0][:, 0] == 0.0)                # phi <= 0
-    assert np.all(acc[0][:, 1] > 0.0)
-    assert np.all(acc[0][:, 2] > 0.0)
-    assert np.all(acc[0][:, 3] == 0.0)                # phi > band
+    acc = ibm_acceleration(rho, momentum, u_wall, np.tile(phi, (ny, 1)))
+    assert np.allclose(acc[0], 2.0 * 0.05 * ibm_weight(np.tile(phi, (ny, 1))))
+    assert np.all(acc[0][:, 5:] == 0.0)                # nothing outside the skin
 
 
 def test_no_force_costs_nothing():

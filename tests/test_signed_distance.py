@@ -183,8 +183,11 @@ class TestIBMVsVoxelRe20:
 
     Both should:
     - Not diverge (no NaN)
-    - Give Cd in [1.0, 6.0]  (Schiller–Naumann at Re=20 ≈ 2.4; blockage inflates this)
-    - Agree to within 40 % of each other
+    - Give Cd in [1.0, 6.0]  (Schiller–Naumann at Re=20 ≈ 2.6; blockage inflates this)
+    - Agree to within 20 % of each other.  The sphere is only 6.4 cells across
+      and the immersed surface is smeared over one cell, so this is loose on
+      purpose; they measure +10.5% apart here and 4% at 14 cells.  (This used
+      to allow 40%, which hid an immersed body that read 41% low.)
     """
 
     @pytest.fixture(scope="class")
@@ -258,7 +261,7 @@ class TestIBMVsVoxelRe20:
         cd_vox = res_vox["Cd_mean"]
         cd_ibm = res_ibm["Cd_mean"]
         rel = abs(cd_ibm - cd_vox) / max(abs(cd_vox), 1e-6)
-        assert rel < 0.40, (
+        assert rel < 0.20, (
             f"IBM Cd={cd_ibm:.3f} and voxel Cd={cd_vox:.3f} disagree by "
-            f"{rel*100:.1f}% (threshold 40%)"
+            f"{rel*100:.1f}% (threshold 20%)"
         )
