@@ -100,7 +100,8 @@ input:focus,select:focus{outline:2px solid var(--accent-soft);border-color:var(-
 .seg{display:inline-flex}
 .seg .btn{border-radius:0}
 .seg .btn:first-child{border-radius:6px 0 0 6px}
-.seg .btn + .btn{margin-left:-1px;border-radius:0 6px 6px 0}
+.seg .btn + .btn{margin-left:-1px}
+.seg .btn:last-child{border-radius:0 6px 6px 0}
 .seg .btn.on{background:var(--accent);border-color:var(--accent);color:#fff;position:relative}
 svg.chart{display:block;width:100%;height:100%}
 figure{margin:0;flex:1;min-height:0;background:#fff;border:1px solid var(--line-soft);border-radius:6px;overflow:hidden;display:grid;place-items:center}
@@ -180,15 +181,16 @@ figure .empty{color:var(--faint);font-size:12.5px}
       <div class="card">
         <h2>Wind tunnel <span class="sp"></span>
           <span class="seg" id="qtySeg" role="group" aria-label="Quantity shown">
-            <button class="btn sm on" data-q="wake" title="How much the body disturbs the flow, |u − U∞|: clear in the free stream, a plume in the wake">Wake</button>
+            <button class="btn sm on" data-q="smoke" title="Dye released upstream and carried through the computed velocity field, coloured by speed">Smoke</button>
+            <button class="btn sm" data-q="wake" title="How much the body disturbs the flow, |u − U∞|: clear in the free stream, a plume in the wake">Wake</button>
             <button class="btn sm" data-q="vorticity" title="How fast the flow spins, |∇×u|: boundary layers, shear layers and vortices">Vorticity</button>
           </span>
-          <button class="btn sm" id="animBtn" title="Freeze or resume the motion">Pause</button>
+          <button class="btn sm" id="animBtn" title="Freeze or resume the smoke">Pause</button>
           <button class="btn sm" id="resetBtn">Reset view</button></h2>
         <div class="fill viewer">
           <canvas id="tunnel"></canvas>
           <div class="empty" id="tunnelEmpty">The flow appears once a run starts</div>
-          <div class="legend"><span id="lgName">|u − U∞|</span><span>0</span><i id="lgBar"></i><span id="lgHi">high</span><span class="hint">drag to rotate · wheel to zoom</span></div>
+          <div class="legend"><span id="lgName">speed |u|</span><span>0</span><i id="lgBar"></i><span id="lgHi">high</span><span class="hint">drag to rotate · wheel to zoom</span></div>
         </div>
       </div>
       <div class="card">
@@ -406,16 +408,29 @@ new ResizeObserver(() => drawChart(lastHist)).observe($("#chart"));
 const _drawChart = drawChart; drawChart = h => { lastHist = h || []; _drawChart(lastHist); };
 
 // ------------------------------------------------------------ 3D tunnel ----
-// Volume rendering, WebGL2.  Every pixel casts a ray through a 3D texture of
-// one scalar -- the wake |u - U∞| or the vorticity -- and gathers colour from
-// the Turbo scale and opacity from a transfer function that leaves the free
-// stream clear, so the flow reads as a glowing medium rather than arrows.
-// It moves: a smoke texture modulates the opacity and is carried along the
-// computed velocity field, so on screen the flow runs downstream at its local
-// speed, slows in the wake and turns back in the recirculation behind the
-// body.  The colours are the data; only the wisps are texture.  The body is a
-// second texture (the smoothed solid mask); rays stop on it and it is lit as
-// a surface.  Without WebGL2 it falls back to the mid-plane on a 2D canvas.
+// Volume rendering, WebGL2.  Three views of the computed flow:
+//
+//   Smoke      Dye released from a rake of nozzles just inside the inlet and
+//              carried through the solver's velocity field, on the GPU: each
+//              frame every cell looks back along the local velocity (second-
+//              order backtrace) to where its fluid came from.  Nothing is
+//              invented -- a puff is where released fluid has been carried,
+//              so it slows at the nose, speeds round the shoulders and is
+//              swept into the wake.  Steps are sized so the free stream moves
+//              exactly one cell, where resampling is exact: dye then stays
+//              sharp in the free stream and only mixes where the flow shears,
+//              instead of blurring into fog over a crossing.  Frames blend
+//              the last two steps, so motion is smooth.  It is released in
+//              pulses so steady flow still shows motion, from a "+" of
+//              nozzles through the body's centre; time is compressed so the
+//              free stream crosses the tunnel in CROSS_SECONDS.  Colour is
+//              local speed.
+//   Wake       |u − U∞| from the solver: clear in the free stream.
+//   Vorticity  |∇×u| from the solver.
+//
+// Each pixel's ray marches through the chosen volume and stops on the body,
+// a second texture (the smoothed solid mask) lit as a surface.  Without
+// WebGL2 it falls back to the mid-plane on a 2D canvas.
 const tunnel = (() => {
   const cv = $("#tunnel");
   // Turbo, 17 control points (matplotlib's table).  Its darkest colour is the
@@ -429,54 +444,36 @@ const tunnel = (() => {
     return [0, 1, 2].map(k => a[k] + (b[k] - a[k]) * u);
   };
   const QTY = {
+    smoke:     {density: 0.55, unit: "u₀",   name: "speed |u|"},
     wake:      {density: 0.13, lo: 0.03, hi: 0.85, unit: "u₀",   name: "|u − U∞|"},
     vorticity: {density: 0.10, lo: 0.05, hi: 0.90, unit: "u₀/D", name: "|ω|"},
   };
+  const CROSS_SECONDS = 4;          // free stream crosses the tunnel in this long on screen
+  const PUFFS = 6;                  // pulses released per crossing
   const view = {yaw: -0.52, pitch: 0.34, zoom: 1};
-  let qty = "wake", geom = null, fld = null, full = [1, 1, 1], queued = false;
+  let qty = "smoke", geom = null, fld = null, full = [1, 1, 1], queued = false;
+  let running = true, simT = 0, simAcc = 0, lastFrame = 0;
+  const rake = {c: [0, 0], sp: 4, r: 1.0, half: 4};
+  // render scale: drops when frames run long, so weak GPUs stay smooth
+  const perf = {scale: Math.min(window.devicePixelRatio || 1, 1.5), frames: 0, since: performance.now()};
 
   const gl = cv.getContext("webgl2", {antialias: false, depth: false, stencil: false});
   const ctx2d = gl ? null : cv.getContext("2d");
 
-  // --------------------------------------------------------------- GL ---
-  let prog = null, U = {}, texVol, texSolid, texLut, texVel, texNoise, volShape = [1, 1, 1], hasSolid = false;
-  // animation clock (seconds), frozen while paused
-  const anim = {on: true, t0: performance.now(), frozenAt: 0};
-  const clock = () => anim.on ? (performance.now() - anim.t0) / 1000 : anim.frozenAt;
-  // render scale: drops when frames run long, so weak GPUs stay smooth
-  const perf = {scale: Math.min(window.devicePixelRatio || 1, 1.5), frames: 0, since: performance.now()};
+  let R = {}, A = {}, render = null, advect = null, fbo = null;
+  let texVol, texSolid, texLut, texVel, dye = [null, null], dyeCur = 0, dyeShape = null, dyeFmt = null;
+  let volShape = [1, 1, 1], hasSolid = false;
 
-  // Tileable smoke texture: white noise, box-blurred along each axis with
-  // wrap-around, contrast-stretched.  Made once, 256 kB.
-  function smokeNoise(n){
-    let a = new Float32Array(n * n * n), b = new Float32Array(a.length);
-    for(let i = 0; i < a.length; i++) a[i] = Math.random();
-    for(let pass = 0; pass < 2; pass++) for(const st of [1, n, n * n]){
-      for(let i = 0; i < a.length; i++){
-        const c = Math.floor(i / st) % n; let sum = 0;
-        for(let k = -2; k <= 2; k++) sum += a[i + (((c + k + n) % n) - c) * st];
-        b[i] = sum / 5;
-      }
-      [a, b] = [b, a];
-    }
-    let mean = 0, sq = 0;
-    for(const v of a){ mean += v; sq += v * v; }
-    mean /= a.length; const sd = Math.sqrt(Math.max(sq / a.length - mean * mean, 1e-12));
-    return Uint8Array.from(a, v => Math.max(0, Math.min(255, Math.round(128 + 46 * (v - mean) / sd))));
-  }
   if(gl){
     const VS = `#version 300 es
       in vec2 aPos; out vec2 vNdc;
       void main(){ vNdc = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }`;
-    const FS = `#version 300 es
+    const RENDER_FS = `#version 300 es
       precision highp float; precision highp sampler3D;
-      uniform sampler3D uVol, uSolid, uVel, uNoise; uniform sampler2D uLut;
-      uniform float uTime, uFlow, uVelScale, uNoiseFreq;
-      uniform bool uAnim;
-      const float PERIOD = 1.8;                       // seconds a texture copy lives
+      uniform sampler3D uVol, uSolid, uVel, uDye, uDyePrev; uniform sampler2D uLut;
       uniform vec3 uEye, uRight, uUp, uFwd, uBox, uCell, uBg;
-      uniform float uTanHalf, uAspect, uDensity, uLo, uHi, uPixel;
-      uniform bool uHasSolid, uHasVol;
+      uniform float uTanHalf, uAspect, uDensity, uLo, uHi, uPixel, uFrac;
+      uniform bool uHasSolid, uHasVol, uSmoke;
       in vec2 vNdc; out vec4 outColor;
 
       vec2 hitBox(vec3 ro, vec3 rd){
@@ -529,81 +526,186 @@ const tunnel = (() => {
             break;
           }
           if(uHasVol){
-            float v = texture(uVol, tc).r;
-            float w = smoothstep(uLo, uHi, v);
-            if(w > 0.0){
-              float d = w;
-              if(uAnim){
-                // Two copies of the texture, each carried back along the local
-                // velocity and restarted every PERIOD while its weight is zero,
-                // so it moves with the flow without ever stretching apart.
-                vec3 vel = (texture(uVel, tc).rgb - 0.5) * (2.0 * uVelScale);
-                vec3 p = uEye + rd * tt;
-                float ph = fract(uTime / PERIOD), ph2 = fract(ph + 0.5);
-                vec3 q0 = (p - vel * (uFlow * PERIOD * ph)) * uNoiseFreq;
-                vec3 q1 = (p - vel * (uFlow * PERIOD * ph2)) * uNoiseFreq + 0.5;
-                float n0 = 0.62 * texture(uNoise, q0).r + 0.38 * texture(uNoise, q0 * 2.7 + 0.31).r;
-                float n1 = 0.62 * texture(uNoise, q1).r + 0.38 * texture(uNoise, q1 * 2.7 + 0.31).r;
-                float n = mix(n0, n1, abs(1.0 - 2.0 * ph));
-                d *= 0.22 + 1.9 * smoothstep(0.30, 0.74, n);
+            if(uSmoke){
+              float c = mix(texture(uDyePrev, tc).r, texture(uDye, tc).r, uFrac);
+              if(c > 0.004){
+                // colour: local speed, 0 .. full scale of the velocity bytes
+                float s = clamp(length((texture(uVel, tc).rgb - 0.5) * 2.0), 0.0, 1.0);
+                vec3 col = texture(uLut, vec2(0.10 + 0.90 * s, 0.5)).rgb * 1.1;
+                float a = 1.0 - exp(-uDensity * c * dt);
+                acc.rgb += (1.0 - acc.a) * a * col;
+                acc.a += (1.0 - acc.a) * a;
               }
-              float a = 1.0 - exp(-uDensity * d * dt);
-              vec3 c = texture(uLut, vec2(v, 0.5)).rgb * (1.0 + 0.5 * w);
-              acc.rgb += (1.0 - acc.a) * a * c;
-              acc.a += (1.0 - acc.a) * a;
+            } else {
+              float v = texture(uVol, tc).r;
+              float w = smoothstep(uLo, uHi, v);
+              if(w > 0.0){
+                float a = 1.0 - exp(-uDensity * w * dt);
+                vec3 c = texture(uLut, vec2(v, 0.5)).rgb * (1.0 + 0.5 * w);
+                acc.rgb += (1.0 - acc.a) * a * c;
+                acc.a += (1.0 - acc.a) * a;
+              }
             }
           }
           tt += dt;
         }
         outColor = vec4(acc.rgb + (1.0 - acc.a) * (uBg + lines), 1.0);
       }`;
+    // One slice of the dye advection: this cell's dye is whatever was at the
+    // point the flow carried here from, one step ago.  Inside the body there
+    // is none; across the inlet it is clean air except at the rake nozzles.
+    const ADVECT_FS = `#version 300 es
+      precision highp float; precision highp sampler3D;
+      uniform sampler3D uDye, uVel, uSolid;
+      uniform vec3 uGrid, uBox;
+      uniform float uZ, uStep, uVelScale, uInject, uRakeSp, uRakeR, uRakeHalf;
+      uniform vec2 uRakeC;
+      uniform bool uFlat;
+      out vec4 outDye;
+      vec3 vel(vec3 p){ return (texture(uVel, p / uBox).rgb - 0.5) * (2.0 * uVelScale); }
+      void main(){
+        vec3 tc = vec3(gl_FragCoord.xy, uZ + 0.5) / uGrid;
+        vec3 p = tc * uBox;
+        if(texture(uSolid, tc).r > 0.5){ outDye = vec4(0.0); return; }
+        float c;
+        if(p.x < 2.5){
+          // a "+" of nozzles: a line across y at the body's mid-span, and a
+          // line across z at its mid-height (in 2D, just the line across y)
+          vec2 q = (vec2(p.y, p.z) - uRakeC) / uRakeSp, k = floor(q + 0.5), d = (q - k) * uRakeSp;
+          if(uFlat){ k.y = 0.0; d.y = 0.0; }
+          bool onLine = (k.y == 0.0 && abs(k.x) <= uRakeHalf) || (k.x == 0.0 && abs(k.y) <= uRakeHalf);
+          c = (onLine && length(d) < uRakeR) ? uInject : 0.0;
+        } else {
+          vec3 back = p - uStep * vel(p - 0.5 * uStep * vel(p));   // midpoint backtrace
+          c = texture(uDye, back / uBox).r;
+        }
+        outDye = vec4(c, 0.0, 0.0, 1.0);
+      }`;
     const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
       if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
-    prog = gl.createProgram();
-    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
-    gl.linkProgram(prog);
-    if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-    gl.useProgram(prog);
-    for(const n of ["uVol","uSolid","uLut","uEye","uRight","uUp","uFwd","uBox","uCell","uBg",
-                    "uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol",
-                    "uVel","uNoise","uTime","uFlow","uVelScale","uNoiseFreq","uAnim"]) U[n] = gl.getUniformLocation(prog, n);
+    const program = (fs, names) => {
+      const p = gl.createProgram();
+      gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+      gl.bindAttribLocation(p, 0, "aPos"); gl.linkProgram(p);
+      if(!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      const loc = {}; for(const n of names) loc[n] = gl.getUniformLocation(p, n);
+      return [p, loc];
+    };
+    [render, R] = program(RENDER_FS, ["uVol","uSolid","uVel","uDye","uLut","uEye","uRight","uUp","uFwd","uBox",
+      "uCell","uBg","uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol","uSmoke",
+      "uDyePrev","uFrac"]);
+    [advect, A] = program(ADVECT_FS, ["uDye","uVel","uSolid","uGrid","uBox","uZ","uStep","uVelScale","uInject",
+      "uRakeSp","uRakeR","uRakeHalf","uRakeC","uFlat"]);
+
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(prog, "aPos");
-    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    const tex3 = unit => { const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, t);
+
+    const tex3 = (unit, internal, format, type, data) => {
+      const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, t);
       for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 1, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1)); return t; };
-    texVol = tex3(0); texSolid = tex3(1); texVel = tex3(3); texNoise = tex3(4);
-    gl.activeTexture(gl.TEXTURE3);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 0]));
-    gl.activeTexture(gl.TEXTURE4);
-    for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.REPEAT);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 64, 64, 64, 0, gl.RED, gl.UNSIGNED_BYTE, smokeNoise(64));
+      gl.texImage3D(gl.TEXTURE_3D, 0, internal, 1, 1, 1, 0, format, type, data); return t; };
+    // units: 0 volume, 1 solid, 2 colour scale, 3 velocity, 5 dye now, 6 dye one step back
+    texVol = tex3(0, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
+    texSolid = tex3(1, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
+    texVel = tex3(3, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 0]));
     texLut = gl.createTexture(); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texLut);
     const lut = new Uint8Array(256 * 4);
     for(let i = 0; i < 256; i++){ const c = turbo(i / 255); lut.set([c[0], c[1], c[2], 255], 4 * i); }
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lut);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.uniform1i(U.uVol, 0); gl.uniform1i(U.uSolid, 1); gl.uniform1i(U.uLut, 2);
-    gl.uniform1i(U.uVel, 3); gl.uniform1i(U.uNoise, 4);
-    const bg = turbo(0).map(v => v / 255); gl.uniform3f(U.uBg, bg[0], bg[1], bg[2]);
+
+    gl.useProgram(render);
+    gl.uniform1i(R.uVol, 0); gl.uniform1i(R.uSolid, 1); gl.uniform1i(R.uLut, 2); gl.uniform1i(R.uVel, 3);
+    gl.uniform1i(R.uDye, 5); gl.uniform1i(R.uDyePrev, 6);
+    const bg = turbo(0).map(v => v / 255); gl.uniform3f(R.uBg, bg[0], bg[1], bg[2]);
+    gl.useProgram(advect);
+    gl.uniform1i(A.uDye, 5); gl.uniform1i(A.uVel, 3); gl.uniform1i(A.uSolid, 1);
+    fbo = gl.createFramebuffer();
+    // Dye in half floats where the GPU can render to them: 8 bits lose faint
+    // dye to rounding on every resample.
+    dyeFmt = gl.getExtension("EXT_color_buffer_float")
+      ? {internal: gl.R16F, type: gl.HALF_FLOAT} : {internal: gl.R8, type: gl.UNSIGNED_BYTE};
   }
 
   function upload(unit, tex, data, shape){                 // shape = [nz, ny, nx]
     gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, tex);
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, shape[2], shape[1], shape[0], 0, gl.RED, gl.UNSIGNED_BYTE, data);
   }
+  // Two dye volumes on the velocity grid, zeroed (WebGL zero-fills a null upload).
+  function makeDye(shape){
+    const [sz, sy, sx] = shape;
+    for(let k = 0; k < 2; k++){
+      if(dye[k]) gl.deleteTexture(dye[k]);
+      dye[k] = gl.createTexture(); gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_3D, dye[k]);
+      for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texImage3D(gl.TEXTURE_3D, 0, dyeFmt.internal, sx, sy, sz, 0, gl.RED, dyeFmt.type, null);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, dye[0], 0, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if(!ok && dyeFmt.internal !== gl.R8){ dyeFmt = {internal: gl.R8, type: gl.UNSIGNED_BYTE}; return makeDye(shape); }
+    dyeShape = shape.slice(); dyeCur = 0; simT = 0; simAcc = 0;
+    bindDye();
+  }
+  function bindDye(){
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_3D, null);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_3D, dye[dyeCur]);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_3D, dye[1 - dyeCur]);
+  }
+  // Screen seconds per step: one step moves the free stream one dye cell.
+  const stepSeconds = () => (fld.header.factor || 1) * CROSS_SECONDS / full[2];
+  // Carry the dye one step through the velocity field.
+  function advance(){
+    const [sz, sy, sx] = dyeShape, box = [full[2], full[1], Math.max(full[0], 1)];
+    const src = dye[dyeCur], dst = dye[1 - dyeCur];
+    simT += stepSeconds();
+    // soft-edged pulses, so the smoke leaves as puffs joined by a faint streak
+    const ph = 0.5 + 0.5 * Math.cos(2 * Math.PI * simT * PUFFS / CROSS_SECONDS);
+    const pulse = 0.12 + 0.88 * ph * ph;
+    gl.useProgram(advect);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.viewport(0, 0, sx, sy);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_3D, src);
+    gl.uniform3f(A.uGrid, sx, sy, sz); gl.uniform3f(A.uBox, ...box);
+    gl.uniform1f(A.uStep, fld.header.factor || 1);            // cells moved at u = u0
+    gl.uniform1f(A.uVelScale, fld.header.scales.vel || 1.5); gl.uniform1f(A.uInject, pulse);
+    gl.uniform2f(A.uRakeC, ...rake.c); gl.uniform1f(A.uRakeSp, rake.sp); gl.uniform1f(A.uRakeR, rake.r);
+    gl.uniform1f(A.uRakeHalf, rake.half); gl.uniform1i(A.uFlat, full[0] <= 1 ? 1 : 0);
+    for(let z = 0; z < sz; z++){
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, dst, 0, z);
+      gl.uniform1f(A.uZ, z);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    dyeCur = 1 - dyeCur;
+    bindDye();
+  }
+  // The rake sits across the stream at the body: nozzles a quarter of the
+  // body apart, out to ~1.3 body sizes either side of its centre.
+  function placeRake(g){
+    const [nz, ny, nx] = full, S = g.solid;
+    let y0 = ny, y1 = -1, z0 = nz, z1 = -1;
+    for(let z = 0; z < nz; z++) for(let y = 0; y < ny; y++){
+      const row = (z * ny + y) * nx;
+      for(let x = 0; x < nx; x++) if(S[row + x]){ y0 = Math.min(y0, y); y1 = Math.max(y1, y); z0 = Math.min(z0, z); z1 = Math.max(z1, z); break; }
+    }
+    const flat = nz <= 1;
+    const h = y1 >= y0 ? Math.max(y1 - y0 + 1, flat ? 0 : z1 - z0 + 1) : ny / 3;
+    rake.c = y1 >= y0 ? [(y0 + y1 + 1) / 2, flat ? 0.5 : (z0 + z1 + 1) / 2] : [ny / 2, Math.max(nz, 1) / 2];
+    rake.sp = Math.max(2.5, h / 4); rake.r = Math.max(0.8, 0.26 * rake.sp);
+    rake.half = Math.max(2, Math.ceil(1.3 * h / rake.sp));
+  }
   // A 3x3x3 box blur of the solid mask, so the trilinear surface at 0.5 is
   // rounded rather than a staircase of cube corners.
   function smoothMask(S, [nz, ny, nx]){
     let a = Float32Array.from(S, v => v ? 1 : 0), b = new Float32Array(a.length);
-    const passes = [[1, nx], [nx, ny], [nx * ny, nz]];
-    for(const [stride, n] of passes){
+    for(const [stride, n] of [[1, nx], [nx, ny], [nx * ny, nz]]){
       if(n < 3) continue;
       for(let i = 0; i < a.length; i++){
         const k = Math.floor(i / stride) % n;
@@ -634,11 +736,21 @@ const tunnel = (() => {
     if(Math.abs(next - perf.scale) > 0.01){ perf.scale = next; resize(); }
   }
 
-  function draw(){
+  function draw(now){
     queued = false;
     if(!gl){ draw2d(); return; }
-    const moving = anim.on && !!fld;
-    if(moving){ pace(); request(); }                  // keep going while there is flow to move
+    now = now || performance.now();
+    const moving = running && qty === "smoke" && fld && fld.vel && dyeShape;
+    if(moving){
+      simAcc += Math.min(Math.max((now - (lastFrame || now)) / 1000, 0), 0.1);
+      const per = stepSeconds();
+      for(let n = 0; simAcc >= per && n < 6; n++){ advance(); simAcc -= per; }
+      simAcc = Math.min(simAcc, per);
+      pace(); request();
+    }
+    lastFrame = moving ? now : 0;
+
+    gl.useProgram(render);
     gl.viewport(0, 0, cv.width, cv.height);
     const box = boxDims(), c = box.map(v => v / 2), tanHalf = Math.tan(20 * Math.PI / 180), aspect = cv.width / cv.height;
     const cp = Math.cos(view.pitch), dir = [cp * Math.sin(view.yaw), Math.sin(view.pitch), cp * Math.cos(view.yaw)];
@@ -654,30 +766,33 @@ const tunnel = (() => {
     }
     const dist = fit / view.zoom, eye = c.map((v, i) => v + dist * dir[i]);
     const q = QTY[qty], flat = full[0] <= 1;
-    gl.uniform3f(U.uEye, ...eye); gl.uniform3f(U.uFwd, ...fwd); gl.uniform3f(U.uRight, ...right); gl.uniform3f(U.uUp, ...up);
-    gl.uniform3f(U.uBox, ...box); gl.uniform3f(U.uCell, 1 / full[2], 1 / full[1], 1 / Math.max(full[0], 1));
-    gl.uniform1f(U.uTanHalf, tanHalf); gl.uniform1f(U.uAspect, aspect); gl.uniform1f(U.uPixel, 2 * tanHalf / cv.height);
-    gl.uniform1f(U.uDensity, flat ? q.density * 10 / box[2] : q.density); gl.uniform1f(U.uLo, q.lo); gl.uniform1f(U.uHi, q.hi);
-    gl.uniform1i(U.uHasSolid, hasSolid ? 1 : 0); gl.uniform1i(U.uHasVol, fld ? 1 : 0);
-    // the free stream crosses the tunnel in ~3.5 s; the texture repeats every ~0.9 tunnel heights
-    gl.uniform1i(U.uAnim, fld && fld.vel ? 1 : 0); gl.uniform1f(U.uTime, clock());
-    gl.uniform1f(U.uFlow, box[0] / 3.5); gl.uniform1f(U.uNoiseFreq, 1 / (0.9 * box[1]));
-    gl.uniform1f(U.uVelScale, fld && fld.header.scales ? fld.header.scales.vel || 1.5 : 1.5);
+    gl.uniform3f(R.uEye, ...eye); gl.uniform3f(R.uFwd, ...fwd); gl.uniform3f(R.uRight, ...right); gl.uniform3f(R.uUp, ...up);
+    gl.uniform3f(R.uBox, ...box); gl.uniform3f(R.uCell, 1 / full[2], 1 / full[1], 1 / Math.max(full[0], 1));
+    gl.uniform1f(R.uTanHalf, tanHalf); gl.uniform1f(R.uAspect, aspect); gl.uniform1f(R.uPixel, 2 * tanHalf / cv.height);
+    gl.uniform1f(R.uDensity, flat ? q.density * 10 / box[2] : q.density);
+    gl.uniform1f(R.uLo, q.lo || 0); gl.uniform1f(R.uHi, q.hi || 1);
+    gl.uniform1i(R.uHasSolid, hasSolid ? 1 : 0); gl.uniform1i(R.uHasVol, fld ? 1 : 0);
+    gl.uniform1i(R.uSmoke, qty === "smoke" && dyeShape ? 1 : 0);
+    gl.uniform1f(R.uFrac, dyeShape && fld ? Math.min(simAcc / stepSeconds(), 1) : 1);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
   // Fallback: the mid-plane, coloured the same way, on a plain 2D canvas.
+  // Smoke needs the GPU, so the fallback shows the speed there instead.
   function draw2d(){
     const W = cv.width, H = cv.height, bg = turbo(0);
     ctx2d.fillStyle = `rgb(${bg.join(",")})`; ctx2d.fillRect(0, 0, W, H);
     if(!fld) return;
-    const [sz, sy, sx] = fld.header.shape, k = sz >> 1, A = fld[qty], img = new ImageData(sx, sy);
+    const [sz, sy, sx] = fld.header.shape, k = sz >> 1, img = new ImageData(sx, sy);
     const fs = fld.header.factor || 1, [gz, gy, gx] = full;
     const solidAt = (y, x) => geom && geom.solid[((Math.min(k * fs, gz - 1)) * gy + Math.min(y * fs, gy - 1)) * gx + Math.min(x * fs, gx - 1)];
+    const value = qty === "smoke"
+      ? i => Math.hypot(fld.vel[4 * i] - 127.5, fld.vel[4 * i + 1] - 127.5, fld.vel[4 * i + 2] - 127.5) / 127.5
+      : i => fld[qty][i] / 255;
     for(let y = 0; y < sy; y++) for(let x = 0; x < sx; x++){
       const o = 4 * ((sy - 1 - y) * sx + x);
       if(solidAt(y, x)){ img.data.set([158, 160, 165, 255], o); continue; }
-      const v = A[(k * sy + y) * sx + x] / 255, c = turbo(v), w = Math.min(1, v * 2.5);
+      const v = Math.min(1, value((k * sy + y) * sx + x)), c = turbo(v), w = qty === "smoke" ? 1 : Math.min(1, v * 2.5);
       img.data.set([bg[0] + (c[0] - bg[0]) * w, bg[1] + (c[1] - bg[1]) * w, bg[2] + (c[2] - bg[2]) * w, 255], o);
     }
     const off = document.createElement("canvas"); off.width = sx; off.height = sy; off.getContext("2d").putImageData(img, 0, 0);
@@ -686,13 +801,15 @@ const tunnel = (() => {
   }
 
   function legend(){
-    const q = QTY[qty], scale = fld && fld.header.scales ? fld.header.scales[qty] : null;
+    const q = QTY[qty], sc = fld && fld.header.scales ? fld.header.scales : null;
+    const scale = sc ? (qty === "smoke" ? sc.vel : sc[qty]) : null;
     $("#lgName").textContent = q.name;
-    $("#lgHi").textContent = scale ? `${+scale.toFixed(2)} ${q.unit}` : "high";
+    $("#lgHi").textContent = scale ? `${+(+scale).toFixed(2)} ${q.unit}` : "high";
   }
   function setGeometry(g){
     geom = g; full = g.header.shape;
     if(gl){ upload(1, texSolid, smoothMask(g.solid, full), full); hasSolid = true; }
+    placeRake(g);
     if(full[0] <= 1){ view.yaw = 0; view.pitch = 0.22; }
     $("#tunnelEmpty").hidden = true; request();
   }
@@ -700,21 +817,23 @@ const tunnel = (() => {
     fld = f; volShape = f.header.shape;
     if(!geom) full = f.header.full;
     if(gl){
-      upload(0, texVol, f[qty], volShape);
+      upload(0, texVol, qty === "smoke" ? f.wake : f[qty], volShape);
       if(f.vel){ gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_3D, texVel);
         gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, volShape[2], volShape[1], volShape[0], 0, gl.RGBA, gl.UNSIGNED_BYTE, f.vel); }
+      if(!dyeShape || dyeShape.join() !== volShape.join()) makeDye(volShape);
     }
     legend(); $("#tunnelEmpty").hidden = true; request();
   }
   function setQuantity(name){
     if(!QTY[name] || name === qty) return;
     qty = name;
-    if(fld && gl) upload(0, texVol, fld[qty], volShape);
+    if(fld && gl && name !== "smoke") upload(0, texVol, fld[qty], volShape);
     for(const b of document.querySelectorAll("#qtySeg .btn")) b.classList.toggle("on", b.dataset.q === qty);
+    $("#animBtn").disabled = qty !== "smoke";
     legend(); request();
   }
   function reset(){
-    geom = null; fld = null; hasSolid = false; full = [1, 1, 1];
+    geom = null; fld = null; hasSolid = false; full = [1, 1, 1]; dyeShape = null; simT = 0;
     if(gl){ upload(0, texVol, new Uint8Array(1), [1, 1, 1]); upload(1, texSolid, new Uint8Array(1), [1, 1, 1]); }
     $("#tunnelEmpty").hidden = false; request();
   }
@@ -733,13 +852,13 @@ const tunnel = (() => {
   for(const b of document.querySelectorAll("#qtySeg .btn")) b.addEventListener("click", () => setQuantity(b.dataset.q));
   $("#resetBtn").addEventListener("click", resetView);
   $("#animBtn").addEventListener("click", () => {
-    if(anim.on){ anim.frozenAt = clock(); anim.on = false; }
-    else { anim.t0 = performance.now() - anim.frozenAt * 1000; anim.on = true; }
-    $("#animBtn").textContent = anim.on ? "Pause" : "Play"; request();
+    running = !running; $("#animBtn").textContent = running ? "Pause" : "Play"; request();
   });
-  if(!gl) $("#animBtn").hidden = true;
   $("#lgBar").style.background = `linear-gradient(90deg, ${TURBO.map(c => `rgb(${c.join(",")})`).join(",")})`;
-  if(!gl) document.querySelector(".viewer .legend .hint").textContent = "mid-plane slice · the 3D view needs WebGL2";
+  if(!gl){
+    document.querySelector(".viewer .legend .hint").textContent = "mid-plane slice · the 3D view needs WebGL2";
+    $("#animBtn").hidden = true;
+  }
   legend();
   return {setGeometry, setField, reset, setQuantity};
 })();
