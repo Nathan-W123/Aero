@@ -183,6 +183,7 @@ figure .empty{color:var(--faint);font-size:12.5px}
             <button class="btn sm on" data-q="wake" title="How much the body disturbs the flow, |u − U∞|: clear in the free stream, a plume in the wake">Wake</button>
             <button class="btn sm" data-q="vorticity" title="How fast the flow spins, |∇×u|: boundary layers, shear layers and vortices">Vorticity</button>
           </span>
+          <button class="btn sm" id="animBtn" title="Freeze or resume the motion">Pause</button>
           <button class="btn sm" id="resetBtn">Reset view</button></h2>
         <div class="fill viewer">
           <canvas id="tunnel"></canvas>
@@ -235,6 +236,10 @@ function syncShape(){
   // A sphere's wake is steady until Re ≈ 210 and sheds only above ≈ 270, so a
   // perturbation tuned for the 2D cylinder (onset 47) just forces noise into Cd.
   $("#inlet_perturbation").value = mode === "3d" ? "0" : "0.02";
+  // A 3D body is only ~a dozen cells across, which puts omega near 2, where
+  // BGK goes unstable (the default sphere diverges in ~300 steps); the
+  // regularized operator is stable there at the same cost.
+  $("#collision").value = mode === "3d" ? "regularized" : "bgk";
   $("#pertHint").textContent = mode === "3d"
     ? "Only needed to trip shedding: a sphere's wake is steady below Re ≈ 210 and sheds above ≈ 270. Leave at 0 below that — it adds noise, not physics."
     : "A small perturbation is what trips vortex shedding above Re ≈ 47.";
@@ -405,9 +410,12 @@ const _drawChart = drawChart; drawChart = h => { lastHist = h || []; _drawChart(
 // one scalar -- the wake |u - U∞| or the vorticity -- and gathers colour from
 // the Turbo scale and opacity from a transfer function that leaves the free
 // stream clear, so the flow reads as a glowing medium rather than arrows.
-// The body is a second texture (the smoothed solid mask); rays stop on it and
-// it is lit as a surface.  Only the view and the data change, so it draws on
-// demand.  Without WebGL2 it falls back to the mid-plane on a 2D canvas.
+// It moves: a smoke texture modulates the opacity and is carried along the
+// computed velocity field, so on screen the flow runs downstream at its local
+// speed, slows in the wake and turns back in the recirculation behind the
+// body.  The colours are the data; only the wisps are texture.  The body is a
+// second texture (the smoothed solid mask); rays stop on it and it is lit as
+// a surface.  Without WebGL2 it falls back to the mid-plane on a 2D canvas.
 const tunnel = (() => {
   const cv = $("#tunnel");
   // Turbo, 17 control points (matplotlib's table).  Its darkest colour is the
@@ -431,16 +439,43 @@ const tunnel = (() => {
   const ctx2d = gl ? null : cv.getContext("2d");
 
   // --------------------------------------------------------------- GL ---
-  let prog = null, U = {}, texVol, texSolid, texLut, volShape = [1, 1, 1], hasSolid = false;
+  let prog = null, U = {}, texVol, texSolid, texLut, texVel, texNoise, volShape = [1, 1, 1], hasSolid = false;
+  // animation clock (seconds), frozen while paused
+  const anim = {on: true, t0: performance.now(), frozenAt: 0};
+  const clock = () => anim.on ? (performance.now() - anim.t0) / 1000 : anim.frozenAt;
+  // render scale: drops when frames run long, so weak GPUs stay smooth
+  const perf = {scale: Math.min(window.devicePixelRatio || 1, 1.5), frames: 0, since: performance.now()};
+
+  // Tileable smoke texture: white noise, box-blurred along each axis with
+  // wrap-around, contrast-stretched.  Made once, 256 kB.
+  function smokeNoise(n){
+    let a = new Float32Array(n * n * n), b = new Float32Array(a.length);
+    for(let i = 0; i < a.length; i++) a[i] = Math.random();
+    for(let pass = 0; pass < 2; pass++) for(const st of [1, n, n * n]){
+      for(let i = 0; i < a.length; i++){
+        const c = Math.floor(i / st) % n; let sum = 0;
+        for(let k = -2; k <= 2; k++) sum += a[i + (((c + k + n) % n) - c) * st];
+        b[i] = sum / 5;
+      }
+      [a, b] = [b, a];
+    }
+    let mean = 0, sq = 0;
+    for(const v of a){ mean += v; sq += v * v; }
+    mean /= a.length; const sd = Math.sqrt(Math.max(sq / a.length - mean * mean, 1e-12));
+    return Uint8Array.from(a, v => Math.max(0, Math.min(255, Math.round(128 + 46 * (v - mean) / sd))));
+  }
   if(gl){
     const VS = `#version 300 es
       in vec2 aPos; out vec2 vNdc;
       void main(){ vNdc = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }`;
     const FS = `#version 300 es
       precision highp float; precision highp sampler3D;
-      uniform sampler3D uVol, uSolid; uniform sampler2D uLut;
+      uniform sampler3D uVol, uSolid, uVel, uNoise; uniform sampler2D uLut;
+      uniform float uTime, uFlow, uVelScale, uNoiseFreq;
+      uniform bool uAnim;
+      const float PERIOD = 1.8;                       // seconds a texture copy lives
       uniform vec3 uEye, uRight, uUp, uFwd, uBox, uCell, uBg;
-      uniform float uTanHalf, uAspect, uDensity, uLo, uHi;
+      uniform float uTanHalf, uAspect, uDensity, uLo, uHi, uPixel;
       uniform bool uHasSolid, uHasVol;
       in vec2 vNdc; out vec4 outColor;
 
@@ -460,7 +495,7 @@ const tunnel = (() => {
         vec2 t = hitBox(uEye, rd);
         if(t.x >= t.y || t.y <= 0.0){ outColor = vec4(uBg, 1.0); return; }
         t.x = max(t.x, 0.0);
-        float px = 1.6 * uTanHalf / 400.0;            // ~ a pixel per unit distance
+        float px = 1.3 * uPixel;                      // ~ a pixel per unit distance
         vec3 lines = vec3(0.62, 0.55, 0.78) * (0.30 * edge(uEye + rd * t.x, px * t.x)
                                               + 0.14 * edge(uEye + rd * t.y, px * t.y));
         float dt = 0.5;                               // half a cell
@@ -497,7 +532,22 @@ const tunnel = (() => {
             float v = texture(uVol, tc).r;
             float w = smoothstep(uLo, uHi, v);
             if(w > 0.0){
-              float a = 1.0 - exp(-uDensity * w * dt);
+              float d = w;
+              if(uAnim){
+                // Two copies of the texture, each carried back along the local
+                // velocity and restarted every PERIOD while its weight is zero,
+                // so it moves with the flow without ever stretching apart.
+                vec3 vel = (texture(uVel, tc).rgb - 0.5) * (2.0 * uVelScale);
+                vec3 p = uEye + rd * tt;
+                float ph = fract(uTime / PERIOD), ph2 = fract(ph + 0.5);
+                vec3 q0 = (p - vel * (uFlow * PERIOD * ph)) * uNoiseFreq;
+                vec3 q1 = (p - vel * (uFlow * PERIOD * ph2)) * uNoiseFreq + 0.5;
+                float n0 = 0.62 * texture(uNoise, q0).r + 0.38 * texture(uNoise, q0 * 2.7 + 0.31).r;
+                float n1 = 0.62 * texture(uNoise, q1).r + 0.38 * texture(uNoise, q1 * 2.7 + 0.31).r;
+                float n = mix(n0, n1, abs(1.0 - 2.0 * ph));
+                d *= 0.22 + 1.9 * smoothstep(0.30, 0.74, n);
+              }
+              float a = 1.0 - exp(-uDensity * d * dt);
               vec3 c = texture(uLut, vec2(v, 0.5)).rgb * (1.0 + 0.5 * w);
               acc.rgb += (1.0 - acc.a) * a * c;
               acc.a += (1.0 - acc.a) * a;
@@ -515,7 +565,8 @@ const tunnel = (() => {
     if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
     gl.useProgram(prog);
     for(const n of ["uVol","uSolid","uLut","uEye","uRight","uUp","uFwd","uBox","uCell","uBg",
-                    "uTanHalf","uAspect","uDensity","uLo","uHi","uHasSolid","uHasVol"]) U[n] = gl.getUniformLocation(prog, n);
+                    "uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol",
+                    "uVel","uNoise","uTime","uFlow","uVelScale","uNoiseFreq","uAnim"]) U[n] = gl.getUniformLocation(prog, n);
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
@@ -526,7 +577,12 @@ const tunnel = (() => {
       for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 1, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1)); return t; };
-    texVol = tex3(0); texSolid = tex3(1);
+    texVol = tex3(0); texSolid = tex3(1); texVel = tex3(3); texNoise = tex3(4);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 0]));
+    gl.activeTexture(gl.TEXTURE4);
+    for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.REPEAT);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 64, 64, 64, 0, gl.RED, gl.UNSIGNED_BYTE, smokeNoise(64));
     texLut = gl.createTexture(); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texLut);
     const lut = new Uint8Array(256 * 4);
     for(let i = 0; i < 256; i++){ const c = turbo(i / 255); lut.set([c[0], c[1], c[2], 255], 4 * i); }
@@ -534,6 +590,7 @@ const tunnel = (() => {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.uniform1i(U.uVol, 0); gl.uniform1i(U.uSolid, 1); gl.uniform1i(U.uLut, 2);
+    gl.uniform1i(U.uVel, 3); gl.uniform1i(U.uNoise, 4);
     const bg = turbo(0).map(v => v / 255); gl.uniform3f(U.uBg, bg[0], bg[1], bg[2]);
   }
 
@@ -563,16 +620,25 @@ const tunnel = (() => {
     return [nx, ny, nz > 1 ? nz : Math.max(4, 0.12 * Math.max(nx, ny))];   // a 2D run is drawn as a slab
   }
   function resize(){
-    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-    cv.width = Math.max(1, Math.round(cv.clientWidth * dpr));
-    cv.height = Math.max(1, Math.round(cv.clientHeight * dpr));
+    cv.width = Math.max(1, Math.round(cv.clientWidth * perf.scale));
+    cv.height = Math.max(1, Math.round(cv.clientHeight * perf.scale));
     request();
   }
   function request(){ if(!queued){ queued = true; requestAnimationFrame(draw); } }
+  // every 30 animated frames: below ~30 fps render smaller, above ~50 fps larger
+  function pace(){
+    if(++perf.frames < 30) return;
+    const ms = (performance.now() - perf.since) / perf.frames, top = Math.min(window.devicePixelRatio || 1, 1.5);
+    const next = ms > 34 ? Math.max(0.4, perf.scale * 0.8) : ms < 20 ? Math.min(top, perf.scale * 1.12) : perf.scale;
+    perf.frames = 0; perf.since = performance.now();
+    if(Math.abs(next - perf.scale) > 0.01){ perf.scale = next; resize(); }
+  }
 
   function draw(){
     queued = false;
     if(!gl){ draw2d(); return; }
+    const moving = anim.on && !!fld;
+    if(moving){ pace(); request(); }                  // keep going while there is flow to move
     gl.viewport(0, 0, cv.width, cv.height);
     const box = boxDims(), c = box.map(v => v / 2), tanHalf = Math.tan(20 * Math.PI / 180), aspect = cv.width / cv.height;
     const cp = Math.cos(view.pitch), dir = [cp * Math.sin(view.yaw), Math.sin(view.pitch), cp * Math.cos(view.yaw)];
@@ -590,9 +656,13 @@ const tunnel = (() => {
     const q = QTY[qty], flat = full[0] <= 1;
     gl.uniform3f(U.uEye, ...eye); gl.uniform3f(U.uFwd, ...fwd); gl.uniform3f(U.uRight, ...right); gl.uniform3f(U.uUp, ...up);
     gl.uniform3f(U.uBox, ...box); gl.uniform3f(U.uCell, 1 / full[2], 1 / full[1], 1 / Math.max(full[0], 1));
-    gl.uniform1f(U.uTanHalf, tanHalf); gl.uniform1f(U.uAspect, aspect);
+    gl.uniform1f(U.uTanHalf, tanHalf); gl.uniform1f(U.uAspect, aspect); gl.uniform1f(U.uPixel, 2 * tanHalf / cv.height);
     gl.uniform1f(U.uDensity, flat ? q.density * 10 / box[2] : q.density); gl.uniform1f(U.uLo, q.lo); gl.uniform1f(U.uHi, q.hi);
     gl.uniform1i(U.uHasSolid, hasSolid ? 1 : 0); gl.uniform1i(U.uHasVol, fld ? 1 : 0);
+    // the free stream crosses the tunnel in ~3.5 s; the texture repeats every ~0.9 tunnel heights
+    gl.uniform1i(U.uAnim, fld && fld.vel ? 1 : 0); gl.uniform1f(U.uTime, clock());
+    gl.uniform1f(U.uFlow, box[0] / 3.5); gl.uniform1f(U.uNoiseFreq, 1 / (0.9 * box[1]));
+    gl.uniform1f(U.uVelScale, fld && fld.header.scales ? fld.header.scales.vel || 1.5 : 1.5);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
@@ -629,7 +699,11 @@ const tunnel = (() => {
   function setField(f){
     fld = f; volShape = f.header.shape;
     if(!geom) full = f.header.full;
-    if(gl) upload(0, texVol, f[qty], volShape);
+    if(gl){
+      upload(0, texVol, f[qty], volShape);
+      if(f.vel){ gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_3D, texVel);
+        gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, volShape[2], volShape[1], volShape[0], 0, gl.RGBA, gl.UNSIGNED_BYTE, f.vel); }
+    }
     legend(); $("#tunnelEmpty").hidden = true; request();
   }
   function setQuantity(name){
@@ -658,6 +732,12 @@ const tunnel = (() => {
     view.zoom = Math.min(6, Math.max(0.4, view.zoom * (e.deltaY < 0 ? 1.1 : 0.9))); request(); }, {passive: false});
   for(const b of document.querySelectorAll("#qtySeg .btn")) b.addEventListener("click", () => setQuantity(b.dataset.q));
   $("#resetBtn").addEventListener("click", resetView);
+  $("#animBtn").addEventListener("click", () => {
+    if(anim.on){ anim.frozenAt = clock(); anim.on = false; }
+    else { anim.t0 = performance.now() - anim.frozenAt * 1000; anim.on = true; }
+    $("#animBtn").textContent = anim.on ? "Pause" : "Play"; request();
+  });
+  if(!gl) $("#animBtn").hidden = true;
   $("#lgBar").style.background = `linear-gradient(90deg, ${TURBO.map(c => `rgb(${c.join(",")})`).join(",")})`;
   if(!gl) document.querySelector(".viewer .legend .hint").textContent = "mid-plane slice · the 3D view needs WebGL2";
   legend();

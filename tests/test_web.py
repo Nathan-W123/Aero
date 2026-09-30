@@ -147,6 +147,22 @@ def test_a_failing_case_reports_the_reason_rather_than_hanging():
     assert job.finished is not None
 
 
+def test_a_run_that_blows_up_is_reported_even_before_it_turns_nan():
+    """
+    BGK on the default 3D sphere (omega 1.92) diverges within ~300 steps, but
+    its drag stays finite -- ~1e40 -- for a while before reaching NaN, so a
+    NaN check alone let it finish as "complete" with garbage fields.
+    """
+    pytest.importorskip("numba")
+    job = web.Job(id="t_blowup", params={
+        "mode": "3d", "shape": "sphere", "radius": 7, "re": 100, "u0": 0.05,
+        "nx": 96, "ny": 48, "nz": 48, "steps": 600, "collision": "bgk", "backend": "numba",
+    })
+    web._run_job(job)
+    assert job.state == "error"
+    assert "diverged" in job.error and "regularized" in job.error
+
+
 def test_cancelling_stops_the_run_partway():
     job = web.Job(id="t3", params={
         "mode": "2d", "shape": "cylinder", "radius": 6, "re": 20, "u0": 0.05,
@@ -257,10 +273,11 @@ def test_field_payload_is_the_wake_and_vorticity_as_bytes(mode):
          "re": 20, "u0": 0.05, "nx": 40, "ny": 24, "nz": 24, "backend": "numpy"}
     solver, _ = web._build_solver(p)
     header, parts = _unpack(web._field_payload(solver, mode))
-    assert set(parts) == {"wake", "vorticity"}
+    assert set(parts) == {"wake", "vorticity", "vel"}
     assert all(a.dtype == np.uint8 for a in parts.values())
     shape = header["shape"]
     assert parts["wake"].size == int(np.prod(shape))
+    assert parts["vel"].size == 4 * int(np.prod(shape))            # RGBA per voxel
     solid = np.asarray(solver.solid, bool).reshape(shape)
     wake = parts["wake"].reshape(shape)
     assert wake[solid].max() == 0                        # the body is not fog
@@ -273,6 +290,10 @@ def test_field_payload_is_the_wake_and_vorticity_as_bytes(mode):
     assert wake[~solid].max() > 20                       # the body now disturbs the flow
     assert parts["vorticity"].max() == 255               # scaled to its own percentile
     assert header["scales"]["vorticity"] > 0
+    vel = parts["vel"].reshape(shape + [4]).astype(float)
+    ux = (vel[..., 0] / 255.0 - 0.5) * 2.0 * web.VEL_FULL_SCALE      # decoded, in u0
+    assert np.all(np.abs(ux[solid]) <= 2.0 * web.VEL_FULL_SCALE / 255)  # at rest, to a byte
+    assert np.median(ux[~solid]) == pytest.approx(1.0, abs=0.05)     # the free stream
 
 
 def test_field_payload_is_strided_to_the_voxel_budget(monkeypatch):

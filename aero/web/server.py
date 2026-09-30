@@ -282,8 +282,11 @@ def _geometry_payload(solid: np.ndarray) -> bytes:
 
 
 #: Voxels sent to the browser's volume renderer per refresh; larger grids are
-#: strided down to about this.  One byte a voxel, so a few MB on localhost.
-FIELD_VOXELS_MAX = 2_500_000
+#: strided down to about this.  Six bytes a voxel, so ~12 MB at most.
+FIELD_VOXELS_MAX = 2_000_000
+
+#: Velocity range carried in a byte for the viewer's animation, in u0.
+VEL_FULL_SCALE = 1.5
 
 #: Disturbance speed |u - U_inf| at the top of the colour scale, in units of u0.
 WAKE_FULL_SCALE = 1.2
@@ -291,7 +294,8 @@ WAKE_FULL_SCALE = 1.2
 
 def _field_payload(solver, mode: str) -> bytes:
     """
-    Two scalar volumes for the viewer's volume renderer, one byte a voxel.
+    Two scalar volumes for the viewer's volume renderer, one byte a voxel,
+    and the velocity that animates them.
 
     ``wake`` is |u - U_inf| / u0: how much the body disturbs the flow.  It is
     zero in the free stream, so the free stream renders as clear space and the
@@ -299,7 +303,9 @@ def _field_payload(solver, mode: str) -> bytes:
     |curl u| D / u0, scaled to its 99.5th percentile over the fluid so the
     shear layers show at any Reynolds number (the scale is in the header, for
     the legend).  Inside the body both are zero: the body is drawn from the
-    geometry, as a surface.
+    geometry, as a surface.  ``vel`` is u/u0 as RGBA bytes (A unused),
+    ``(u/u0) / (2 VEL_FULL_SCALE) + 1/2``; the viewer carries its smoke
+    texture along it, so the motion on screen is the computed flow's.
     """
     if mode == "2d":
         _, ux, uy = solver.macroscopic()
@@ -333,11 +339,15 @@ def _field_payload(solver, mode: str) -> bytes:
     def byte(a, full_scale):
         return np.clip(a * (255.0 / full_scale) + 0.5, 0.0, 255.0).astype(np.uint8)
 
+    vel = np.zeros(wake.shape + (4,), dtype=np.float32)
+    for i, comp in enumerate((ux, uy, uz)):
+        vel[..., i] = np.where(solid, 0.0, comp / u0) / (2.0 * VEL_FULL_SCALE) + 0.5
     return _pack(
         {"shape": list(wake.shape), "factor": f, "full": [nz, ny, nx], "u0": u0,
-         "scales": {"wake": WAKE_FULL_SCALE, "vorticity": _num(v_scale, 3)},
-         "names": ["wake", "vorticity"]},
-        byte(wake, WAKE_FULL_SCALE), byte(vort, v_scale),
+         "scales": {"wake": WAKE_FULL_SCALE, "vorticity": _num(v_scale, 3),
+                    "vel": VEL_FULL_SCALE},
+         "names": ["wake", "vorticity", "vel"]},
+        byte(wake, WAKE_FULL_SCALE), byte(vort, v_scale), byte(vel, 1.0),
     )
 
 
@@ -544,7 +554,9 @@ def _run_job(job: Job) -> None:
             cl_hist = _lift_history(solver)
             cd = float(cd_hist[-1]) if cd_hist else float("nan")
             cl = float(cl_hist[-1]) if cl_hist else float("nan")
-            if not np.isfinite(cd):
+            # A blown-up run can stay finite for a while (Cd ~ 1e40) before
+            # it reaches NaN; no physical drag coefficient is anywhere near 1e4.
+            if not np.isfinite(cd) or abs(cd) > 1e4:
                 raise RuntimeError(
                     f"the solution diverged at step {done} — lower Re, raise the "
                     f"grid resolution, or try the regularized collision operator"
