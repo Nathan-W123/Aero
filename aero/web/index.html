@@ -410,21 +410,20 @@ const _drawChart = drawChart; drawChart = h => { lastHist = h || []; _drawChart(
 // ------------------------------------------------------------ 3D tunnel ----
 // Volume rendering, WebGL2.  Three views of the computed flow:
 //
-//   Smoke      Dye released from a rake of nozzles just inside the inlet and
+//   Smoke      Smoke let in across a soft disc upstream of the body and
 //              carried through the solver's velocity field, on the GPU: each
-//              frame every cell looks back along the local velocity (second-
-//              order backtrace) to where its fluid came from.  Nothing is
-//              invented -- a puff is where released fluid has been carried,
-//              so it slows at the nose, speeds round the shoulders and is
-//              swept into the wake.  Steps are sized so the free stream moves
-//              exactly one cell, where resampling is exact: dye then stays
-//              sharp in the free stream and only mixes where the flow shears,
-//              instead of blurring into fog over a crossing.  Frames blend
-//              the last two steps, so motion is smooth.  It is released in
-//              pulses so steady flow still shows motion, from a "+" of
-//              nozzles through the body's centre; time is compressed so the
-//              free stream crosses the tunnel in CROSS_SECONDS.  Colour is
-//              local speed.
+//              step every cell looks back along the local velocity (second-
+//              order backtrace) to where its fluid came from.  It enters as
+//              uneven, cloudy puffs -- a slice of a smooth random field
+//              drifting in at the free-stream speed, like a smoke machine's
+//              output -- and from there on only the computed flow moves it:
+//              it parts round the body, speeds past the shoulders and is
+//              drawn into the wake.  Steps are sized so the free stream moves
+//              exactly one cell, where resampling is exact, so smoke stays
+//              crisp until the flow itself shears it; frames blend the last
+//              two steps, so motion is smooth.  Time is compressed so the free
+//              stream crosses the tunnel in CROSS_SECONDS.  Coloured by how
+//              much the body disturbs the flow there, |u − U∞|.
 //   Wake       |u − U∞| from the solver: clear in the free stream.
 //   Vorticity  |∇×u| from the solver.
 //
@@ -444,16 +443,18 @@ const tunnel = (() => {
     return [0, 1, 2].map(k => a[k] + (b[k] - a[k]) * u);
   };
   const QTY = {
-    smoke:     {density: 0.55, unit: "u₀",   name: "speed |u|"},
+    smoke:     {density: 0.10, unit: "u₀",   name: "smoke · |u − U∞|"},
     wake:      {density: 0.13, lo: 0.03, hi: 0.85, unit: "u₀",   name: "|u − U∞|"},
     vorticity: {density: 0.10, lo: 0.05, hi: 0.90, unit: "u₀/D", name: "|ω|"},
   };
   const CROSS_SECONDS = 4;          // free stream crosses the tunnel in this long on screen
-  const PUFFS = 6;                  // pulses released per crossing
   const view = {yaw: -0.52, pitch: 0.34, zoom: 1};
   let qty = "smoke", geom = null, fld = null, full = [1, 1, 1], queued = false;
   let running = true, simT = 0, simAcc = 0, lastFrame = 0;
-  const rake = {c: [0, 0], sp: 4, r: 1.0, half: 4};
+  // where smoke comes in, and the repeat length of its random field (cells);
+  // the field's features are ~1/12 of that, so puffs come out ~half a body
+  const source = {c: [0, 0], radius: 12, repeat: 80};
+  let simCells = 0;                                   // how far the free stream has moved, cells
   // render scale: drops when frames run long, so weak GPUs stay smooth
   const perf = {scale: Math.min(window.devicePixelRatio || 1, 1.5), frames: 0, since: performance.now()};
 
@@ -529,10 +530,12 @@ const tunnel = (() => {
             if(uSmoke){
               float c = mix(texture(uDyePrev, tc).r, texture(uDye, tc).r, uFrac);
               if(c > 0.004){
-                // colour: local speed, 0 .. full scale of the velocity bytes
-                float s = clamp(length((texture(uVel, tc).rgb - 0.5) * 2.0), 0.0, 1.0);
-                vec3 col = texture(uLut, vec2(0.10 + 0.90 * s, 0.5)).rgb * 1.1;
-                float a = 1.0 - exp(-uDensity * c * dt);
+                // colour: how disturbed the flow is here (uVol holds the wake);
+                // disturbed smoke is also denser, so the wake stands out of
+                // the stream around it
+                float s = texture(uVol, tc).r;
+                vec3 col = texture(uLut, vec2(0.18 + 0.82 * s, 0.5)).rgb * (1.05 + 0.35 * s);
+                float a = 1.0 - exp(-uDensity * c * (0.35 + 1.6 * s) * dt);
                 acc.rgb += (1.0 - acc.a) * a * col;
                 acc.a += (1.0 - acc.a) * a;
               }
@@ -553,13 +556,14 @@ const tunnel = (() => {
       }`;
     // One slice of the dye advection: this cell's dye is whatever was at the
     // point the flow carried here from, one step ago.  Inside the body there
-    // is none; across the inlet it is clean air except at the rake nozzles.
+    // is none; across the inlet it is the smoke source (clear outside its disc).
     const ADVECT_FS = `#version 300 es
       precision highp float; precision highp sampler3D;
       uniform sampler3D uDye, uVel, uSolid;
       uniform vec3 uGrid, uBox;
-      uniform float uZ, uStep, uVelScale, uInject, uRakeSp, uRakeR, uRakeHalf;
-      uniform vec2 uRakeC;
+      uniform sampler3D uNoise;
+      uniform float uZ, uStep, uVelScale, uAdvanced, uSrcR, uRepeat;
+      uniform vec2 uSrcC;
       uniform bool uFlat;
       out vec4 outDye;
       vec3 vel(vec3 p){ return (texture(uVel, p / uBox).rgb - 0.5) * (2.0 * uVelScale); }
@@ -569,12 +573,14 @@ const tunnel = (() => {
         if(texture(uSolid, tc).r > 0.5){ outDye = vec4(0.0); return; }
         float c;
         if(p.x < 2.5){
-          // a "+" of nozzles: a line across y at the body's mid-span, and a
-          // line across z at its mid-height (in 2D, just the line across y)
-          vec2 q = (vec2(p.y, p.z) - uRakeC) / uRakeSp, k = floor(q + 0.5), d = (q - k) * uRakeSp;
-          if(uFlat){ k.y = 0.0; d.y = 0.0; }
-          bool onLine = (k.y == 0.0 && abs(k.x) <= uRakeHalf) || (k.x == 0.0 && abs(k.y) <= uRakeHalf);
-          c = (onLine && length(d) < uRakeR) ? uInject : 0.0;
+          // a soft disc of smoke around the body's axis (a strip in 2D), its
+          // density a slice of a smooth random field drifting in with the stream
+          vec2 r = vec2(p.y, p.z) - uSrcC;
+          if(uFlat) r.y = 0.0;
+          float disc = 1.0 - smoothstep(0.7 * uSrcR, uSrcR, length(r));
+          vec3 q = vec3(p.x - uAdvanced, p.y, uFlat ? 0.0 : p.z) / uRepeat;
+          float n = 0.62 * texture(uNoise, q).r + 0.38 * texture(uNoise, q * 2.3 + 0.37).r;
+          c = disc * (0.10 + 0.90 * smoothstep(0.36, 0.66, n));
         } else {
           vec3 back = p - uStep * vel(p - 0.5 * uStep * vel(p));   // midpoint backtrace
           c = texture(uDye, back / uBox).r;
@@ -594,8 +600,8 @@ const tunnel = (() => {
     [render, R] = program(RENDER_FS, ["uVol","uSolid","uVel","uDye","uLut","uEye","uRight","uUp","uFwd","uBox",
       "uCell","uBg","uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol","uSmoke",
       "uDyePrev","uFrac"]);
-    [advect, A] = program(ADVECT_FS, ["uDye","uVel","uSolid","uGrid","uBox","uZ","uStep","uVelScale","uInject",
-      "uRakeSp","uRakeR","uRakeHalf","uRakeC","uFlat"]);
+    [advect, A] = program(ADVECT_FS, ["uDye","uVel","uSolid","uNoise","uGrid","uBox","uZ","uStep","uVelScale",
+      "uAdvanced","uSrcR","uRepeat","uSrcC","uFlat"]);
 
     const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -608,10 +614,13 @@ const tunnel = (() => {
       for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texImage3D(gl.TEXTURE_3D, 0, internal, 1, 1, 1, 0, format, type, data); return t; };
-    // units: 0 volume, 1 solid, 2 colour scale, 3 velocity, 5 dye now, 6 dye one step back
+    // units: 0 volume, 1 solid, 2 colour scale, 3 velocity, 4 source noise, 5 dye now, 6 dye one step back
     texVol = tex3(0, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
     texSolid = tex3(1, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
     texVel = tex3(3, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 0]));
+    const texNoise = tex3(4, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
+    for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.REPEAT);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 64, 64, 64, 0, gl.RED, gl.UNSIGNED_BYTE, smoothNoise(64));
     texLut = gl.createTexture(); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texLut);
     const lut = new Uint8Array(256 * 4);
     for(let i = 0; i < 256; i++){ const c = turbo(i / 255); lut.set([c[0], c[1], c[2], 255], 4 * i); }
@@ -624,7 +633,7 @@ const tunnel = (() => {
     gl.uniform1i(R.uDye, 5); gl.uniform1i(R.uDyePrev, 6);
     const bg = turbo(0).map(v => v / 255); gl.uniform3f(R.uBg, bg[0], bg[1], bg[2]);
     gl.useProgram(advect);
-    gl.uniform1i(A.uDye, 5); gl.uniform1i(A.uVel, 3); gl.uniform1i(A.uSolid, 1);
+    gl.uniform1i(A.uDye, 5); gl.uniform1i(A.uVel, 3); gl.uniform1i(A.uSolid, 1); gl.uniform1i(A.uNoise, 4);
     fbo = gl.createFramebuffer();
     // Dye in half floats where the GPU can render to them: 8 bits lose faint
     // dye to rounding on every resample.
@@ -651,7 +660,7 @@ const tunnel = (() => {
     const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     if(!ok && dyeFmt.internal !== gl.R8){ dyeFmt = {internal: gl.R8, type: gl.UNSIGNED_BYTE}; return makeDye(shape); }
-    dyeShape = shape.slice(); dyeCur = 0; simT = 0; simAcc = 0;
+    dyeShape = shape.slice(); dyeCur = 0; simT = 0; simAcc = 0; simCells = 0;
     bindDye();
   }
   function bindDye(){
@@ -666,17 +675,15 @@ const tunnel = (() => {
     const [sz, sy, sx] = dyeShape, box = [full[2], full[1], Math.max(full[0], 1)];
     const src = dye[dyeCur], dst = dye[1 - dyeCur];
     simT += stepSeconds();
-    // soft-edged pulses, so the smoke leaves as puffs joined by a faint streak
-    const ph = 0.5 + 0.5 * Math.cos(2 * Math.PI * simT * PUFFS / CROSS_SECONDS);
-    const pulse = 0.12 + 0.88 * ph * ph;
+    simCells += fld.header.factor || 1;
     gl.useProgram(advect);
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.viewport(0, 0, sx, sy);
     gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_3D, src);
     gl.uniform3f(A.uGrid, sx, sy, sz); gl.uniform3f(A.uBox, ...box);
     gl.uniform1f(A.uStep, fld.header.factor || 1);            // cells moved at u = u0
-    gl.uniform1f(A.uVelScale, fld.header.scales.vel || 1.5); gl.uniform1f(A.uInject, pulse);
-    gl.uniform2f(A.uRakeC, ...rake.c); gl.uniform1f(A.uRakeSp, rake.sp); gl.uniform1f(A.uRakeR, rake.r);
-    gl.uniform1f(A.uRakeHalf, rake.half); gl.uniform1i(A.uFlat, full[0] <= 1 ? 1 : 0);
+    gl.uniform1f(A.uVelScale, fld.header.scales.vel || 1.5); gl.uniform1f(A.uAdvanced, simCells);
+    gl.uniform2f(A.uSrcC, ...source.c); gl.uniform1f(A.uSrcR, source.radius); gl.uniform1f(A.uRepeat, source.repeat);
+    gl.uniform1i(A.uFlat, full[0] <= 1 ? 1 : 0);
     for(let z = 0; z < sz; z++){
       gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, dst, 0, z);
       gl.uniform1f(A.uZ, z);
@@ -686,9 +693,9 @@ const tunnel = (() => {
     dyeCur = 1 - dyeCur;
     bindDye();
   }
-  // The rake sits across the stream at the body: nozzles a quarter of the
-  // body apart, out to ~1.3 body sizes either side of its centre.
-  function placeRake(g){
+  // The smoke source is centred on the body's axis, about a body size in
+  // radius, with puffs about half a body across.
+  function placeSource(g){
     const [nz, ny, nx] = full, S = g.solid;
     let y0 = ny, y1 = -1, z0 = nz, z1 = -1;
     for(let z = 0; z < nz; z++) for(let y = 0; y < ny; y++){
@@ -697,9 +704,26 @@ const tunnel = (() => {
     }
     const flat = nz <= 1;
     const h = y1 >= y0 ? Math.max(y1 - y0 + 1, flat ? 0 : z1 - z0 + 1) : ny / 3;
-    rake.c = y1 >= y0 ? [(y0 + y1 + 1) / 2, flat ? 0.5 : (z0 + z1 + 1) / 2] : [ny / 2, Math.max(nz, 1) / 2];
-    rake.sp = Math.max(2.5, h / 4); rake.r = Math.max(0.8, 0.26 * rake.sp);
-    rake.half = Math.max(2, Math.ceil(1.3 * h / rake.sp));
+    source.c = y1 >= y0 ? [(y0 + y1 + 1) / 2, flat ? 0.5 : (z0 + z1 + 1) / 2] : [ny / 2, Math.max(nz, 1) / 2];
+    source.radius = Math.max(4, 0.95 * h); source.repeat = Math.max(36, 6.5 * h);
+  }
+  // Tileable smooth random field for the smoke source: white noise, box-
+  // blurred along each axis with wrap-around, contrast-stretched.  256 kB.
+  function smoothNoise(n){
+    let a = new Float32Array(n * n * n), b = new Float32Array(a.length);
+    for(let i = 0; i < a.length; i++) a[i] = Math.random();
+    for(let pass = 0; pass < 2; pass++) for(const st of [1, n, n * n]){
+      for(let i = 0; i < a.length; i++){
+        const c = Math.floor(i / st) % n; let sum = 0;
+        for(let k = -2; k <= 2; k++) sum += a[i + (((c + k + n) % n) - c) * st];
+        b[i] = sum / 5;
+      }
+      [a, b] = [b, a];
+    }
+    let mean = 0, sq = 0;
+    for(const v of a){ mean += v; sq += v * v; }
+    mean /= a.length; const sd = Math.sqrt(Math.max(sq / a.length - mean * mean, 1e-12));
+    return Uint8Array.from(a, v => Math.max(0, Math.min(255, Math.round(128 + 46 * (v - mean) / sd))));
   }
   // A 3x3x3 box blur of the solid mask, so the trilinear surface at 0.5 is
   // rounded rather than a staircase of cube corners.
@@ -802,14 +826,14 @@ const tunnel = (() => {
 
   function legend(){
     const q = QTY[qty], sc = fld && fld.header.scales ? fld.header.scales : null;
-    const scale = sc ? (qty === "smoke" ? sc.vel : sc[qty]) : null;
+    const scale = sc ? (qty === "smoke" ? sc.wake : sc[qty]) : null;
     $("#lgName").textContent = q.name;
     $("#lgHi").textContent = scale ? `${+(+scale).toFixed(2)} ${q.unit}` : "high";
   }
   function setGeometry(g){
     geom = g; full = g.header.shape;
     if(gl){ upload(1, texSolid, smoothMask(g.solid, full), full); hasSolid = true; }
-    placeRake(g);
+    placeSource(g);
     if(full[0] <= 1){ view.yaw = 0; view.pitch = 0.22; }
     $("#tunnelEmpty").hidden = true; request();
   }
