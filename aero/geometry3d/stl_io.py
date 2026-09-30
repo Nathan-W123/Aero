@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import struct
 from typing import Tuple
 
@@ -18,7 +19,11 @@ def load_stl_triangles(path: str) -> np.ndarray:
     triangles : ndarray, shape (T, 3, 3)
         Each row is three (x, y, z) vertices.
     """
-    data = pathlib.Path(path).read_bytes()
+    return parse_stl(pathlib.Path(path).read_bytes())
+
+
+def parse_stl(data: bytes) -> np.ndarray:
+    """The triangles of an STL file's contents (ASCII or binary), shape (T, 3, 3)."""
     if _looks_like_binary_stl(data):
         return _load_stl_binary(data)
     if data[:5].lower().startswith(b"solid"):
@@ -42,34 +47,23 @@ def _load_stl_binary(data: bytes) -> np.ndarray:
     if len(data) < expected:
         raise ValueError("Binary STL truncated")
 
-    tris = np.empty((tri_count, 3, 3), dtype=np.float64)
-    offset = 84
-    for i in range(tri_count):
-        vals = struct.unpack_from("<12f", data, offset)
-        tris[i, 0] = vals[3:6]
-        tris[i, 1] = vals[6:9]
-        tris[i, 2] = vals[9:12]
-        offset += 50
-    return tris
+    # 50 bytes a triangle: normal, three vertices, attribute count
+    record = np.dtype([("normal", "<f4", (3,)), ("v", "<f4", (3, 3)), ("attr", "<u2")])
+    return np.frombuffer(data, dtype=record, count=tri_count, offset=84)["v"].astype(np.float64)
+
+
+_ASCII_VERTEX = re.compile(rb"vertex\s+(\S+)\s+(\S+)\s+(\S+)", re.IGNORECASE)
 
 
 def _load_stl_ascii(data: bytes) -> np.ndarray:
-    text = data.decode("utf-8", errors="replace").splitlines()
-    tris = []
-    verts = []
-    for line in text:
-        parts = line.strip().split()
-        if not parts:
-            continue
-        tag = parts[0].lower()
-        if tag == "vertex" and len(parts) >= 4:
-            verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
-            if len(verts) == 3:
-                tris.append(verts)
-                verts = []
-    if not tris:
+    verts = _ASCII_VERTEX.findall(data)
+    n = len(verts) // 3 * 3                   # a trailing partial triangle is dropped
+    if n == 0:
         raise ValueError("No triangles found in ASCII STL")
-    return np.asarray(tris, dtype=np.float64)
+    try:
+        return np.array(verts[:n], dtype=np.float64).reshape(-1, 3, 3)
+    except ValueError as exc:
+        raise ValueError(f"Unreadable vertex in ASCII STL: {exc}") from None
 
 
 def triangle_bounds(triangles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

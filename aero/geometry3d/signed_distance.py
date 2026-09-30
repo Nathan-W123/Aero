@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .mesh_mask import points_inside_mesh
+from .mesh_mask import voxelize_mesh
 from .stl_prep import prepare_mesh_triangles
 
 
@@ -202,10 +202,9 @@ def compute_phi_field(
     y = np.arange(ny, dtype=np.float64) + 0.5
     x = np.arange(nx, dtype=np.float64) + 0.5
     zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")          # (nz, ny, nx)
-    all_pts = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])  # (N, 3)
 
-    # 3. Inside/outside classification via parity ray cast
-    inside = points_inside_mesh(all_pts, tris).reshape(nz, ny, nx)
+    # 3. Inside/outside classification via parity ray cast, a ray per column
+    inside = voxelize_mesh(tris, nz, ny, nx)
 
     # 4. Narrow-band: cells within band_width of the surface boundary
     near_surface = _dilate(inside, band_width) & _dilate(~inside, band_width)
