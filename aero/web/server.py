@@ -42,7 +42,7 @@ import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -114,6 +114,15 @@ class Job:
     geometry: Optional[bytes] = None
     field_bytes: Optional[bytes] = None
     field_step: int = -1
+    #: Cd and Cl at every step (entry i is step i + 1), for the convergence
+    #: chart to zoom into; replaced whole after each chunk, so a reader always
+    #: sees a matching pair
+    series: Tuple[np.ndarray, np.ndarray] = field(
+        default_factory=lambda: (np.zeros(0, np.float32), np.zeros(0, np.float32)))
+    #: replay frames, (step, vorticity scale, wake bytes, vorticity bytes);
+    #: see _record_frame
+    frames: List[Tuple[int, float, np.ndarray, np.ndarray]] = field(default_factory=list)
+    frame_shape: List[int] = field(default_factory=list)
     _cancel: threading.Event = field(default_factory=threading.Event)
 
     def public(self) -> Dict[str, Any]:
@@ -132,6 +141,7 @@ class Job:
             "figure_step": self.figure_step,
             "has_geometry": self.geometry is not None,
             "field_step": self.field_step,
+            "frame_step": self.frames[-1][0] if self.frames else -1,
             "params": self.params,
         }
 
@@ -181,8 +191,16 @@ def _check_omega(omega: float, re: float) -> None:
         )
 
 
-def _build_solver(p: Dict[str, Any]):
-    """Return (solver, geometry_label). Raises ValueError on a bad case."""
+def _case(p: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Parse and check a case's parameters, allocating nothing.
+
+    Returns the derived numbers (reference length, relaxation rate, grid)
+    and a ``make`` callable for the geometry; raises ValueError with a
+    message for the user on a case the solver would refuse.  Shared by
+    :func:`_build_solver` and the pre-run checks, which call it on every
+    edit of the form.
+    """
     mode = p.get("mode", "2d")
     re = _f(p, "re", 100.0)
     u0 = _f(p, "u0", 0.05)
@@ -191,8 +209,55 @@ def _build_solver(p: Dict[str, Any]):
     if not (0.0 < u0 <= 0.2):
         raise ValueError("u0 must be in (0, 0.2] — beyond that the flow is too compressible.")
 
+    if mode == "2d":
+        from ..geometry.cylinder import Cylinder
+        from ..geometry.rectangle import Rectangle
+
+        ny, nx = _i(p, "ny", 200), _i(p, "nx", 400)
+        shape = p.get("shape", "cylinder")
+        if shape == "rectangle":
+            w, h = _f(p, "width", 40.0), _f(p, "height", 20.0)
+            D, label, make = h, f"rectangle {w:g}x{h:g}", (lambda: Rectangle(width=w, height=h))
+        else:
+            r = _f(p, "radius", 20.0)
+            D, label, make = 2.0 * r, f"cylinder r={r:g}", (lambda: Cylinder(radius=r))
+        if D >= ny:
+            raise ValueError("The body is taller than the domain.")
+        grid = (ny, nx)
+    else:
+        from ..geometry3d.box import Box
+        from ..geometry3d.cylinder3d import Cylinder3D
+        from ..geometry3d.sphere import Sphere
+
+        nz, ny, nx = _i(p, "nz", 48), _i(p, "ny", 48), _i(p, "nx", 96)
+        shape = p.get("shape", "sphere")
+        if shape == "box":
+            w, h, d = _f(p, "width", 10.0), _f(p, "height", 10.0), _f(p, "depth", 10.0)
+            D, label, make = h, f"box {w:g}x{h:g}x{d:g}", (lambda: Box(width=w, height=h, depth=d))
+        elif shape == "cylinder":
+            r, L = _f(p, "radius", 8.0), _f(p, "length", 24.0)
+            D, label, make = 2.0 * r, f"cylinder r={r:g}", (lambda: Cylinder3D(radius=r, length=L))
+        else:
+            r = _f(p, "radius", 7.0)
+            D, label, make = 2.0 * r, f"sphere r={r:g}", (lambda: Sphere(radius=r))
+        if D >= ny or (shape == "sphere" and D >= nz):
+            raise ValueError("The body is larger than the tunnel's cross-section.")
+        grid = (nz, ny, nx)
+
+    nu = u0 * D / re
+    omega = 1.0 / (3.0 * nu + 0.5)
+    _check_omega(omega, re)
+    if mode == "3d" and p.get("lattice", "d3q19") != "d3q19" and p.get("collision", "bgk") == "mrt":
+        raise ValueError("MRT is implemented for D3Q19 only — pick another collision operator.")
+    return {"mode": mode, "shape": shape, "D": D, "label": label, "make": make,
+            "grid": grid, "re": re, "u0": u0, "nu": nu, "omega": omega}
+
+
+def _build_solver(p: Dict[str, Any]):
+    """Return (solver, geometry_label). Raises ValueError on a bad case."""
+    case = _case(p)
     common = dict(
-        u0=u0,
+        u0=case["u0"],
         backend=p.get("backend", "auto"),
         collision=p.get("collision", "bgk"),
         wall_bc=p.get("wall_bc", "slip"),
@@ -201,53 +266,115 @@ def _build_solver(p: Dict[str, Any]):
         les_cs=_f(p, "les_cs", 0.16),
         inlet_perturbation=_f(p, "inlet_perturbation", 0.0),
     )
-
-    if mode == "2d":
-        from ..geometry.cylinder import Cylinder
-        from ..geometry.rectangle import Rectangle
+    geom, D, omega = case["make"](), case["D"], case["omega"]
+    if case["mode"] == "2d":
         from ..lbm.solver import Solver
 
-        ny, nx = _i(p, "ny", 200), _i(p, "nx", 400)
-        shape = p.get("shape", "cylinder")
-        if shape == "rectangle":
-            w, h = _f(p, "width", 40.0), _f(p, "height", 20.0)
-            geom, D, label = Rectangle(width=w, height=h), h, f"rectangle {w:g}x{h:g}"
-        else:
-            r = _f(p, "radius", 20.0)
-            geom, D, label = Cylinder(radius=r), 2.0 * r, f"cylinder r={r:g}"
+        ny, nx = case["grid"]
         solid = geom.mark_solid(ny, nx)
-        if D >= ny:
-            raise ValueError("The body is taller than the domain.")
-        nu = u0 * D / re
-        omega = 1.0 / (3.0 * nu + 0.5)
-        _check_omega(omega, re)
-        return Solver(Ny=ny, Nx=nx, solid=solid, omega=omega, D=D, **common), label
+        return Solver(Ny=ny, Nx=nx, solid=solid, omega=omega, D=D, **common), case["label"]
 
-    from ..geometry3d.box import Box
-    from ..geometry3d.cylinder3d import Cylinder3D
-    from ..geometry3d.sphere import Sphere
     from ..lbm.solver3d import Solver3D
 
-    nz, ny, nx = _i(p, "nz", 48), _i(p, "ny", 48), _i(p, "nx", 96)
-    shape = p.get("shape", "sphere")
-    if shape == "box":
-        w, h, d = _f(p, "width", 10.0), _f(p, "height", 10.0), _f(p, "depth", 10.0)
-        geom, D, label = Box(width=w, height=h, depth=d), h, f"box {w:g}x{h:g}x{d:g}"
-    elif shape == "cylinder":
-        r, L = _f(p, "radius", 8.0), _f(p, "length", 24.0)
-        geom, D, label = Cylinder3D(radius=r, length=L), 2.0 * r, f"cylinder r={r:g}"
-    else:
-        r = _f(p, "radius", 7.0)
-        geom, D, label = Sphere(radius=r), 2.0 * r, f"sphere r={r:g}"
+    nz, ny, nx = case["grid"]
     solid = geom.mark_solid(nz, ny, nx)
-    nu = u0 * D / re
-    omega = 1.0 / (3.0 * nu + 0.5)
-    _check_omega(omega, re)
-    lattice = p.get("lattice", "d3q19")
-    if lattice != "d3q19" and common["collision"] == "mrt":
-        raise ValueError("MRT is implemented for D3Q19 only — pick another collision operator.")
     return Solver3D(Nz=nz, Ny=ny, Nx=nx, solid=solid, omega=omega, D=D,
-                    lattice=lattice, ref_area=geom.reference_area(), **common), label
+                    lattice=p.get("lattice", "d3q19"), ref_area=geom.reference_area(),
+                    **common), case["label"]
+
+
+#: The pre-run stability check warns above this relaxation rate: the grid
+#: then resolves the viscosity by only a few percent of a cell, and whether a
+#: run survives depends on the collision operator and the body.  Measured
+#: with the regularized inlet: BGK holds on the default 2D rectangle up to
+#: omega = 1.942 (Re 200) and on the default sphere at 1.919.  (The solver
+#: refuses outright above OMEGA_CEILING.)
+OMEGA_WARN = 1.95
+#: ... and above this inlet speed, where compressibility errors (~Ma^2) pass 3%.
+U0_WARN = 0.1
+
+#: The uncertainty-budget checks that depend only on the settings.
+PREFLIGHT_CHECKS = ("blockage", "domain_length", "discretization", "bc_sensitivity")
+
+
+def _stability_check(p: Dict[str, Any], case: Optional[Dict[str, Any]], error: Optional[str]):
+    u0 = _f(p, "u0", 0.05)
+    ma = u0 * np.sqrt(3.0)
+    if case is None:
+        return {"status": "fail", "short": "cannot run as set", "message": error or ""}
+    omega = case["omega"]
+    short = f"ω = {omega:.3f} · Ma = {ma:.2f}"
+    notes = []
+    if omega > OMEGA_WARN:
+        notes.append(
+            f"ω = {omega:.3f} (τ = {1 / omega:.3f}) is close to 2, where the grid barely "
+            "resolves the viscosity. If the run diverges, use a finer grid (a larger body "
+            "in cells), a lower Re or u0, or another collision operator.")
+    if u0 > U0_WARN:
+        notes.append(f"Ma = {ma:.2f}: compressibility errors grow as Ma² (~{ma * ma * 100:.0f}% here); "
+                     "a lower u0 is closer to incompressible, at more steps for the same flow time.")
+    if notes:
+        return {"status": "warn", "short": short, "message": " ".join(notes)}
+    return {"status": "pass", "short": short,
+            "message": f"ω = {omega:.3f} (τ = {1 / omega:.3f}) and Ma = {ma:.2f} are well inside "
+                       "the stable, nearly incompressible range."}
+
+
+_NUMERIC_KEYS = frozenset({"re", "u0", "nx", "ny", "nz", "radius", "width", "height", "depth",
+                           "length", "steps", "inlet_perturbation", "les_cs"})
+#: The numbers :func:`_case` falls back on, for the checks' benefit.
+_FORM_DEFAULTS = {
+    "2d": {"re": 100.0, "u0": 0.05, "nx": 400, "ny": 200, "radius": 20.0, "width": 40.0, "height": 20.0},
+    "3d": {"re": 100.0, "u0": 0.05, "nx": 96, "ny": 48, "nz": 48, "radius": 7.0, "width": 10.0,
+           "height": 10.0, "depth": 10.0, "length": 24.0},
+}
+
+
+def _is_number(v: Any) -> bool:
+    try:
+        return bool(np.isfinite(float(v)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _preflight(p: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    What can be said about a case before it runs: the checks that depend only
+    on its settings -- blockage, domain length, resolution, boundary
+    conditions, stability -- and the drag it should give.  Allocates nothing,
+    so the page can ask on every edit.
+    """
+    # a form mid-edit sends "" or "1e"; read those as the defaults, so the
+    # checks stay meaningful rather than the whole list failing
+    mode = p.get("mode", "2d")
+    p = {**_FORM_DEFAULTS[mode if mode in _FORM_DEFAULTS else "2d"],
+         **{k: v for k, v in p.items() if k not in _NUMERIC_KEYS or _is_number(v)}}
+    shape = p.get("shape", "cylinder" if mode == "2d" else "sphere")
+    case, error = None, None
+    try:
+        case = _case(p)
+    except ValueError as exc:
+        error = str(exc)
+    checks: Dict[str, Any] = {"stability": _stability_check(p, case, error)}
+    try:
+        rep = build_uncertainty_report(mode=mode, shape=shape, params=dict(p), result={})
+        for name in PREFLIGHT_CHECKS:
+            comp = rep.components.get(name) or {}
+            if comp.get("status") not in (None, "n/a"):
+                checks[name] = {"status": comp["status"], "message": comp.get("message", ""),
+                                "short": _short_label(name, comp.get("value"), mode, shape,
+                                                      _f(p, "re", 100.0))}
+    except Exception as exc:                 # a half-typed form must not break the page
+        checks["budget"] = {"status": "warn", "short": "checks unavailable", "message": str(exc)}
+    out: Dict[str, Any] = {"uncertainty": checks, "error": error}
+    try:
+        out["reference"] = _reference(p, mode, None)
+    except Exception:
+        out["reference"] = None
+    if case is not None:
+        out["setup"] = {"label": case["label"], "omega": _num(case["omega"]), "nu": _num(case["nu"], 6),
+                        "grid": list(case["grid"]), "cells": int(np.prod(case["grid"]))}
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +403,22 @@ def _pack(header: Dict[str, Any], *arrays: np.ndarray) -> bytes:
     return head + b" " * pad + b"\n" + b"".join(blobs)
 
 
+def _series(cd_hist, cl_hist) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-step Cd and Cl as float32, the same length (Cl padded with NaN)."""
+    cd = np.asarray(cd_hist, dtype=np.float32)
+    cl = np.full(cd.shape, np.nan, dtype=np.float32)
+    n = min(len(cl_hist), cd.size)
+    cl[:n] = np.asarray(cl_hist[:n], dtype=np.float32)
+    return cd, cl
+
+
+def _series_payload(job: "Job", start: int) -> bytes:
+    """The per-step coefficients from step ``start + 1`` on (entry i is step i + 1)."""
+    cd, cl = job.series
+    start = min(max(int(start), 0), cd.size)
+    return _pack({"from": start, "total": int(cd.size), "names": ["cd", "cl"]}, cd[start:], cl[start:])
+
+
 def _geometry_payload(solid: np.ndarray) -> bytes:
     if solid.ndim == 2:
         solid = solid[None]
@@ -295,6 +438,11 @@ WAKE_FULL_SCALE = 1.2
 
 
 def _field_payload(solver, mode: str) -> bytes:
+    header, *volumes = _field_volumes(solver, mode)
+    return _pack(header, *volumes)
+
+
+def _field_volumes(solver, mode: str):
     """
     Two scalar volumes for the viewer's volume renderer, one byte a voxel,
     and the velocity that animates them.
@@ -344,13 +492,40 @@ def _field_payload(solver, mode: str) -> bytes:
     vel = np.zeros(wake.shape + (4,), dtype=np.float32)
     for i, comp in enumerate((ux, uy, uz)):
         vel[..., i] = np.where(solid, 0.0, comp / u0) / (2.0 * VEL_FULL_SCALE) + 0.5
-    return _pack(
+    return (
         {"shape": list(wake.shape), "factor": f, "full": [nz, ny, nx], "u0": u0,
          "scales": {"wake": WAKE_FULL_SCALE, "vorticity": _num(v_scale, 3),
                     "vel": VEL_FULL_SCALE},
          "names": ["wake", "vorticity", "vel"]},
         byte(wake, WAKE_FULL_SCALE), byte(vort, v_scale), byte(vel, 1.0),
     )
+
+
+#: The viewer replays the wake and vorticity of a run as a time-lapse, one
+#: frame a chunk.  Frames cost two bytes a voxel; past this many bytes a run
+#: drops every other frame (keeping the first and the latest), and only the
+#: newest REPLAY_RUNS_KEPT runs keep theirs.
+REPLAY_BYTES_MAX = 48 * 2 ** 20
+REPLAY_RUNS_KEPT = 3
+
+
+def _record_frame(job: "Job", step: int, header: Dict[str, Any], wake: np.ndarray,
+                  vort: np.ndarray) -> None:
+    frames = job.frames + [(int(step), float(header["scales"]["vorticity"] or 1.0), wake, vort)]
+    if sum(w.nbytes + v.nbytes for _, _, w, v in frames) > REPLAY_BYTES_MAX and len(frames) > 2:
+        frames = frames[:-1:2] + [frames[-1]]
+    job.frame_shape = list(header["shape"])
+    job.frames = frames                       # replaced whole: readers see one list or the other
+
+
+def _frames_payload(job: "Job", after: int) -> bytes:
+    """The replay frames after step ``after``: steps, vorticity scales, then the volumes."""
+    frames = [fr for fr in job.frames if fr[0] > after]
+    empty = np.zeros(0, np.uint8)
+    return _pack({"shape": job.frame_shape, "steps": [fr[0] for fr in frames],
+                  "scales": [_num(fr[1], 4) for fr in frames], "names": ["wake", "vorticity"]},
+                 np.concatenate([fr[2].ravel() for fr in frames]) if frames else empty,
+                 np.concatenate([fr[3].ravel() for fr in frames]) if frames else empty)
 
 
 # ---------------------------------------------------------------------------
@@ -630,8 +805,10 @@ def _run_job(job: Job) -> None:
         }
 
         job.geometry = _geometry_payload(solver.solid)
-        job.field_bytes = _field_payload(solver, mode)
+        header, *volumes = _field_volumes(solver, mode)
+        job.field_bytes = _pack(header, *volumes)
         job.field_step = 0
+        _record_frame(job, 0, header, volumes[0], volumes[1])
 
         total = job.total = max(_i(p, "steps", 3000), 1)
         chunk = max(total // 60, 50)
@@ -655,17 +832,21 @@ def _run_job(job: Job) -> None:
             # it reaches NaN; no physical drag coefficient is anywhere near 1e4.
             if not np.isfinite(cd) or abs(cd) > 1e4:
                 raise RuntimeError(
-                    f"the solution diverged at step {done} — lower Re, raise the "
-                    f"grid resolution, or try the regularized collision operator"
+                    f"the solution diverged at step {done} — lower Re or u0, raise the "
+                    f"grid resolution (more cells across the body), or try another "
+                    f"collision operator"
                 )
             job.history.append({"step": done, "cd": _num(cd), "cl": _num(cl)})
+            job.series = _series(cd_hist, cl_hist)
             rate = done / max(time.time() - t0, 1e-9)
             mlups = rate * float(np.prod(solver.solid.shape)) / 1e6
             job.message = (f"step {done:,} of {total:,} · {rate:,.0f} steps/s · "
                            f"{mlups:,.1f} MLUPS on {getattr(solver, 'backend', '?')}")
             try:
-                job.field_bytes = _field_payload(solver, mode)
+                header, *volumes = _field_volumes(solver, mode)
+                job.field_bytes = _pack(header, *volumes)
                 job.field_step = done
+                _record_frame(job, done, header, volumes[0], volumes[1])
             except Exception:
                 pass
             if len(job.history) % 3 == 1:
@@ -710,8 +891,11 @@ def _run_job(job: Job) -> None:
                 pass
         job.figure_step = job.step
         try:
-            job.field_bytes = _field_payload(solver, mode)
+            header, *volumes = _field_volumes(solver, mode)
+            job.field_bytes = _pack(header, *volumes)
             job.field_step = job.step
+            if not job.frames or job.frames[-1][0] != job.step:
+                _record_frame(job, job.step, header, volumes[0], volumes[1])
         except Exception:
             pass
         job.preview_png = job.figures.get(p.get("field", "speed")) or job.preview_png
@@ -781,6 +965,23 @@ class Handler(BaseHTTPRequestHandler):
             if not blob:
                 return self._json({"error": "not ready yet"}, 404)
             return self._send(200, blob, "application/octet-stream")
+        if u.path == "/api/frames":
+            job = JOBS.get((q.get("id") or [""])[0])
+            if job is None:
+                return self._json({"error": "no such run"}, 404)
+            after = (q.get("after") or ["-1"])[0]
+            try:
+                after = int(after)
+            except ValueError:
+                after = -1
+            return self._send(200, _frames_payload(job, after), "application/octet-stream")
+        if u.path == "/api/series":
+            job = JOBS.get((q.get("id") or [""])[0])
+            if job is None:
+                return self._json({"error": "no such run"}, 404)
+            start = (q.get("from") or ["0"])[0]
+            return self._send(200, _series_payload(job, int(start) if start.isdigit() else 0),
+                              "application/octet-stream")
         if u.path == "/api/figure":
             job = JOBS.get((q.get("id") or [""])[0])
             if job is None:
@@ -806,8 +1007,13 @@ class Handler(BaseHTTPRequestHandler):
                 JOBS[job.id] = job
                 for old in sorted(JOBS.values(), key=lambda j: j.started)[:-12]:
                     JOBS.pop(old.id, None)        # keep the last dozen
+                for old in sorted(JOBS.values(), key=lambda j: j.started)[:-REPLAY_RUNS_KEPT]:
+                    old.frames = []               # and the replays of the last few
             threading.Thread(target=_run_job, args=(job,), daemon=True).start()
             return self._json({"id": job.id})
+
+        if u.path == "/api/preflight":
+            return self._json(_preflight(payload if isinstance(payload, dict) else {}))
 
         if u.path == "/api/stop":
             job = JOBS.get(payload.get("id", ""))

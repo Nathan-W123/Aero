@@ -128,12 +128,33 @@ h1,h2{margin:0;font-size:inherit}
 .cm-ticks span:first-child::before{left:0}
 .cm-ticks span:last-child{transform:translateX(-100%)}
 .cm-ticks span:last-child::before{left:auto;right:0}
+.replay{display:flex;align-items:center;gap:8px;margin-left:8px;min-width:0}
+.replay input{width:clamp(80px,14vw,220px);accent-color:var(--sel)}
+.replay .mono{font-size:11px;white-space:nowrap}
 .cmap .hint{margin-left:auto;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 /* ---- plots ---- */
 .right{display:grid;grid-template-rows:repeat(4,minmax(0,1fr))}
 .chartbox{overflow:hidden}
-svg.chart{display:block;width:100%;height:100%}
+svg.chart{display:block;width:100%;height:100%;cursor:grab;touch-action:none;user-select:none}
+svg.chart:active{cursor:grabbing}
+svg.chart.box{cursor:crosshair}
+svg.chart:focus-visible{outline:1px dotted var(--ink);outline-offset:-2px}
+.phead h2{font-weight:600}
+.tools{display:flex;gap:1px}
+.tb{width:22px;height:19px;display:grid;place-items:center;padding:0;border:1px solid transparent;border-radius:2px;background:none}
+.tb svg{width:14px;height:14px}
+.tb:hover:not(:disabled){background:linear-gradient(#f4f9fe,#dcebfb);border-color:var(--hover-edge)}
+.tb.on{background:linear-gradient(#dcebf8,#c3dbf4);border-color:var(--press-edge)}
+.tb:disabled{cursor:default}
+.tb:disabled svg{filter:grayscale(1);opacity:.4}
+.tb:focus-visible{outline:1px dotted var(--ink);outline-offset:-3px}
+.tip{position:absolute;pointer-events:none;background:#fff;border:1px solid var(--edge);box-shadow:0 2px 6px rgba(20,40,70,.18);
+  padding:4px 7px;font:11px/1.45 Consolas,ui-monospace,monospace;color:var(--ink);white-space:nowrap;z-index:5}
+.tip b{font-weight:600}
+.tip .w{color:var(--faint);font-weight:400}
+.work{position:relative}
+.pane.max{position:absolute;inset:4px;z-index:30;box-shadow:0 8px 28px rgba(20,40,70,.35)}
 figure{margin:0;flex:1;min-height:0;display:grid;place-items:center;overflow:hidden;position:relative}
 figure img{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);object-fit:contain;display:block}
 figure .empty{color:var(--faint)}
@@ -164,6 +185,7 @@ figure .empty{color:var(--faint)}
   .right{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,240px)}
   .statusbar{position:sticky;bottom:0}
 }
+@media (max-width:1100px){ .pane.max{position:fixed;inset:8px} }
 @media (max-width:620px){
   .resbody,#checks{grid-template-columns:minmax(0,1fr)}
   #stats{border-right:0}
@@ -223,7 +245,7 @@ figure .empty{color:var(--faint)}
       </div>
       <div class="rlabel">View</div>
     </div>
-    <div class="rgroup" role="group" aria-label="Smoke">
+    <div class="rgroup" role="group" aria-label="Animation">
       <div class="rbtns">
         <button class="rbtn big" id="animBtn" title="Freeze or resume the smoke">
           <svg class="ic-pause" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="gAnim" x2="0" y2="1"><stop offset="0" stop-color="#7cb7f0"/><stop offset="1" stop-color="#2463b5"/></linearGradient></defs><circle cx="16" cy="16" r="13.5" fill="url(#gAnim)" stroke="#1d4f91"/><rect x="11.2" y="10" width="3.5" height="12" rx=".8" fill="#fff"/><rect x="17.3" y="10" width="3.5" height="12" rx=".8" fill="#fff"/></svg>
@@ -233,7 +255,7 @@ figure .empty{color:var(--faint)}
           <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13.5" fill="url(#gAnim)" stroke="#1d4f91"/><rect x="10" y="10" width="2.8" height="12" rx=".7" fill="#fff"/><path d="M22.6 9.8v12.4L13.4 16z" fill="#fff"/></svg>
           <span>Restart</span></button>
       </div>
-      <div class="rlabel">Smoke</div>
+      <div class="rlabel">Animation</div>
     </div>
     <div class="rgroup" role="group" aria-label="Export">
       <div class="rbtns">
@@ -318,6 +340,9 @@ figure .empty{color:var(--faint)}
         <span class="cm-name" id="lgName">smoke · |u − U∞|</span>
         <div class="cm-scale"><i id="lgBar"></i><div class="cm-ticks" id="lgTicks"></div></div>
         <span id="lgUnit"></span>
+        <span class="replay" id="replayBox" hidden>
+          <input type="range" id="replayPos" min="0" max="1" step="0.01" value="1" aria-label="Replay position">
+          <span class="mono" id="replayStep"></span></span>
         <span class="hint" id="viewHint">drag to rotate · wheel to zoom</span>
       </div>
     </section>
@@ -332,9 +357,26 @@ figure .empty{color:var(--faint)}
   </div>
 
   <div class="col right">
-    <section class="pane" aria-label="Convergence">
-      <h2 class="phead">Convergence<span class="sp"></span><span class="aux mono" id="chartRead"></span></h2>
-      <div class="pbody chartbox"><svg class="chart" id="chart" role="img" aria-label="Drag and lift coefficient against step"></svg></div>
+    <section class="pane" id="convPane" aria-label="Convergence">
+      <div class="phead"><h2>Convergence</h2><span class="sp"></span>
+        <span class="tools" role="toolbar" aria-label="Chart navigation">
+          <button class="tb on" id="cvPan" aria-pressed="true" title="Pan: drag to move (Shift-drag zooms to a box)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5v13M1.5 8h13M8 1.5L6 3.6M8 1.5l2 2.1M8 14.5l-2-2.1M8 14.5l2-2.1M1.5 8l2.1-2M1.5 8l2.1 2M14.5 8l-2.1-2M14.5 8l-2.1 2" fill="none" stroke="#3d5a80" stroke-width="1.3" stroke-linecap="round"/></svg></button>
+          <button class="tb" id="cvBox" aria-pressed="false" title="Box zoom: drag a box to zoom into">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="3.5" width="9" height="7" fill="#dbe9f9" stroke="#3d5a80" stroke-dasharray="2 1.2"/><circle cx="11" cy="10" r="3" fill="#fff" stroke="#3d5a80" stroke-width="1.2"/><path d="M13.2 12.2l2 2" stroke="#3d5a80" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+          <button class="tb" id="cvIn" title="Zoom in on time (or use the wheel)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.6" fill="#e8f2fd" stroke="#3d5a80" stroke-width="1.3"/><path d="M10 10l4.2 4.2" stroke="#3d5a80" stroke-width="2" stroke-linecap="round"/><path d="M4.3 6.5h4.4M6.5 4.3v4.4" stroke="#2b62b0" stroke-width="1.3"/></svg></button>
+          <button class="tb" id="cvOut" title="Zoom out on time">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.6" fill="#e8f2fd" stroke="#3d5a80" stroke-width="1.3"/><path d="M10 10l4.2 4.2" stroke="#3d5a80" stroke-width="2" stroke-linecap="round"/><path d="M4.3 6.5h4.4" stroke="#2b62b0" stroke-width="1.3"/></svg></button>
+          <button class="tb" id="cvFit" title="Whole run, axes automatic (or double-click the chart)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 5V1.5H5M11 1.5h3.5V5M14.5 11v3.5H11M5 14.5H1.5V11" fill="none" stroke="#3d5a80" stroke-width="1.3"/><path d="M4 10l2.5-3 2 2L12 5" fill="none" stroke="#2b62b0" stroke-width="1.3"/></svg></button>
+          <button class="tb" id="cvMax" aria-pressed="false" title="Enlarge the chart">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" fill="#fff" stroke="#3d5a80" stroke-width="1.2"/><path d="M2 5h12" stroke="#3d5a80" stroke-width="1.6"/></svg></button>
+        </span></div>
+      <div class="pbody chartbox">
+        <svg class="chart" id="chart" tabindex="0" role="img" aria-label="Drag and lift coefficient against step"></svg>
+        <div class="tip" id="chartTip" hidden></div>
+      </div>
     </section>
     <section class="pane"><h2 class="phead">Velocity</h2><figure id="fig_speed"><span class="empty">—</span></figure></section>
     <section class="pane"><h2 class="phead">Vorticity</h2><figure id="fig_vorticity"><span class="empty">—</span></figure></section>
@@ -396,9 +438,10 @@ function syncShape(){
   // A sphere's wake is steady until Re ≈ 210 and sheds only above ≈ 270, so a
   // perturbation tuned for the 2D cylinder (onset 47) just forces noise into Cd.
   $("#inlet_perturbation").value = mode === "3d" ? "0" : "0.02";
-  // A 3D body is only ~a dozen cells across, which puts omega near 2, where
-  // BGK goes unstable (the default sphere diverges in ~300 steps); the
-  // regularized operator is stable there at the same cost.
+  // 3D defaults to the regularized operator, as it has since BGK diverged on
+  // the default sphere (omega 1.92) -- which turned out to be the Zou-He
+  // inlet, not BGK: with the regularized inlet both are stable there, and
+  // at higher u0 near omega = 2 BGK is the more robust of the two.
   $("#collision").value = mode === "3d" ? "regularized" : "bgk";
   $("#pertRow").dataset.desc = mode === "3d"
     ? "Random inlet noise, as a fraction of u₀. Only needed to trip shedding: a sphere's wake is steady below Re ≈ 210 and sheds above ≈ 270. Leave at 0 below that — it adds noise, not physics."
@@ -410,12 +453,13 @@ function syncShape(){
 function syncDims(){ inputs($("#dimRow"), DIMS[$("#mode").value + ":" + $("#shape").value] || []); }
 function params(){
   const p = {};
-  document.querySelectorAll("input,select").forEach(el=>{ if(el.id) p[el.id] = el.type === "checkbox" ? el.checked : el.value; });
+  // the case is the property grid, nothing else on the page (the replay slider is an input too)
+  document.querySelectorAll("#props input, #props select").forEach(el=>{ if(el.id) p[el.id] = el.type === "checkbox" ? el.checked : el.value; });
   return p;
 }
 function attach(id){
   jobId = id; location.hash = id;
-  geomLoaded = false; fieldStamp = -1; figStamp = -1; tunnel.reset();
+  geomLoaded = false; fieldStamp = -1; figStamp = -1; tunnel.reset(); resetChart(); drawChart();
   $("#runBtn").disabled = true; $("#stopBtn").disabled = false;
   clearInterval(poll); poll = setInterval(tick, 700); tick();
 }
@@ -427,11 +471,12 @@ async function boot(){
   syncShape();
   $("#mode").addEventListener("change", syncShape);
   $("#shape").addEventListener("change", syncDims);
+  preflight();
   const fromUrl = location.hash.replace(/^#/, "").trim();
   if(/^[a-f0-9]{6,32}$/.test(fromUrl) && (await fetch(`/api/status?id=${fromUrl}`)).ok) attach(fromUrl);
 }
 $("#runBtn").addEventListener("click", async () => {
-  $("#errBox").hidden = true; $("#checks").hidden = true;
+  $("#errBox").hidden = true;
   $("#stats").innerHTML = '<div class="pempty">Waiting for the first samples…</div>';
   for(const k of ["speed","vorticity","pressure"]) $("#fig_"+k).innerHTML = '<span class="empty">rendering…</span>';
   formSynced = true;
@@ -457,8 +502,11 @@ function caseName(){
 }
 $("#saveImgBtn").addEventListener("click", () => download(`${caseName()}_${tunnel.quantity()}.png`, tunnel.snapshot()));
 $("#saveCsvBtn").addEventListener("click", () => {
-  const cell = v => (v === null || v === undefined) ? "" : v;
-  const rows = (lastStatus.history || []).map(d => `${d.step},${cell(d.cd)},${cell(d.cl)}`);
+  const cell = v => (v === null || v === undefined || !Number.isFinite(v)) ? "" : +v.toPrecision(7);
+  // every step when the per-step series is here, else the sampled history
+  const rows = series.n >= 2
+    ? Array.from({length: series.n}, (_, i) => `${i + 1},${cell(series.cd[i])},${cell(series.cl[i])}`)
+    : (lastStatus.history || []).map(d => `${d.step},${cell(d.cd)},${cell(d.cl)}`);
   downloadText(`${caseName()}_history.csv`, ["step,Cd,Cl", ...rows].join("\n") + "\n", "text/csv");
 });
 $("#saveJsonBtn").addEventListener("click", () => {
@@ -498,10 +546,11 @@ async function tick(){
     $("#mode").value = j.params.mode || "2d"; syncShape();
     if(j.params.shape){ $("#shape").value = j.params.shape; syncDims(); }
     for(const [k, v] of Object.entries(j.params)){
-      const el = document.getElementById(k);
+      const el = $("#props").querySelector(`[id="${k}"]`);
       if(!el || k === "mode" || k === "shape") continue;
       if(el.type === "checkbox") el.checked = !!v; else el.value = v;
     }
+    preflight();                                   // for the run's settings, not the defaults
   }
   const s = j.result.setup;
   if(s){
@@ -512,7 +561,8 @@ async function tick(){
   }
   if(j.state === "error"){ $("#errBox").hidden = false; $("#errBox").textContent = j.error || "the run failed"; }
 
-  drawChart(j.history, j.result.coefficients);
+  await pullSeries(jobId);
+  drawChart(j.history, j.result.coefficients || null);
   const c = j.result.coefficients;
   const f4 = v => (v === null || v === undefined) ? "—" : v.toFixed(4);
   // (the label's text sits in its own span: a flex item trims the space after <sub>)
@@ -523,11 +573,16 @@ async function tick(){
     + row("C<sub>d</sub> fluctuation σ", f4(c.cd_std), "Standard deviation of the per-step drag signal: how much it fluctuates, not how uncertain the mean is.")
     + row("C<sub>l</sub>", `${f4(c.cl)}<small>± ${f4(c.cl_sem95)}</small>`);
 
-  renderChecks(j.result);
+  // the run's own checks once it has them; until then the pre-run ones stand
+  if(j.result.uncertainty || j.result.reference) renderChecks(j.result, "Checks");
 
   if(j.has_geometry && !geomLoaded){
     const g = await fetchPacked(`/api/geometry?id=${jobId}`);
     if(g){ tunnel.setGeometry(g); geomLoaded = true; $("#saveImgBtn").disabled = false; }
+  }
+  if(j.frame_step > tunnel.replayLast()){
+    const fr = await fetchPacked(`/api/frames?id=${jobId}&after=${tunnel.replayLast()}`);
+    if(fr) tunnel.addFrames(fr);
   }
   if(j.field_step !== fieldStamp && j.field_step >= 0){
     const f = await fetchPacked(`/api/field?id=${jobId}`);
@@ -543,6 +598,7 @@ async function tick(){
   }
   if(["done","error","stopped"].includes(j.state)){
     clearInterval(poll); poll = null;
+    tunnel.runDone();
     $("#runBtn").disabled = false; $("#stopBtn").disabled = true;
   }
 }
@@ -552,7 +608,8 @@ async function tick(){
 // so each systematic effect gets its own row, and the expected value for the
 // run *as configured* (confinement included) sits first.  Status is carried
 // by the icon's shape as well as its colour.
-const CHECK_ORDER = ["statistical", "blockage", "domain_length", "discretization", "bc_sensitivity", "convergence"];
+const CHECK_ORDER = ["statistical", "blockage", "domain_length", "discretization", "stability",
+                     "bc_sensitivity", "convergence", "budget"];
 const STATUS_ICON = {
   pass: '<svg viewBox="0 0 14 14" aria-label="pass"><circle cx="7" cy="7" r="6.5" fill="#2c8a3c"/><path d="M4 7.3l2 2 4-4.5" fill="none" stroke="#fff" stroke-width="1.6"/></svg>',
   warn: '<svg viewBox="0 0 14 14" aria-label="warning"><path d="M7 1l6.3 11.4H.7z" fill="#e3a008" stroke="#a86f00" stroke-width=".8" stroke-linejoin="round"/><path d="M7 4.8v3.8" stroke="#fff" stroke-width="1.6"/><circle cx="7" cy="10.4" r=".9" fill="#fff"/></svg>',
@@ -560,10 +617,12 @@ const STATUS_ICON = {
   info: '<svg viewBox="0 0 14 14" aria-label="note"><circle cx="7" cy="7" r="6.5" fill="#3a78c9"/><path d="M7 6v4.4" stroke="#fff" stroke-width="1.6"/><circle cx="7" cy="4" r=".95" fill="#fff"/></svg>',
 };
 function esc(t){ return String(t).replace(/[&<>"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch])); }
-function renderChecks(res){
+function renderChecks(res, title){
   const box = $("#checks"), u = res.uncertainty, r = res.reference;
-  if(!u && !r){ box.hidden = true; return; }
-  let html = '<div class="pcat">Checks</div>';
+  if(!u && !r && !res.error){ box.hidden = true; return; }
+  let html = `<div class="pcat">${title}</div>`;
+  if(res.error)
+    html += `<div class="crow ref">${STATUS_ICON.fail}<span>Won't run as set: ${esc(res.error)}</span></div>`;
   if(r){
     const exp = r.expected != null ? `Expected C<sub>d</sub> ≈ ${r.expected.toFixed(2)}` : "Literature value";
     const band = r.band ? ` [${r.band[0].toFixed(2)}–${r.band[1].toFixed(2)}]` : "";
@@ -577,128 +636,366 @@ function renderChecks(res){
   box.innerHTML = html; box.hidden = false;
 }
 
+// The checks that depend only on the settings -- blockage, domain length,
+// resolution, stability, boundary conditions -- and the expected drag, asked
+// for on every edit so a case can be fixed before it is run.
+let preflightTimer = null, preflightSeq = 0;
+async function preflight(){
+  const seq = ++preflightSeq;
+  let res;
+  try {
+    res = await (await fetch("/api/preflight", {method: "POST", headers: {"Content-Type": "application/json"},
+                                                 body: JSON.stringify(params())})).json();
+  } catch(e){ console.error("pre-run checks failed:", e); return; }
+  if(seq === preflightSeq) renderChecks(res, "Pre-run checks · current settings");
+}
+function preflightSoon(){ clearTimeout(preflightTimer); preflightTimer = setTimeout(preflight, 300); }
+$("#props").addEventListener("input", preflightSoon);
+$("#props").addEventListener("change", preflightSoon);
+
 // --------------------------------------------------------------- chart ----
 // Cd above, Cl below, on a shared step axis: small multiples rather than one
 // axis, because the two differ in size (Cd ~ 1, Cl ~ 0 +- a little) and one
-// scale flattens whichever is smaller.  Each range ignores the first 15% of
-// the run, where the start-up transient can be ten times the settled value;
-// the transient runs off the top or bottom instead, as do the odd spikes
-// (the range spans the 5th to 95th percentile).  The shaded band is the second
-// half of the run, which is what the reported means average over; once the
-// run is done the mean and its 95% interval are drawn across it.
-const SERIES = [{k: "cd", sub: "d", color: "#1f5fbf", width: 1.8, share: 0.56},
-                {k: "cl", sub: "l", color: "#d9730d", width: 1.5, share: 0.44}];
-let lastHist = [], lastCoef = null, chartGeom = null, chartHovering = false;
-const CHART_NOTE = "shaded: averaging window";
-function niceTicks(lo, hi, n){
-  const raw = (hi - lo) / Math.max(n, 1), mag = 10 ** Math.floor(Math.log10(raw));
-  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(v => v >= raw * 0.999);
+// scale flattens whichever is smaller.  The data is Cd and Cl at every step
+// (/api/series), drawn at whatever detail the zoom calls for: when there are
+// more steps in view than pixels, each pixel column draws its min and max, so
+// no spike is lost at any zoom.
+//
+// Navigation.  The wheel zooms time around the cursor; on a panel's value
+// axis, or with Shift, it zooms that panel's values.  Dragging pans (the box
+// tool, or Shift-drag, zooms to a box).  Double-click or Fit shows the whole
+// run.  Each axis is automatic until you move it: time then stays where you
+// put it while the run goes on, and an automatic value axis fits what is in
+// view -- ignoring the start-up transient and the odd spike in the whole-run
+// view (5th to 95th percentile), showing everything once zoomed in.  Ticks
+// are recomputed for every view.
+//
+// The shaded band is the second half of the run, which is what the reported
+// means average over; once the run is done the mean and its 95% interval are
+// drawn across it.
+const SERIES = [{k: "cd", sub: "d", color: "#1f5fbf", width: 1.6, share: 0.56},
+                {k: "cl", sub: "l", color: "#d9730d", width: 1.4, share: 0.44}];
+const CHART_PAD = {L: 50, R: 10, T: 3, B: 17, GAP: 6};
+const series = {cd: new Float32Array(1024), cl: new Float32Array(1024), n: 0, busy: false};
+const nav = {x: null, y: [null, null], tool: "pan"};    // null: automatic
+let lastHist = [], lastCoef = null, chartGeom = null, hoverAt = null, drag = null;
+
+// Tick values for [lo, hi], about n of them, at 1, 2, 2.5 or 5 times a power
+// of ten (whole numbers only, when ``whole``), labelled to the step's precision.
+function niceTicks(lo, hi, n, whole = false){
+  const raw = Math.max((hi - lo) / Math.max(n, 1), whole ? 1 : 0), mag = 10 ** Math.floor(Math.log10(raw));
+  const step = (whole ? [1, 2, 5, 10] : [1, 2, 2.5, 5, 10]).map(m => m * mag).find(v => v >= raw * 0.999);
   const dec = Math.min(6, (String(+step.toPrecision(6)).split(".")[1] || "").length);
   const ticks = [];
   for(let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + step * 1e-9; v += step) ticks.push(v);
   return {ticks, fmt: v => (Math.abs(v) < step * 1e-6 ? 0 : v).toFixed(dec)};
 }
+function resetChart(){
+  series.n = 0; series.busy = false;
+  nav.x = null; nav.y = [null, null];
+  lastHist = []; lastCoef = null; hideHover();
+}
+function appendSeries(cd, cl){
+  const need = series.n + cd.length;
+  if(need > series.cd.length){
+    let cap = series.cd.length; while(cap < need) cap *= 2;
+    for(const k of ["cd", "cl"]){ const a = new Float32Array(cap); a.set(series[k].subarray(0, series.n)); series[k] = a; }
+  }
+  series.cd.set(cd, series.n); series.cl.set(cl, series.n); series.n = need;
+}
+async function pullSeries(id){
+  if(series.busy) return;
+  series.busy = true;
+  try {
+    const d = await fetchPacked(`/api/series?id=${id}&from=${series.n}`);
+    if(d && id === jobId && d.header.from === series.n && d.cd.length) appendSeries(d.cd, d.cl);
+  } finally { series.busy = false; }
+}
+// The points to draw: every step while they fit, else each pixel column's
+// extremes in time order.  Entry i of the per-step series is step i + 1.
+function source(){
+  if(series.n >= 2) return {n: series.n, x: i => i + 1, v: (k, i) => series[k][i], dense: true};
+  const h = lastHist.filter(d => Number.isFinite(d.step));
+  return {n: h.length, x: i => h[i].step, v: (k, i) => (h[i][k] ?? NaN), dense: false};
+}
+function visiblePoints(src, k, x0, x1, X, width){
+  let i0 = 0, i1 = src.n - 1;
+  if(src.dense){ i0 = Math.max(0, Math.floor(x0) - 2); i1 = Math.min(src.n - 1, Math.ceil(x1)); }
+  else {
+    while(i0 < src.n - 1 && src.x(i0 + 1) < x0) i0++;
+    while(i1 > 0 && src.x(i1 - 1) > x1) i1--;
+  }
+  const pts = [];
+  if(i1 - i0 + 1 <= 2 * width){
+    for(let i = i0; i <= i1; i++){ const v = src.v(k, i); if(Number.isFinite(v)) pts.push([src.x(i), v]); }
+    return pts;
+  }
+  let col = -1, lo = null, hi = null;
+  const flush = () => { if(lo){ if(lo[0] <= hi[0]) pts.push(lo, hi); else pts.push(hi, lo); } lo = hi = null; };
+  for(let i = i0; i <= i1; i++){
+    const v = src.v(k, i); if(!Number.isFinite(v)) continue;
+    const x = src.x(i), c = Math.floor(X(x));
+    if(c !== col){ flush(); col = c; }
+    if(!lo || v < lo[1]) lo = [x, v];
+    if(!hi || v > hi[1]) hi = [x, v];
+  }
+  flush();
+  return pts;
+}
+function autoRange(pts, whole, end, mean, ci){
+  let vals = pts.map(p => p[1]);
+  if(whole){                                        // the whole run: skip the start-up, trim spikes
+    const settled = pts.filter(p => p[0] >= 0.2 * end).map(p => p[1]);
+    if(settled.length >= 3) vals = settled;
+    vals.sort((a, b) => a - b);
+    const q = f => vals[Math.round(f * (vals.length - 1))];
+    vals = [q(0.05), q(0.95)];
+  }
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if(Number.isFinite(mean) && whole){ lo = Math.min(lo, mean - (ci || 0)); hi = Math.max(hi, mean + (ci || 0)); }
+  const mid = (lo + hi) / 2, half = Math.max((whole ? 0.62 : 0.56) * (hi - lo), 0.01 * Math.abs(mid), 1e-4);
+  return [mid - half, mid + half];
+}
 function drawChart(samples, coef){
-  lastHist = samples || []; lastCoef = coef || null;
-  const svg = $("#chart");
+  if(samples) lastHist = samples;
+  if(coef !== undefined) lastCoef = coef || null;
+  const svg = $("#chart"), coefs = lastCoef;
   const W = Math.max(svg.clientWidth, 200), H = Math.max(svg.clientHeight, 90);
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const src = source();
   chartGeom = null;
-  const hist = lastHist.filter(d => Number.isFinite(d.step));
-  if(hist.length < 2){
+  if(src.n < 2){
     svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="#66788f" font-size="12">no samples yet</text>`;
-    $("#chartRead").textContent = ""; return;
+    syncChartTools(); return;
   }
-  const L = 46, R = 10, T = 3, B = 17, GAP = 6;
-  const end = hist[hist.length - 1].step, X = v => L + (W - L - R) * v / Math.max(end, 1);
-  const win = end / 2, settle = 0.2 * end, plotH = H - T - B - GAP;
-  const xt = niceTicks(0, end, Math.max(2, Math.floor((W - L - R) / 72)));
+  const {L, R, T, B, GAP} = CHART_PAD, pw = W - L - R, plotH = H - T - B - GAP;
+  const end = Math.max(src.x(src.n - 1), 1);
+  const [x0, x1] = nav.x || [0, end];
+  const X = v => L + pw * (v - x0) / (x1 - x0), Xinv = px => x0 + (px - L) * (x1 - x0) / pw;
+  const win = end / 2, clipW = (a, b) => [Math.max(X(a), L), Math.min(X(b), W - R)];
+  const xt = niceTicks(x0, x1, Math.max(2, Math.floor(pw / 80)), true);
   let out = "", top = T;
   const panels = [];
-  for(const sr of SERIES){
+  SERIES.forEach((sr, n) => {
     const h = Math.round(plotH * sr.share), y0 = top, y1 = top + h;
     top = y1 + GAP;
-    const pts = hist.filter(d => Number.isFinite(d[sr.k]));
-    out += `<rect x="${L}" y="${y0}" width="${W - L - R}" height="${h}" fill="#fff"/>`
-         + `<rect x="${X(win).toFixed(1)}" y="${y0}" width="${(X(end) - X(win)).toFixed(1)}" height="${h}" fill="#eef3fa"/>`;
+    const pts = visiblePoints(src, sr.k, x0, x1, X, pw);
+    const mean = coefs ? coefs[sr.k] : null, ci = coefs ? coefs[sr.k + "_sem95"] : null;
+    const [lo, hi] = nav.y[n] || (pts.length ? autoRange(pts, !nav.x, end, mean, ci) : [-1, 1]);
+    const Y = v => y1 - h * (v - lo) / (hi - lo), Yinv = py => lo + (y1 - py) * (hi - lo) / h;
+    out += `<rect x="${L}" y="${y0}" width="${pw}" height="${h}" fill="#fff"/>`;
+    const [wa, wb] = clipW(win, end);
+    if(wb > wa) out += `<rect x="${wa.toFixed(1)}" y="${y0}" width="${(wb - wa).toFixed(1)}" height="${h}" fill="#eef3fa"/>`;
     for(const v of xt.ticks) out += `<line x1="${X(v).toFixed(1)}" x2="${X(v).toFixed(1)}" y1="${y0}" y2="${y1}" stroke="#eef1f5"/>`;
-    const mean = coef ? coef[sr.k] : null, ci = coef ? coef[sr.k + "_sem95"] : null;
-    let Y = null;
-    if(pts.length){
-      const settled = pts.filter(d => d.step >= settle);
-      const vals = (settled.length >= 3 ? settled : pts).map(d => d[sr.k]).sort((a, b) => a - b);
-      const q = f => vals[Math.round(f * (vals.length - 1))];
-      let lo = q(0.05), hi = q(0.95);
-      if(Number.isFinite(mean)){ lo = Math.min(lo, mean - (ci || 0)); hi = Math.max(hi, mean + (ci || 0)); }
-      const mid = (lo + hi) / 2, half = Math.max(0.62 * (hi - lo), 0.01 * Math.abs(mid), 1e-3);
-      lo = mid - half; hi = mid + half;
-      Y = v => y1 - h * (v - lo) / (hi - lo);
-      const yt = niceTicks(lo, hi, h >= 70 ? 3 : 2);
-      for(const v of yt.ticks){
-        const y = Y(v).toFixed(1);
-        out += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}" stroke="#e3e9f1"/>`
-             + `<text class="tk" x="${L - 5}" y="${(+y + 3.5).toFixed(1)}" text-anchor="end">${yt.fmt(v)}</text>`;
-      }
-      out += `<clipPath id="clip_${sr.k}"><rect x="${L}" y="${y0}" width="${W - L - R}" height="${h}"/></clipPath><g clip-path="url(#clip_${sr.k})">`;
-      if(Number.isFinite(mean)){
-        const yb = Y(mean + (ci || 0)), band = Math.max(Y(mean - (ci || 0)) - yb, 1);
-        out += `<rect x="${X(win).toFixed(1)}" y="${yb.toFixed(1)}" width="${(X(end) - X(win)).toFixed(1)}" height="${band.toFixed(1)}" fill="${sr.color}" fill-opacity=".16"/>`
-             + `<line x1="${X(win).toFixed(1)}" x2="${X(end).toFixed(1)}" y1="${Y(mean).toFixed(1)}" y2="${Y(mean).toFixed(1)}" stroke="#1b2a3d" stroke-width="1" stroke-dasharray="4 3"/>`;
-      }
-      out += `<path d="${pts.map((d, i) => `${i ? "L" : "M"}${X(d.step).toFixed(1)} ${Y(d[sr.k]).toFixed(1)}`).join(" ")}" fill="none" stroke="${sr.color}" stroke-width="${sr.width}" stroke-linejoin="round"/></g>`;
-      if(Number.isFinite(mean) && X(end) - X(win) > 90){
-        const ym = Y(mean), above = ym - y0 > 16;
-        out += `<text class="lb" x="${(X(end) - 5).toFixed(1)}" y="${(above ? ym - 5 : ym + 13).toFixed(1)}" text-anchor="end">mean ${mean.toFixed(4)} ± ${(ci || 0).toFixed(4)}</text>`;
-      }
-    } else {
-      out += `<text class="tk" x="${(L + W - R) / 2}" y="${(y0 + y1) / 2 + 4}" text-anchor="middle">no data</text>`;
+    const yt = niceTicks(lo, hi, Math.max(2, Math.floor(h / 26)));
+    for(const v of yt.ticks){
+      const y = Y(v).toFixed(1);
+      out += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}" stroke="#e3e9f1"/>`
+           + `<text class="tk" x="${L - 5}" y="${(+y + 3.5).toFixed(1)}" text-anchor="end">${yt.fmt(v)}</text>`;
     }
-    out += `<rect x="${L}" y="${y0}" width="${W - L - R}" height="${h}" fill="none" stroke="#c9d4e2"/>`
+    out += `<clipPath id="clip_${sr.k}"><rect x="${L}" y="${y0}" width="${pw}" height="${h}"/></clipPath><g clip-path="url(#clip_${sr.k})">`;
+    if(Number.isFinite(mean) && wb > wa){
+      const yb = Y(mean + (ci || 0)), band = Math.max(Y(mean - (ci || 0)) - yb, 1);
+      out += `<rect x="${wa.toFixed(1)}" y="${yb.toFixed(1)}" width="${(wb - wa).toFixed(1)}" height="${band.toFixed(1)}" fill="${sr.color}" fill-opacity=".16"/>`
+           + `<line x1="${wa.toFixed(1)}" x2="${wb.toFixed(1)}" y1="${Y(mean).toFixed(1)}" y2="${Y(mean).toFixed(1)}" stroke="#1b2a3d" stroke-dasharray="4 3"/>`;
+    }
+    if(pts.length)
+      out += `<path d="${pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)} ${Y(p[1]).toFixed(1)}`).join("")}" fill="none" stroke="${sr.color}" stroke-width="${sr.width}" stroke-linejoin="round"/>`;
+    out += `</g>`;
+    if(Number.isFinite(mean) && wb - wa > 120){
+      const ym = Y(mean);
+      if(ym > y0 + 4 && ym < y1 - 4){
+        const above = ym - y0 > 16;
+        out += `<text class="lb" x="${(wb - 5).toFixed(1)}" y="${(above ? ym - 5 : ym + 13).toFixed(1)}" text-anchor="end">mean ${mean.toFixed(4)} ± ${(ci || 0).toFixed(4)}</text>`;
+      }
+    }
+    out += `<rect x="${L}" y="${y0}" width="${pw}" height="${h}" fill="none" stroke="#c9d4e2"/>`
          + `<text class="nm" x="${L + 6}" y="${y0 + 13}">C<tspan dy="3" font-size="8.5">${sr.sub}</tspan></text>`;
-    panels.push({k: sr.k, Y, y0, y1});
-  }
+    panels.push({k: sr.k, n, Y, Yinv, y0, y1, lo, hi});
+  });
   for(const v of xt.ticks){
-    if(v === 0) continue;                                   // "step" stands there
-    const x = X(v), anchor = x > W - R - 18 ? "end" : "middle";
+    const x = X(v);
+    if(x < L + 12 && v === 0) continue;                // "step" stands there
+    const anchor = x > W - R - 18 ? "end" : x < L + 14 ? "start" : "middle";
     out += `<text class="tk" x="${x.toFixed(1)}" y="${H - 4}" text-anchor="${anchor}">${Math.round(v).toLocaleString()}</text>`;
   }
   out += `<text class="tk" x="${L - 5}" y="${H - 4}" text-anchor="end">step</text>`;
-  svg.innerHTML = `<style>.tk{font:10px Consolas,ui-monospace,monospace;fill:#5d6f88}`
+  svg.innerHTML = `<title>Drag and lift coefficient against step. Wheel: zoom time (Shift or over the numbers: zoom values). Drag: pan. Shift-drag: zoom to a box. Double-click: whole run.</title>`
+    + `<style>.tk{font:10px Consolas,ui-monospace,monospace;fill:#5d6f88}`
     + `.lb{font:10.5px "Segoe UI",system-ui,sans-serif;fill:#3e5372;paint-order:stroke;stroke:#fff;stroke-width:3px}`
     + `.nm{font:600 11.5px "Segoe UI",system-ui,sans-serif;fill:#1b2a3d;paint-order:stroke;stroke:#fff;stroke-width:3px}</style>`
     + out
     + `<g id="chartHover" display="none"><line y1="${T}" y2="${H - B}" stroke="#7d8ca2" stroke-dasharray="3 3"/>`
-    + SERIES.map(sr => `<circle r="4" fill="${sr.color}" stroke="#fff" stroke-width="2"/>`).join("") + `</g>`;
-  chartGeom = {W, X, panels, hist};
-  if(!chartHovering) $("#chartRead").textContent = CHART_NOTE;
+    + SERIES.map(sr => `<circle r="4" fill="${sr.color}" stroke="#fff" stroke-width="2"/>`).join("") + `</g>`
+    + `<rect id="chartBox" display="none" fill="#3a78c9" fill-opacity=".12" stroke="#3a78c9" stroke-dasharray="3 2"/>`;
+  chartGeom = {W, H, L, R, pw, X, Xinv, end, src, panels, win};
+  syncChartTools();
+  if(hoverAt) showHover(hoverAt.x, hoverAt.y);
 }
-function chartHover(e){
-  const svg = $("#chart"), hov = $("#chartHover");
-  if(!chartGeom || !hov) return;
-  chartHovering = true;
-  const {W, X, panels, hist} = chartGeom, box = svg.getBoundingClientRect();
-  const px = (e.clientX - box.left) * W / box.width;
-  let i = 0;
-  for(let k = 1; k < hist.length; k++) if(Math.abs(X(hist[k].step) - px) < Math.abs(X(hist[i].step) - px)) i = k;
-  const d = hist[i], x = X(d.step).toFixed(1);
+
+// --- pointer helpers
+function chartPoint(e){
+  const svg = $("#chart"), box = svg.getBoundingClientRect(), g = chartGeom;
+  return {x: (e.clientX - box.left) * g.W / box.width, y: (e.clientY - box.top) * g.H / box.height};
+}
+function panelAt(y){
+  const g = chartGeom;
+  return g.panels.find(p => y >= p.y0 - 3 && y <= p.y1 + 3) || (y < g.panels[1].y0 ? g.panels[0] : g.panels[1]);
+}
+function currentX(){ return nav.x || [0, chartGeom.end]; }
+function setX(a, b){
+  const end = chartGeom.end, span = b - a, min = Math.min(10, end);
+  if(span >= end){ nav.x = null; return; }                  // all of it: back to automatic
+  if(span < min){ const c = (a + b) / 2; a = c - min / 2; b = c + min / 2; }
+  if(a < 0){ b -= a; a = 0; }
+  if(b > end){ a -= b - end; b = end; }
+  nav.x = [Math.max(0, a), b];
+}
+function zoomX(f, about){
+  const [a, b] = currentX();
+  about = about ?? (a + b) / 2;
+  setX(about - (about - a) * f, about + (b - about) * f);
+}
+function zoomY(p, f, about){
+  const lo = p.lo, hi = p.hi;
+  about = about ?? (lo + hi) / 2;
+  nav.y[p.n] = [about - (about - lo) * f, about + (hi - about) * f];
+}
+function fitChart(){ nav.x = null; nav.y = [null, null]; drawChart(); }
+
+// --- hover: crosshair, a dot on each line, the values in a tooltip
+function showHover(px, py){
+  const g = chartGeom, hov = $("#chartHover"), tip = $("#chartTip");
+  if(!g || !hov) return;
+  if(px < g.L || px > g.W - g.R || py > g.H - CHART_PAD.B){ hideHover(false); return; }
+  const src = g.src;
+  let i;
+  if(src.dense) i = Math.min(src.n - 1, Math.max(0, Math.round(g.Xinv(px)) - 1));
+  else { i = 0; for(let k = 1; k < src.n; k++) if(Math.abs(g.X(src.x(k)) - px) < Math.abs(g.X(src.x(i)) - px)) i = k; }
+  const step = src.x(i), x = g.X(step);
   const [line, ...dots] = hov.children;
-  line.setAttribute("x1", x); line.setAttribute("x2", x);
-  panels.forEach((p, n) => {
-    const v = d[p.k], show = p.Y && Number.isFinite(v) && p.Y(v) >= p.y0 && p.Y(v) <= p.y1;
+  line.setAttribute("x1", x.toFixed(1)); line.setAttribute("x2", x.toFixed(1));
+  g.panels.forEach((p, n) => {
+    const v = src.v(p.k, i), y = Number.isFinite(v) ? p.Y(v) : NaN, show = y >= p.y0 && y <= p.y1;
     dots[n].setAttribute("display", show ? "inline" : "none");
-    if(show){ dots[n].setAttribute("cx", x); dots[n].setAttribute("cy", p.Y(v).toFixed(1)); }
+    if(show){ dots[n].setAttribute("cx", x.toFixed(1)); dots[n].setAttribute("cy", y.toFixed(1)); }
   });
   hov.setAttribute("display", "inline");
   const f = v => Number.isFinite(v) ? v.toFixed(4) : "—";
-  $("#chartRead").textContent = `step ${d.step.toLocaleString()} · Cd ${f(d.cd)} · Cl ${f(d.cl)}`;
+  tip.innerHTML = `<b>step ${step.toLocaleString()}</b>${step >= g.win ? ' <span class="w">averaged</span>' : ""}`
+    + `<br>C<sub>d</sub> ${f(src.v("cd", i))}<br>C<sub>l</sub> ${f(src.v("cl", i))}`;
+  tip.hidden = false;
+  const box = $("#chart").getBoundingClientRect(), sx = box.width / g.W;
+  const left = x * sx + 12, right = left + tip.offsetWidth > box.width;
+  tip.style.left = `${right ? x * sx - tip.offsetWidth - 12 : left}px`;
+  tip.style.top = `${Math.min(Math.max(py * sx - tip.offsetHeight / 2, 2), box.height - tip.offsetHeight - 2)}px`;
 }
-$("#chart").addEventListener("pointermove", chartHover);
-$("#chart").addEventListener("pointerleave", () => {
+function hideHover(forget = true){
   const hov = $("#chartHover"); if(hov) hov.setAttribute("display", "none");
-  chartHovering = false;
-  $("#chartRead").textContent = chartGeom ? CHART_NOTE : "";
+  $("#chartTip").hidden = true;
+  if(forget) hoverAt = null;
+}
+
+// --- wheel, drag, box zoom, double-click, keys
+const chartEl = $("#chart");
+chartEl.addEventListener("wheel", e => {
+  if(!chartGeom) return;
+  e.preventDefault();
+  const pt = chartPoint(e), f = Math.exp(Math.max(-3, Math.min(3, e.deltaY * (e.deltaMode ? 33 : 1) * 0.0015)));
+  if(e.shiftKey || pt.x < chartGeom.L){
+    const p = panelAt(pt.y);
+    zoomY(p, f, p.Yinv(pt.y));
+  } else {
+    zoomX(f, Math.min(Math.max(chartGeom.Xinv(pt.x), 0), chartGeom.end));
+  }
+  drawChart();
+}, {passive: false});
+chartEl.addEventListener("pointerdown", e => {
+  if(!chartGeom || e.button !== 0) return;
+  const pt = chartPoint(e), p = panelAt(pt.y);
+  chartEl.setPointerCapture(e.pointerId);
+  hideHover();
+  const boxMode = nav.tool === "box" || e.shiftKey;
+  drag = {start: pt, panel: p, box: boxMode, x: currentX(), y: [p.lo, p.hi], yLocked: pt.x >= chartGeom.L, moved: false};
 });
-new ResizeObserver(() => drawChart(lastHist, lastCoef)).observe($("#chart"));
+chartEl.addEventListener("pointermove", e => {
+  if(!chartGeom) return;
+  const pt = chartPoint(e);
+  if(!drag){ hoverAt = pt; showHover(pt.x, pt.y); return; }
+  const g = chartGeom, dx = pt.x - drag.start.x, dy = pt.y - drag.start.y;
+  if(Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
+  if(drag.box){
+    const r = $("#chartBox"), p = drag.panel;
+    const xa = Math.max(Math.min(drag.start.x, pt.x), g.L), xb = Math.min(Math.max(drag.start.x, pt.x), g.W - g.R);
+    const tall = Math.abs(dy) > 6;
+    const ya = tall ? Math.max(Math.min(drag.start.y, pt.y), p.y0) : p.y0, yb = tall ? Math.min(Math.max(drag.start.y, pt.y), p.y1) : p.y1;
+    r.setAttribute("x", xa); r.setAttribute("width", Math.max(xb - xa, 0));
+    r.setAttribute("y", ya); r.setAttribute("height", Math.max(yb - ya, 0));
+    r.setAttribute("display", "inline");
+    return;
+  }
+  // pan: time with horizontal movement, the panel's values once the drag
+  // has moved vertically by more than a jitter (or it started on the numbers)
+  const span = drag.x[1] - drag.x[0];
+  if(drag.start.x >= g.L) setX(drag.x[0] - dx * span / g.pw, drag.x[1] - dx * span / g.pw);
+  const slack = drag.yLocked ? 8 : 0;
+  if(Math.abs(dy) > slack){
+    const p = drag.panel, h = p.y1 - p.y0, dv = (dy - Math.sign(dy) * slack) * (drag.y[1] - drag.y[0]) / h;
+    nav.y[p.n] = [drag.y[0] + dv, drag.y[1] + dv];
+  }
+  drawChart();
+});
+chartEl.addEventListener("pointerup", e => {
+  if(!drag || !chartGeom) { drag = null; return; }
+  const g = chartGeom, pt = chartPoint(e);
+  if(drag.box && drag.moved){
+    const p = drag.panel, xa = Math.max(Math.min(drag.start.x, pt.x), g.L), xb = Math.min(Math.max(drag.start.x, pt.x), g.W - g.R);
+    if(xb - xa > 6) setX(g.Xinv(xa), g.Xinv(xb));
+    if(Math.abs(pt.y - drag.start.y) > 6){
+      const ya = Math.max(Math.min(drag.start.y, pt.y), p.y0), yb = Math.min(Math.max(drag.start.y, pt.y), p.y1);
+      nav.y[p.n] = [p.Yinv(yb), p.Yinv(ya)];
+    }
+  }
+  drag = null;
+  drawChart();
+});
+chartEl.addEventListener("pointerleave", () => { if(!drag) hideHover(); });
+chartEl.addEventListener("dblclick", fitChart);
+chartEl.addEventListener("keydown", e => {
+  if(!chartGeom) return;
+  const [a, b] = currentX(), step = (b - a) * 0.1;
+  const act = {"+": () => zoomX(0.8), "=": () => zoomX(0.8), "-": () => zoomX(1.25), "_": () => zoomX(1.25),
+               "ArrowLeft": () => setX(a - step, b - step), "ArrowRight": () => setX(a + step, b + step),
+               "0": () => { nav.x = null; nav.y = [null, null]; }, "Home": () => { nav.x = null; nav.y = [null, null]; }}[e.key];
+  if(act){ e.preventDefault(); act(); drawChart(); }
+});
+
+// --- the pane's toolbar
+function syncChartTools(){
+  const auto = !nav.x && !nav.y[0] && !nav.y[1], ready = !!chartGeom;
+  $("#cvFit").disabled = !ready || auto;
+  $("#cvOut").disabled = !ready || !nav.x;
+  $("#cvIn").disabled = !ready;
+  for(const [id, tool] of [["#cvPan", "pan"], ["#cvBox", "box"]]){
+    $(id).classList.toggle("on", nav.tool === tool); $(id).setAttribute("aria-pressed", nav.tool === tool);
+  }
+  $("#chart").classList.toggle("box", nav.tool === "box");
+}
+$("#cvPan").addEventListener("click", () => { nav.tool = "pan"; syncChartTools(); });
+$("#cvBox").addEventListener("click", () => { nav.tool = "box"; syncChartTools(); });
+$("#cvIn").addEventListener("click", () => { zoomX(0.7); drawChart(); });
+$("#cvOut").addEventListener("click", () => { zoomX(1 / 0.7); drawChart(); });
+$("#cvFit").addEventListener("click", fitChart);
+function maximizeChart(on){
+  const pane = $("#convPane");
+  on = on ?? !pane.classList.contains("max");
+  pane.classList.toggle("max", on);
+  $("#cvMax").classList.toggle("on", on); $("#cvMax").setAttribute("aria-pressed", on);
+  $("#cvMax").title = on ? "Restore the chart (Esc)" : "Enlarge the chart";
+}
+$("#cvMax").addEventListener("click", () => maximizeChart());
+document.addEventListener("keydown", e => { if(e.key === "Escape" && $("#convPane").classList.contains("max")) maximizeChart(false); });
+new ResizeObserver(() => drawChart()).observe($("#chart"));
 
 // ------------------------------------------------------------ 3D tunnel ----
 // Volume rendering, WebGL2.  Three views of the computed flow:
@@ -759,6 +1056,7 @@ const tunnel = (() => {
 
   let R = {}, A = {}, render = null, advect = null, fbo = null;
   let texVol, texSolid, texLut, texVel, dye = [null, null], dyeCur = 0, dyeShape = null, dyeFmt = null;
+  let texFrame = [null, null];
   let volShape = [1, 1, 1], hasSolid = false;
 
   if(gl){
@@ -767,7 +1065,8 @@ const tunnel = (() => {
       void main(){ vNdc = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }`;
     const RENDER_FS = `#version 300 es
       precision highp float; precision highp sampler3D;
-      uniform sampler3D uVol, uSolid, uVel, uDye, uDyePrev; uniform sampler2D uLut;
+      uniform sampler3D uVol, uSolid, uVel, uDye, uDyePrev, uFrameA, uFrameB; uniform sampler2D uLut;
+      uniform float uMix, uGainA, uGainB; uniform bool uReplay;
       uniform vec3 uEye, uRight, uUp, uFwd, uBox, uCell, uBgTop, uBgBottom, uLine;
       uniform float uTanHalf, uAspect, uDensity, uLo, uHi, uPixel, uFrac, uFrom;
       uniform bool uHasSolid, uHasVol, uSmoke;
@@ -836,7 +1135,8 @@ const tunnel = (() => {
                 acc.a += (1.0 - acc.a) * a;
               }
             } else {
-              float v = texture(uVol, tc).r;
+              float v = uReplay ? mix(texture(uFrameA, tc).r * uGainA, texture(uFrameB, tc).r * uGainB, uMix)
+                                : texture(uVol, tc).r;
               float w = smoothstep(uLo, uHi, v);
               if(w > 0.0){
                 float a = 1.0 - exp(-uDensity * w * dt);
@@ -895,7 +1195,7 @@ const tunnel = (() => {
     };
     [render, R] = program(RENDER_FS, ["uVol","uSolid","uVel","uDye","uLut","uEye","uRight","uUp","uFwd","uBox",
       "uCell","uBgTop","uBgBottom","uLine","uFrom","uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol","uSmoke",
-      "uDyePrev","uFrac"]);
+      "uDyePrev","uFrac","uFrameA","uFrameB","uMix","uGainA","uGainB","uReplay"]);
     [advect, A] = program(ADVECT_FS, ["uDye","uVel","uSolid","uNoise","uGrid","uBox","uZ","uStep","uVelScale",
       "uAdvanced","uSrcR","uRepeat","uSrcC","uFlat"]);
 
@@ -910,8 +1210,11 @@ const tunnel = (() => {
       for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texImage3D(gl.TEXTURE_3D, 0, internal, 1, 1, 1, 0, format, type, data); return t; };
-    // units: 0 volume, 1 solid, 2 colour scale, 3 velocity, 4 source noise, 5 dye now, 6 dye one step back
+    // units: 0 volume, 1 solid, 2 colour scale, 3 velocity, 4 source noise, 5 dye now, 6 dye one step
+    // back, 8 and 9 the two replay frames being crossfaded
     texVol = tex3(0, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
+    texFrame = [tex3(8, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1)),
+                tex3(9, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1))];
     texSolid = tex3(1, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
     texVel = tex3(3, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 0]));
     const texNoise = tex3(4, gl.R8, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
@@ -926,7 +1229,7 @@ const tunnel = (() => {
 
     gl.useProgram(render);
     gl.uniform1i(R.uVol, 0); gl.uniform1i(R.uSolid, 1); gl.uniform1i(R.uLut, 2); gl.uniform1i(R.uVel, 3);
-    gl.uniform1i(R.uDye, 5); gl.uniform1i(R.uDyePrev, 6);
+    gl.uniform1i(R.uDye, 5); gl.uniform1i(R.uDyePrev, 6); gl.uniform1i(R.uFrameA, 8); gl.uniform1i(R.uFrameB, 9);
     gl.uniform3f(R.uBgTop, 1, 1, 1); gl.uniform3f(R.uBgBottom, 0.914, 0.933, 0.961);   // #fff -> #e9eef5
     gl.uniform3f(R.uLine, 0.30, 0.38, 0.50);
     gl.useProgram(advect);
@@ -1070,6 +1373,11 @@ const tunnel = (() => {
       pace(); request();
     }
     lastFrame = moving ? now : 0;
+    if(replaying() && replay.mode === "play"){
+      replay.pos += Math.min(Math.max((now - (replay.t || now)) / 1000, 0), 0.1) * REPLAY_FPS;
+      if(replay.pos >= replay.frames.length - 1 + REPLAY_HOLD) replay.pos = 0;
+      replay.t = now; syncReplay(); request();
+    } else replay.t = 0;
     paint();
   }
   // Render the current state without advancing it (also used by snapshot()).
@@ -1097,6 +1405,15 @@ const tunnel = (() => {
     gl.uniform1f(R.uLo, q.lo || 0); gl.uniform1f(R.uHi, q.hi || 1); gl.uniform1f(R.uFrom, q.from);
     gl.uniform1i(R.uHasSolid, hasSolid ? 1 : 0); gl.uniform1i(R.uHasVol, fld ? 1 : 0);
     gl.uniform1i(R.uSmoke, qty === "smoke" && dyeShape ? 1 : 0);
+    const show = replaying();
+    gl.uniform1i(R.uReplay, show ? 1 : 0);
+    if(show){
+      const n = replay.frames.length, a = Math.min(Math.floor(replay.pos), n - 1), b = Math.min(a + 1, n - 1);
+      const ref = replay.frames[n - 1].scale, gain = i => qty === "vorticity" ? replay.frames[i].scale / ref : 1;
+      loadFrame(0, a); loadFrame(1, b);
+      gl.uniform1f(R.uMix, a < n - 1 ? replay.pos - a : 0);
+      gl.uniform1f(R.uGainA, gain(a)); gl.uniform1f(R.uGainB, gain(b));
+    }
     gl.uniform1f(R.uFrac, dyeShape && fld ? Math.min(simAcc / stepSeconds(), 1) : 1);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
@@ -1166,14 +1483,75 @@ const tunnel = (() => {
     for(const b of document.querySelectorAll("#qtySeg [data-q]")){
       b.classList.toggle("on", b.dataset.q === qty); b.setAttribute("aria-selected", b.dataset.q === qty);
     }
-    $("#animBtn").disabled = $("#restartBtn").disabled = !gl || qty !== "smoke";
-    legend(); request();
+    replay.loaded = [-1, -1];
+    syncReplay(); legend(); request();
   }
   function reset(){
     geom = null; fld = null; hasSolid = false; full = [1, 1, 1]; dyeShape = null; simT = 0;
+    Object.assign(replay, {frames: [], mode: "live", pos: 0, last: -1, loaded: [-1, -1], shape: null});
+    syncReplay();
     if(gl){ upload(0, texVol, new Uint8Array(1), [1, 1, 1]); upload(1, texSolid, new Uint8Array(1), [1, 1, 1]); }
     $("#tunnelEmpty").hidden = false; request();
   }
+  // Replay: a run's wake and vorticity as a time-lapse, one frame a chunk
+  // (/api/frames).  While the run is going the view is live, the latest field
+  // as it arrives; once it is done the replay loops, crossfading between
+  // frames and holding the last for a moment before starting over.  Each
+  // vorticity frame was scaled to its own 99.5th percentile, so it is
+  // weighted by its scale over the latest one's, which is the colour bar's.
+  const REPLAY_FPS = 8, REPLAY_HOLD = 8, REPLAY_BYTES_MAX = 160 * 2 ** 20;
+  const replay = {frames: [], mode: "live", pos: 0, t: 0, last: -1, loaded: [-1, -1], shape: null};
+  const replaying = () => gl && qty !== "smoke" && replay.frames.length >= 2 && replay.mode !== "live";
+  function loadFrame(slot, i){
+    const key = i * 2 + (qty === "vorticity" ? 1 : 0);
+    if(replay.loaded[slot] === key) return;
+    upload(8 + slot, texFrame[slot], replay.frames[i][qty], replay.shape);
+    replay.loaded[slot] = key;
+  }
+  function addFrames(d){
+    const {steps, scales, shape} = d.header, V = shape[0] * shape[1] * shape[2];
+    if(replay.shape && replay.shape.join() !== shape.join()){ replay.frames = []; replay.last = -1; }
+    replay.shape = shape;
+    steps.forEach((step, k) => {
+      if(step <= replay.last) return;
+      replay.frames.push({step, scale: scales[k] || 1,
+                          wake: d.wake.slice(k * V, (k + 1) * V), vorticity: d.vorticity.slice(k * V, (k + 1) * V)});
+      replay.last = step;
+    });
+    while(replay.frames.length * 2 * V > REPLAY_BYTES_MAX && replay.frames.length > 2)
+      replay.frames = replay.frames.filter((_, i, a) => i % 2 === 0 || i === a.length - 1);
+    replay.loaded = [-1, -1];
+    syncReplay(); request();
+  }
+  // the run is done: start the replay (unless someone is already scrubbing it)
+  function runDone(){ if(replay.mode === "live" && replay.frames.length >= 2){ replay.mode = "play"; replay.pos = 0; } syncReplay(); request(); }
+  function replayControl(action){
+    if(action === "toggle") replay.mode = replay.mode === "play" ? "pause" : "play";
+    if(action === "rewind"){ replay.pos = 0; replay.mode = "play"; }
+    syncReplay(); request();
+  }
+  // the scrubber, its step label, and what Pause/Play and Restart do here
+  function syncReplay(){
+    const n = replay.frames.length, on = gl && qty !== "smoke" && n >= 2;
+    $("#replayBox").hidden = !on;
+    if(on){
+      const i = replay.mode === "live" ? n - 1 : Math.min(Math.round(replay.pos), n - 1);
+      const r = $("#replayPos");
+      r.max = n - 1;
+      if(document.activeElement !== r) r.value = replay.mode === "live" ? n - 1 : Math.min(replay.pos, n - 1);
+      $("#replayStep").textContent = replay.mode === "live"
+        ? `live · step ${replay.frames[n - 1].step.toLocaleString()}`
+        : `step ${replay.frames[i].step.toLocaleString()} of ${replay.frames[n - 1].step.toLocaleString()}`;
+    }
+    const smoke = qty === "smoke", playing = smoke ? running : replay.mode === "play";
+    $("#animBtn").disabled = !gl || (!smoke && n < 2);
+    $("#restartBtn").disabled = !gl || (!smoke && n < 2);
+    $("#animBtn").classList.toggle("paused", !playing);
+    $("#animLbl").textContent = playing ? "Pause" : "Play";
+    $("#animBtn").title = smoke ? "Freeze or resume the smoke" : "Play or pause the replay of the run";
+    $("#restartBtn").title = smoke ? "Clear the smoke and let it in again from the inlet" : "Replay the run from the start";
+  }
+
   // Camera presets.  The flow runs along +x; "front" looks downstream at the
   // body's upstream face, "side" and "top" show the flow left to right.
   function setView(name){
@@ -1210,17 +1588,21 @@ const tunnel = (() => {
   $("#zoomInBtn").addEventListener("click", () => zoomBy(1.25));
   $("#zoomOutBtn").addEventListener("click", () => zoomBy(0.8));
   $("#resetBtn").addEventListener("click", () => { view.zoom = 1; request(); });
-  $("#restartBtn").addEventListener("click", restartSmoke);
+  $("#restartBtn").addEventListener("click", () => qty === "smoke" ? restartSmoke() : replayControl("rewind"));
   $("#animBtn").addEventListener("click", () => {
-    running = !running; $("#animBtn").classList.toggle("paused", !running);
-    $("#animLbl").textContent = running ? "Pause" : "Play"; request();
+    if(qty === "smoke"){ running = !running; syncReplay(); request(); }
+    else replayControl("toggle");
+  });
+  $("#replayPos").addEventListener("input", e => {
+    replay.mode = "pause"; replay.pos = +e.target.value; syncReplay(); request();
   });
   if(!gl){
     $("#viewHint").textContent = "mid-plane slice · the 3D view needs WebGL2";
     for(const b of document.querySelectorAll("#animBtn, #restartBtn, [data-view], #zoomInBtn, #zoomOutBtn, #resetBtn")) b.disabled = true;
   }
-  legend();
-  return {setGeometry, setField, reset, setQuantity, snapshot, quantity: () => qty};
+  legend(); syncReplay();
+  return {setGeometry, setField, reset, setQuantity, snapshot, addFrames, runDone,
+          quantity: () => qty, replayLast: () => replay.last};
 })();
 
 boot();

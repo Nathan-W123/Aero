@@ -357,3 +357,99 @@ def test_smoothed_outline_keeps_a_straight_wall_in_place():
     s = web._smoothed(solid)
     # the 0.5 level of a blurred half-plane sits on the original boundary
     assert np.all(s[:, 3] > 0.5) and np.all(s[:, 4] < 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Pre-run checks and the per-step series
+# ---------------------------------------------------------------------------
+
+def test_preflight_reports_blockage_before_anything_runs():
+    out = web._preflight({"mode": "3d", "shape": "sphere", "radius": "7", "nx": "96",
+                          "ny": "48", "nz": "48", "re": "100", "u0": "0.05"})
+    assert out["error"] is None
+    checks = out["uncertainty"]
+    assert {"stability", "blockage", "domain_length", "discretization"} <= set(checks)
+    assert "29%" in checks["blockage"]["short"]
+    assert out["reference"]["expected"] > out["reference"]["unconfined"]     # confinement
+    assert out["setup"]["cells"] == 96 * 48 * 48
+    json.dumps(out)
+
+
+def test_preflight_says_why_a_case_would_be_refused():
+    out = web._preflight({"mode": "2d", "shape": "cylinder", "radius": "120", "ny": "200"})
+    assert out["error"] == "The body is taller than the domain."
+    assert out["uncertainty"]["stability"]["status"] == "fail"
+
+
+def test_a_3d_body_larger_than_the_tunnel_is_refused():
+    out = web._preflight({"mode": "3d", "shape": "sphere", "radius": "30", "ny": "48", "nz": "48"})
+    assert out["error"] == "The body is larger than the tunnel's cross-section."
+    with pytest.raises(ValueError):
+        web._build_solver({"mode": "3d", "shape": "sphere", "radius": 30, "ny": 48, "nz": 48})
+
+
+def test_preflight_survives_a_half_typed_form():
+    out = web._preflight({"mode": "2d", "shape": "cylinder", "radius": "", "nx": "1e", "re": "100"})
+    assert out["error"] is None
+    assert all(c["status"] in {"pass", "warn", "fail"} for c in out["uncertainty"].values())
+    assert "budget" not in out["uncertainty"]
+
+
+def test_preflight_warns_close_to_omega_two():
+    out = web._preflight({"mode": "3d", "shape": "sphere", "radius": "3", "nx": "96",
+                          "ny": "48", "nz": "48", "re": "100", "u0": "0.05"})
+    stab = out["uncertainty"]["stability"]
+    assert stab["status"] == "warn" and "1.965" in stab["short"]
+
+
+def test_series_payload_serves_every_step_incrementally():
+    job = web.Job(id="t_series", params={"mode": "2d", "shape": "cylinder", "radius": 6, "re": 20,
+                                         "u0": 0.05, "nx": 80, "ny": 40, "steps": 150,
+                                         "backend": "numpy"})
+    web._run_job(job)
+    assert job.state == "done"
+    header, parts = _unpack(web._series_payload(job, 0))
+    assert header["from"] == 0 and header["total"] == 150
+    assert parts["cd"].size == parts["cl"].size == 150
+    assert np.isfinite(parts["cd"]).all()
+    header, parts = _unpack(web._series_payload(job, 140))
+    assert header["from"] == 140 and parts["cd"].size == 10
+    header, parts = _unpack(web._series_payload(job, 10 ** 6))      # past the end: nothing
+    assert parts["cd"].size == 0
+
+
+# ---------------------------------------------------------------------------
+# Replay frames
+# ---------------------------------------------------------------------------
+
+def _small_job(job_id, steps=300):
+    return web.Job(id=job_id, params={"mode": "2d", "shape": "cylinder", "radius": 6, "re": 20,
+                                      "u0": 0.05, "nx": 80, "ny": 40, "steps": steps,
+                                      "backend": "numpy"})
+
+
+def test_replay_frames_are_recorded_and_served_after_a_step():
+    job = _small_job("t_frames")
+    web._run_job(job)
+    steps = [fr[0] for fr in job.frames]
+    assert steps[0] == 0 and steps[-1] == 300 and steps == sorted(set(steps))
+    header, parts = _unpack(web._frames_payload(job, -1))
+    voxels = int(np.prod(header["shape"]))
+    assert header["steps"] == steps
+    assert parts["wake"].size == parts["vorticity"].size == len(steps) * voxels
+    assert parts["wake"][voxels:].max() > 0                   # the wake grows after step 0
+    header, parts = _unpack(web._frames_payload(job, steps[-2]))
+    assert header["steps"] == [steps[-1]] and parts["wake"].size == voxels
+    assert web.Job(id="x", params={}).public()["frame_step"] == -1
+    assert job.public()["frame_step"] == 300
+
+
+def test_replay_frames_stay_inside_their_budget(monkeypatch):
+    job = _small_job("t_budget", steps=600)
+    voxels = 80 * 40
+    monkeypatch.setattr(web, "REPLAY_BYTES_MAX", 5 * 2 * voxels)     # five frames' worth
+    web._run_job(job)
+    steps = [fr[0] for fr in job.frames]
+    assert sum(w.nbytes + v.nbytes for _, _, w, v in job.frames) <= 6 * 2 * voxels
+    assert steps[0] == 0 and steps[-1] == 600                  # the ends are kept
+    assert steps == sorted(steps)
