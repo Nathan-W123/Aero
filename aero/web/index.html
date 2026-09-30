@@ -70,7 +70,7 @@ h1,h2{margin:0;font-size:inherit}
 .left .case{flex:1 1 0}
 .center .view{flex:1 1 0}
 .center .res{flex:none;height:170px}
-.resbody{display:grid;grid-template-columns:minmax(240px,.8fr) minmax(0,1.7fr);align-content:start}
+.resbody{display:grid;grid-template-columns:minmax(250px,340px) minmax(0,1fr);align-content:start}
 .resbody .err{grid-column:1/-1}
 #stats{border-right:1px solid var(--edge-soft);align-self:stretch}
 #checks{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));align-content:start}
@@ -101,7 +101,7 @@ h1,h2{margin:0;font-size:inherit}
 .crow{display:flex;align-items:flex-start;gap:6px;padding:2px 6px 2px 16px;border-bottom:1px solid var(--edge-soft);cursor:help}
 .crow svg{flex:none;width:14px;height:14px;margin-top:1px}
 .crow.ref{font-weight:600}
-.pempty{padding:9px 10px;color:var(--faint)}
+.pcat .note{font-weight:400;color:var(--faint)}
 .err{margin:6px;padding:6px 8px;background:#fdecea;border:1px solid #e3aaa3;color:var(--err)}
 
 /* ---- viewport ---- */
@@ -350,7 +350,7 @@ figure .empty{color:var(--faint)}
       <h2 class="phead" id="resHead">Results</h2>
       <div class="pbody resbody">
         <div id="errBox" hidden class="err"></div>
-        <div class="pg" id="stats"><div class="pempty">No results yet — set up a case and press Run.</div></div>
+        <div class="pg" id="stats"></div>
         <div class="pg" id="checks" hidden></div>
       </div>
     </section>
@@ -477,7 +477,7 @@ async function boot(){
 }
 $("#runBtn").addEventListener("click", async () => {
   $("#errBox").hidden = true;
-  $("#stats").innerHTML = '<div class="pempty">Waiting for the first samples…</div>';
+  renderStats(null, "starting…");
   for(const k of ["speed","vorticity","pressure"]) $("#fig_"+k).innerHTML = '<span class="empty">rendering…</span>';
   formSynced = true;
   const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(params())});
@@ -563,15 +563,8 @@ async function tick(){
 
   await pullSeries(jobId);
   drawChart(j.history, j.result.coefficients || null);
-  const c = j.result.coefficients;
-  const f4 = v => (v === null || v === undefined) ? "—" : v.toFixed(4);
-  // (the label's text sits in its own span: a flex item trims the space after <sub>)
-  const row = (k, v, tip) => `<div class="prow"${tip ? ` title="${esc(tip)}"` : ""}><span class="pl"><span>${k}</span></span><span class="pv num">${v}</span></div>`;
-  if(c) $("#stats").innerHTML = '<div class="pcat">Coefficients · mean ± 95%</div>'
-    + row("C<sub>d</sub>", `${f4(c.cd)}<small>± ${f4(c.cd_sem95)}</small>`,
-          `± is the 95% statistical uncertainty of the mean, from ${c.cd_n_eff ?? "?"} effective independent samples. It does not include systematic errors such as blockage or resolution — see the checks below.`)
-    + row("C<sub>d</sub> fluctuation σ", f4(c.cd_std), "Standard deviation of the per-step drag signal: how much it fluctuates, not how uncertain the mean is.")
-    + row("C<sub>l</sub>", `${f4(c.cl)}<small>± ${f4(c.cl_sem95)}</small>`);
+  renderStats(j.result.coefficients, {running: "averaged when the run ends", queued: "starting…",
+    error: "none: the run failed"}[j.state] || "none");
 
   // the run's own checks once it has them; until then the pre-run ones stand
   if(j.result.uncertainty || j.result.reference) renderChecks(j.result, "Checks");
@@ -602,6 +595,21 @@ async function tick(){
     $("#runBtn").disabled = false; $("#stopBtn").disabled = true;
   }
 }
+
+// The coefficients block keeps its rows at all times -- "—" until there are
+// values, the header saying why -- so the strip does not change shape.
+function renderStats(c, note){
+  const f4 = v => (v === null || v === undefined) ? "—" : v.toFixed(4);
+  const pm = (v, e) => c ? `${f4(v)}<small>± ${f4(e)}</small>` : "—";
+  // (the label's text sits in its own span: a flex item trims the space after <sub>)
+  const row = (k, v, tip) => `<div class="prow"${tip ? ` title="${esc(tip)}"` : ""}><span class="pl"><span>${k}</span></span><span class="pv num">${v}</span></div>`;
+  $("#stats").innerHTML = `<div class="pcat">Coefficients · ${c ? "mean ± 95%" : `<span class="note">${note}</span>`}</div>`
+    + row("C<sub>d</sub>", pm(c && c.cd, c && c.cd_sem95), c &&
+          `± is the 95% statistical uncertainty of the mean, from ${c.cd_n_eff ?? "?"} effective independent samples. It does not include systematic errors such as blockage or resolution — see the checks.`)
+    + row("C<sub>d</sub> fluctuation σ", c ? f4(c.cd_std) : "—", c && "Standard deviation of the per-step drag signal: how much it fluctuates, not how uncertain the mean is.")
+    + row("C<sub>l</sub>", pm(c && c.cl, c && c.cl_sem95));
+}
+renderStats(null, "no run yet");
 
 // -------------------------------------------------------------- checks ----
 // The uncertainty budget: a statistical ± can never cover a systematic bias,
