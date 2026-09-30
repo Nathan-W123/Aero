@@ -102,6 +102,17 @@ h1,h2{margin:0;font-size:inherit}
 .crow svg{flex:none;width:14px;height:14px;margin-top:1px}
 .crow.ref{font-weight:600}
 .pcat .note{font-weight:400;color:var(--faint)}
+.pv .pick{flex:none;height:18px;margin:0 5px;padding:0 9px;border:1px solid var(--edge);border-radius:2px;
+  background:linear-gradient(#fdfeff,#e8eef6);font-size:11.5px;line-height:1}
+.pv .pick:hover{border-color:var(--hover-edge);background:linear-gradient(#f4f9fe,#dcebfb)}
+.pv .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink2);font-size:11.5px;padding-right:6px}
+.pv .fname.err{color:var(--err)}
+.dropzone{position:fixed;inset:0;z-index:60;display:grid;place-items:center;pointer-events:none;
+  background:rgba(58,120,201,.12);border:3px dashed var(--sel)}
+.dropzone div{background:#fff;border:1px solid var(--edge);padding:14px 22px;font-size:14px;color:var(--title);
+  box-shadow:0 6px 20px rgba(20,40,70,.2)}
+.viewer .badge{position:absolute;left:10px;top:8px;padding:2px 8px;font-size:11.5px;color:var(--ink2);
+  background:rgba(255,255,255,.88);border:1px solid var(--edge);pointer-events:none}
 .err{margin:6px;padding:6px 8px;background:#fdecea;border:1px solid #e3aaa3;color:var(--err)}
 
 /* ---- viewport ---- */
@@ -335,6 +346,7 @@ figure .empty{color:var(--faint)}
       <div class="viewer">
         <canvas id="tunnel"></canvas>
         <div class="empty" id="tunnelEmpty">The flow appears once a run starts</div>
+        <div class="badge" id="viewBadge" hidden>Preview · not run yet</div>
       </div>
       <div class="cmap">
         <span class="cm-name" id="lgName">smoke · |u − U∞|</span>
@@ -384,6 +396,9 @@ figure .empty{color:var(--faint)}
   </div>
 </div>
 
+<input type="file" id="stlFile" accept=".stl,.STL" hidden>
+<div class="dropzone" id="dropZone" hidden><div>Drop the STL file to use it as the body</div></div>
+
 <footer class="statusbar">
   <span class="sb"><span class="dot" id="dot"></span><span class="t" id="statusText">Ready</span></span>
   <span class="sb"><span class="bar" role="progressbar" aria-label="Run progress"><i id="bar"></i></span><span class="mono" id="pct">0%</span></span>
@@ -415,7 +430,76 @@ const DESC = {
   nx: "Tunnel length, streamwise, in cells. The body sits a third of the way along; the wake needs room behind it.",
   ny: "Tunnel height, in cells. The body's share of it (blockage) raises Cd: the checks under Results say by how much.",
   nz: "Tunnel width, spanwise, in cells.",
+  mesh_file: "An STL file, ASCII or binary, as any CAD program exports it; it should be a closed surface. You can also drop the file anywhere on the page.",
+  mesh_info: "The uploaded surface: its triangles, and whether it is closed (every edge shared by two triangles). An open surface has no well-defined inside, so its cells may be missing or extra.",
+  mesh_size: "The part's largest cross-stream extent, in cells: its reference length D, as a sphere's diameter is. Parts thinner than a cell at this size fall between the cell centres and disappear — the preview shows what the solver will see.",
+  mesh_orient: "auto turns the part onto its principal axes: the longest across the tunnel's height (y), the thinnest across its width (z). 'as in the file' keeps the STL's axes, x downstream.",
+  mesh_rot_x: "Extra rotation about the flow direction (x), in degrees, after orienting. 90° lays a part that auto stood on end (an aircraft's wings) across the tunnel.",
+  mesh_rot_y: "Extra rotation about the vertical (y), in degrees: yaw.",
+  mesh_rot_z: "Extra rotation about the spanwise axis (z), in degrees: pitch, or angle of attack.",
 };
+// The uploaded STL: {id, name, triangles, open_edges}, kept across re-renders of the rows.
+let currentMesh = null;
+function meshRows(host){
+  const m = currentMesh, prow = (id, label, value) =>
+    `<div class="prow" data-desc="${esc(DESC[id] || "")}"><label for="${id}">${label}</label><div class="pv">${value}</div></div>`;
+  const num = (id, label, val, unit, step) => prow(id, label,
+    `<input id="${id}" type="number" value="${val}" step="${step}"><span class="u">${unit}</span>`);
+  host.innerHTML =
+      `<div class="prow" data-desc="${esc(DESC.mesh_file)}"><label for="stlPick">STL file</label><div class="pv">`
+    + `<button type="button" class="pick" id="stlPick">Choose…</button><span class="fname" id="stlName"></span>`
+    + `<input type="hidden" id="mesh_id" value="${m ? m.id : ""}"></div></div>`
+    + `<div class="prow" data-desc="${esc(DESC.mesh_info)}"><span class="pl"><span>Surface</span></span>`
+    + `<span class="pv num" id="stlInfo"></span></div>`
+    + num("mesh_size", "Size", 16, "cells", 1)
+    + prow("mesh_orient", "Orientation", `<select id="mesh_orient"><option value="auto">auto (principal axes)</option><option value="none">as in the file</option></select>`)
+    + num("mesh_rot_x", "Rotate about x", 0, "°", 15) + num("mesh_rot_y", "Rotate about y", 0, "°", 15)
+    + num("mesh_rot_z", "Rotate about z", 0, "°", 15);
+  $("#stlPick").addEventListener("click", () => $("#stlFile").click());
+  showMeshName();
+}
+function showMeshName(text, error){
+  const el = $("#stlName"); if(!el) return;
+  const m = currentMesh;
+  el.textContent = text || (m ? m.name : "none chosen");
+  el.title = el.textContent; el.classList.toggle("err", !!error);
+  $("#stlInfo").textContent = m && !text ? `${m.triangles.toLocaleString()} triangles · `
+    + (m.open_edges ? `not closed (${m.open_edges.toLocaleString()} open edges)` : "closed") : "—";
+}
+async function uploadStl(file){
+  if($("#mode").value !== "3d"){ $("#mode").value = "3d"; syncShape(); }
+  if($("#shape").value !== "mesh"){ $("#shape").value = "mesh"; syncDims(); }
+  if(!/\.stl$/i.test(file.name)){ showMeshName(`${file.name}: not an .stl file`, true); return; }
+  showMeshName(`uploading ${file.name}…`);
+  let r, info;
+  try {
+    r = await fetch("/api/mesh", {method: "POST", headers: {"X-Filename": encodeURIComponent(file.name)}, body: file});
+    info = await r.json();
+  } catch(e){ showMeshName(`upload failed: ${e.message}`, true); return; }
+  if(!r.ok){ showMeshName(info.error || "upload failed", true); return; }
+  currentMesh = info;
+  $("#mesh_id").value = info.id;
+  showMeshName();
+  preflightSoon(); previewSoon();
+}
+async function loadMeshInfo(id){
+  const r = await fetch(`/api/mesh?id=${encodeURIComponent(id)}`);
+  if(r.ok){ currentMesh = await r.json(); showMeshName(); }
+  else showMeshName("the server no longer has this mesh: choose the file again", true);
+}
+$("#stlFile").addEventListener("change", e => { const f = e.target.files[0]; if(f) uploadStl(f); e.target.value = ""; });
+// Drop an STL anywhere on the page.
+let dragDepth = 0;
+const draggingFiles = e => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes("Files");
+window.addEventListener("dragenter", e => { if(!draggingFiles(e)) return; e.preventDefault(); dragDepth++; $("#dropZone").hidden = false; });
+window.addEventListener("dragover", e => { if(draggingFiles(e)) e.preventDefault(); });
+window.addEventListener("dragleave", e => { if(draggingFiles(e) && --dragDepth <= 0){ dragDepth = 0; $("#dropZone").hidden = true; } });
+window.addEventListener("drop", e => {
+  if(!draggingFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; $("#dropZone").hidden = true;
+  const files = [...e.dataTransfer.files], f = files.find(x => /\.stl$/i.test(x.name)) || files[0];
+  if(f) uploadStl(f);
+});
 function fill(sel, items){ sel.innerHTML = items.map(v=>`<option value="${v}">${v}</option>`).join(""); }
 function inputs(host, defs){
   host.innerHTML = defs.map(([id,lab,val]) =>
@@ -450,7 +534,10 @@ function syncShape(){
   describe(described);
   syncDims();
 }
-function syncDims(){ inputs($("#dimRow"), DIMS[$("#mode").value + ":" + $("#shape").value] || []); }
+function syncDims(){
+  const key = $("#mode").value + ":" + $("#shape").value;
+  if(key === "3d:mesh") meshRows($("#dimRow")); else inputs($("#dimRow"), DIMS[key] || []);
+}
 function params(){
   const p = {};
   // the case is the property grid, nothing else on the page (the replay slider is an input too)
@@ -474,6 +561,7 @@ async function boot(){
   preflight();
   const fromUrl = location.hash.replace(/^#/, "").trim();
   if(/^[a-f0-9]{6,32}$/.test(fromUrl) && (await fetch(`/api/status?id=${fromUrl}`)).ok) attach(fromUrl);
+  else preview();
 }
 $("#runBtn").addEventListener("click", async () => {
   $("#errBox").hidden = true;
@@ -516,8 +604,8 @@ $("#saveJsonBtn").addEventListener("click", () => {
 });
 
 // ------------------------------------------------------------- polling ----
-async function fetchPacked(url){
-  const r = await fetch(url); if(!r.ok) return null;
+async function fetchPacked(url, init){
+  const r = await fetch(url, init); if(!r.ok) return null;
   const buf = await r.arrayBuffer(), bytes = new Uint8Array(buf);
   const nl = bytes.indexOf(10);
   const header = JSON.parse(new TextDecoder().decode(bytes.subarray(0, nl)));
@@ -550,6 +638,7 @@ async function tick(){
       if(!el || k === "mode" || k === "shape") continue;
       if(el.type === "checkbox") el.checked = !!v; else el.value = v;
     }
+    if(j.params.shape === "mesh" && j.params.mesh_id) loadMeshInfo(j.params.mesh_id);
     preflight();                                   // for the run's settings, not the defaults
   }
   const s = j.result.setup;
@@ -616,7 +705,7 @@ renderStats(null, "no run yet");
 // so each systematic effect gets its own row, and the expected value for the
 // run *as configured* (confinement included) sits first.  Status is carried
 // by the icon's shape as well as its colour.
-const CHECK_ORDER = ["statistical", "blockage", "domain_length", "discretization", "stability",
+const CHECK_ORDER = ["mesh", "statistical", "blockage", "domain_length", "discretization", "stability",
                      "bc_sensitivity", "convergence", "budget"];
 const STATUS_ICON = {
   pass: '<svg viewBox="0 0 14 14" aria-label="pass"><circle cx="7" cy="7" r="6.5" fill="#2c8a3c"/><path d="M4 7.3l2 2 4-4.5" fill="none" stroke="#fff" stroke-width="1.6"/></svg>',
@@ -658,6 +747,21 @@ async function preflight(){
   if(seq === preflightSeq) renderChecks(res, "Pre-run checks · current settings");
 }
 function preflightSoon(){ clearTimeout(preflightTimer); preflightTimer = setTimeout(preflight, 300); }
+// The body in the tunnel as configured, drawn before anything runs, whenever
+// an edit changes the geometry (and no run is going).
+const GEOMETRY_KEYS = new Set(["mode", "shape", "radius", "width", "height", "depth", "length", "nx", "ny", "nz",
+                               "mesh_id", "mesh_size", "mesh_orient", "mesh_rot_x", "mesh_rot_y", "mesh_rot_z"]);
+let previewTimer = null, previewSeq = 0;
+function previewSoon(){ clearTimeout(previewTimer); previewTimer = setTimeout(preview, 350); }
+async function preview(){
+  if(poll) return;                                   // a run is going: its view stays
+  const seq = ++previewSeq;
+  const g = await fetchPacked("/api/preview", {method: "POST", headers: {"Content-Type": "application/json"},
+                                               body: JSON.stringify(params())});
+  if(seq === previewSeq && !poll) tunnel.showPreview(g);
+}
+for(const kind of ["input", "change"])
+  $("#props").addEventListener(kind, e => { if(GEOMETRY_KEYS.has(e.target.id)) previewSoon(); });
 $("#props").addEventListener("input", preflightSoon);
 $("#props").addEventListener("change", preflightSoon);
 
@@ -1494,7 +1598,16 @@ const tunnel = (() => {
     replay.loaded = [-1, -1];
     syncReplay(); legend(); request();
   }
+  // The case as configured, before it runs: the body in its tunnel.
+  function showPreview(g){
+    reset();
+    if(!g){ $("#tunnelEmpty").textContent = "This case can't be built as set — see the checks"; return; }
+    setGeometry(g);
+    $("#viewBadge").hidden = false;
+  }
   function reset(){
+    $("#viewBadge").hidden = true;
+    $("#tunnelEmpty").textContent = "The flow appears once a run starts";
     geom = null; fld = null; hasSolid = false; full = [1, 1, 1]; dyeShape = null; simT = 0;
     Object.assign(replay, {frames: [], mode: "live", pos: 0, last: -1, loaded: [-1, -1], shape: null});
     syncReplay();
@@ -1609,7 +1722,7 @@ const tunnel = (() => {
     for(const b of document.querySelectorAll("#animBtn, #restartBtn, [data-view], #zoomInBtn, #zoomOutBtn, #resetBtn")) b.disabled = true;
   }
   legend(); syncReplay();
-  return {setGeometry, setField, reset, setQuantity, snapshot, addFrames, runDone,
+  return {setGeometry, setField, reset, setQuantity, snapshot, addFrames, runDone, showPreview,
           quantity: () => qty, replayLast: () => replay.last};
 })();
 

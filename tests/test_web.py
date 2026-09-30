@@ -70,8 +70,13 @@ def test_every_offered_2d_shape_builds(shape):
 
 @pytest.mark.parametrize("shape", web.SHAPES_3D)
 def test_every_offered_3d_shape_builds(shape):
+    extra = {}
+    if shape == "mesh":                   # needs an upload to build from
+        from pathlib import Path
+        stl = Path(__file__).resolve().parents[1] / "samples" / "stl" / "unit_sphere.stl"
+        extra = {"mesh_id": web._store_mesh("unit_sphere.stl", stl.read_bytes())["id"], "mesh_size": 8}
     web._build_solver({"mode": "3d", "shape": shape, "re": 20, "u0": 0.05,
-                       "nx": 40, "ny": 24, "nz": 24, "backend": "numpy"})
+                       "nx": 40, "ny": 24, "nz": 24, "backend": "numpy", **extra})
 
 
 # ---------------------------------------------------------------------------
@@ -453,3 +458,105 @@ def test_replay_frames_stay_inside_their_budget(monkeypatch):
     assert sum(w.nbytes + v.nbytes for _, _, w, v in job.frames) <= 6 * 2 * voxels
     assert steps[0] == 0 and steps[-1] == 600                  # the ends are kept
     assert steps == sorted(steps)
+
+
+# ---------------------------------------------------------------------------
+# STL uploads
+# ---------------------------------------------------------------------------
+
+SAMPLES = __import__("pathlib").Path(__file__).resolve().parents[1] / "samples" / "stl"
+
+
+def _upload(name="unit_sphere.stl"):
+    return web._store_mesh(name, (SAMPLES / name).read_bytes())
+
+
+def _mesh_params(mesh_id, **kw):
+    p = {"mode": "3d", "shape": "mesh", "mesh_id": mesh_id, "mesh_size": "10", "nx": "48",
+         "ny": "24", "nz": "24", "re": "20", "u0": "0.05", "backend": "numpy"}
+    p.update(kw)
+    return p
+
+
+def test_an_uploaded_stl_is_parsed_and_described():
+    info = _upload()
+    assert info["triangles"] == 1280 and info["open_edges"] == 0
+    assert info["extent"] == pytest.approx([2.0, 2.0, 2.0], rel=1e-3)
+    assert web._mesh_info(info["id"])["name"] == "unit_sphere.stl"
+    assert "tris" not in web._mesh_info(info["id"])
+
+
+def test_an_open_mesh_is_flagged():
+    from aero.geometry3d.stl_io import parse_stl
+    tris = parse_stl((SAMPLES / "unit_cube.stl").read_bytes())[:-1]         # one face short
+    assert web._open_edges(tris) == 3
+
+
+@pytest.mark.parametrize("data, why", [(b"not an stl at all", "readable"),
+                                       (b"solid x\nendsolid x\n", "readable")])
+def test_a_bad_upload_says_why(data, why):
+    with pytest.raises(ValueError, match=why):
+        web._store_mesh("bad.stl", data)
+
+
+def test_only_the_newest_meshes_are_kept():
+    ids = [_upload()["id"] for _ in range(web.MESHES_KEPT + 2)]
+    assert ids[0] not in web.MESHES and ids[-1] in web.MESHES
+
+
+def test_a_mesh_case_uses_its_size_as_the_reference_length():
+    info = _upload()
+    case = web._case(_mesh_params(info["id"], mesh_size="12"))
+    assert case["D"] == 12.0 and case["label"] == "mesh unit_sphere.stl"
+    with pytest.raises(ValueError, match="Choose an STL"):
+        web._case(_mesh_params("nope"))
+    with pytest.raises(ValueError, match="cross-section"):
+        web._case(_mesh_params(info["id"], mesh_size="30"))
+
+
+def test_preflight_reports_how_the_mesh_landed_on_the_grid():
+    info = _upload()
+    out = web._preflight(_mesh_params(info["id"]))
+    mesh = out["uncertainty"]["mesh"]
+    assert mesh["status"] == "pass" and "solid cells" in mesh["short"] and "frontal area" not in mesh["short"]
+    assert "by area" in out["uncertainty"]["blockage"]["short"]
+    assert "blockage" in out["uncertainty"]
+    json.dumps(out)
+    thin = web._preflight(_mesh_params(_upload("simple_plane.stl")["id"], mesh_size="6"))
+    assert thin["uncertainty"]["mesh"]["status"] in {"warn", "fail"}
+
+
+def test_a_slender_mesh_is_graded_on_its_frontal_area():
+    """A plane spanning 42% of the tunnel blocks ~3% of it; the extent would say "fail"."""
+    plane = _upload("simple_plane.stl")["id"]
+    out = web._preflight(_mesh_params(plane, mesh_size="20", nx="96", ny="48", nz="48", mesh_rot_x="90"))
+    b = out["uncertainty"]["blockage"]
+    assert "by area" in b["short"]
+    area = float(b["short"].split()[1].rstrip("%"))
+    assert area < 5.0
+    assert "42%" in b["message"]                 # the extent is still reported
+
+
+def test_preview_is_the_mask_the_run_uses():
+    info = _upload()
+    p = _mesh_params(info["id"])
+    case = web._case(p)
+    header, parts = _unpack(web._geometry_payload(web._solid_for(p, case)))
+    assert header["shape"] == [24, 24, 48]
+    solver, label = web._build_solver(p)
+    assert np.array_equal(parts["solid"].reshape(24, 24, 48).astype(bool), solver.solid)
+    assert solver.ref_area > 0                                   # measured from the voxels
+    # every shape previews, in 2D too
+    header, parts = _unpack(web._geometry_payload(web._solid_for(
+        {"mode": "2d", "shape": "cylinder", "radius": 5, "nx": 60, "ny": 30},
+        web._case({"mode": "2d", "shape": "cylinder", "radius": 5, "nx": 60, "ny": 30}))))
+    assert header["shape"] == [1, 30, 60] and parts["solid"].sum() > 0
+
+
+def test_a_mesh_run_completes():
+    info = _upload()
+    job = web.Job(id="t_mesh", params={**_mesh_params(info["id"]), "steps": 60})
+    web._run_job(job)
+    assert job.state == "done", job.error
+    assert job.result["setup"]["label"] == "mesh unit_sphere.stl"
+    assert np.isfinite(job.result["coefficients"]["cd"])

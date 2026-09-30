@@ -403,6 +403,8 @@ def reference_length_cells(mode: str, shape: str, params: Dict[str, str]) -> flo
         return float(params.get("height", "20"))
     if shape == "box":
         return float(params.get("height", "10"))
+    if shape == "mesh":                     # an uploaded STL, scaled to this many cells across
+        return float(params.get("mesh_size", "16"))
     return float(params.get("height", params.get("radius", "10")))
 
 

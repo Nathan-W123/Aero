@@ -179,6 +179,26 @@ or:
 aero-gui
 ```
 
+## Web UI
+
+A browser front end that needs nothing beyond the package itself:
+
+```bash
+python3 webui.py          # then open http://localhost:8017
+```
+
+- Set the case in the property grid; the checks strip grades it before you run
+  (blockage, domain length, resolution, stability) and the viewer previews the
+  body in its tunnel.
+- 3D shape **mesh** takes an STL (ASCII or binary): **Choose…**, or drop the
+  file anywhere on the page.  Size it in cells, orient and rotate it, and the
+  preview shows exactly the cells the solver will see.
+- The 3D view shows smoke carried by the computed flow, and replays the wake
+  and vorticity of the run as a time-lapse.
+- The convergence chart has Cd and Cl at every step: wheel to zoom, drag to
+  pan, Shift-drag to zoom to a box, double-click for the whole run.
+- Export the view as PNG, the history as CSV, the results as JSON.
+
 ## Research notes
 
 - Low-Mach operation is still important; keep `u0` conservative.

@@ -39,11 +39,12 @@ import threading
 import time
 import traceback
 import uuid
+from struct import error as struct_error
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
@@ -67,7 +68,7 @@ COLLISIONS = ["bgk", "trt", "mrt", "regularized"]
 LATTICES_3D = sorted(LATTICES)
 BACKENDS = ["auto", "numpy", "numba"]
 SHAPES_2D = ["cylinder", "rectangle"]
-SHAPES_3D = ["sphere", "box", "cylinder"]
+SHAPES_3D = ["sphere", "box", "cylinder", "mesh"]
 WALL_BCS = ["slip", "noslip"]
 OUTLET_BCS = ["convective", "zerogradient"]
 
@@ -191,6 +192,69 @@ def _check_omega(omega: float, re: float) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Uploaded meshes
+# ---------------------------------------------------------------------------
+
+#: STL uploads are kept in memory by id; the newest MESHES_KEPT stay.
+MESHES_KEPT = 8
+MESH_BYTES_MAX = 256 * 2 ** 20
+MESH_TRIANGLES_MAX = 4_000_000
+MESHES: Dict[str, Dict[str, Any]] = {}
+_MESHES_LOCK = threading.Lock()
+
+
+def _open_edges(tris: np.ndarray) -> int:
+    """
+    Edges not shared by exactly two triangles: 0 for a closed surface.
+
+    Vertices are matched on their float32 bit patterns, which is how an STL
+    stores them, so a shared vertex matches exactly and nothing else does.
+    """
+    v = np.ascontiguousarray(tris.reshape(-1, 3), dtype=np.float32).view(np.dtype((np.void, 12))).ravel()
+    _, idx = np.unique(v, return_inverse=True)
+    idx = idx.reshape(-1, 3).astype(np.int64)
+    n = int(idx.max()) + 1
+    e = np.concatenate([idx[:, [0, 1]], idx[:, [1, 2]], idx[:, [2, 0]]])
+    e.sort(axis=1)
+    _, counts = np.unique(e[:, 0] * n + e[:, 1], return_counts=True)
+    return int((counts != 2).sum())
+
+
+def _store_mesh(name: str, data: bytes) -> Dict[str, Any]:
+    """Parse an uploaded STL and keep it; returns what the page shows of it."""
+    from ..geometry3d.stl_io import parse_stl
+
+    if len(data) > MESH_BYTES_MAX:
+        raise ValueError(f"The file is {len(data) / 2**20:.0f} MB; the limit is {MESH_BYTES_MAX // 2**20} MB.")
+    try:
+        tris = parse_stl(data)
+    except (ValueError, struct_error) as exc:
+        raise ValueError(f"Not a readable STL file ({exc}).") from None
+    if len(tris) == 0:
+        raise ValueError("The STL file has no triangles.")
+    if len(tris) > MESH_TRIANGLES_MAX:
+        raise ValueError(f"{len(tris):,} triangles; the limit is {MESH_TRIANGLES_MAX:,}.")
+    if not np.isfinite(tris).all():
+        raise ValueError("The STL file has coordinates that are not numbers.")
+    extent = np.ptp(tris.reshape(-1, 3), axis=0)
+    if (extent > 1e-9 * max(float(extent.max()), 1e-30)).sum() < 3:
+        raise ValueError("The mesh is flat: it has no volume to put in the tunnel.")
+    info = {"id": uuid.uuid4().hex[:12], "name": (name or "mesh.stl")[:120],
+            "triangles": int(len(tris)), "extent": [round(float(x), 6) for x in extent],
+            "open_edges": _open_edges(tris)}
+    with _MESHES_LOCK:
+        MESHES[info["id"]] = {**info, "tris": tris}
+        while len(MESHES) > MESHES_KEPT:
+            MESHES.pop(next(iter(MESHES)))
+    return info
+
+
+def _mesh_info(mesh_id: str) -> Optional[Dict[str, Any]]:
+    m = MESHES.get(mesh_id)
+    return None if m is None else {k: v for k, v in m.items() if k != "tris"}
+
+
 def _case(p: Dict[str, Any]) -> Dict[str, Any]:
     """
     Parse and check a case's parameters, allocating nothing.
@@ -237,10 +301,12 @@ def _case(p: Dict[str, Any]) -> Dict[str, Any]:
         elif shape == "cylinder":
             r, L = _f(p, "radius", 8.0), _f(p, "length", 24.0)
             D, label, make = 2.0 * r, f"cylinder r={r:g}", (lambda: Cylinder3D(radius=r, length=L))
+        elif shape == "mesh":
+            D, label, make = _mesh_case(p, ny, nz)
         else:
             r = _f(p, "radius", 7.0)
             D, label, make = 2.0 * r, f"sphere r={r:g}", (lambda: Sphere(radius=r))
-        if D >= ny or (shape == "sphere" and D >= nz):
+        if D >= ny or (shape in ("sphere", "mesh") and D >= nz):
             raise ValueError("The body is larger than the tunnel's cross-section.")
         grid = (nz, ny, nx)
 
@@ -251,6 +317,53 @@ def _case(p: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("MRT is implemented for D3Q19 only — pick another collision operator.")
     return {"mode": mode, "shape": shape, "D": D, "label": label, "make": make,
             "grid": grid, "re": re, "u0": u0, "nu": nu, "omega": omega}
+
+
+def _mesh_case(p: Dict[str, Any], ny: int, nz: int):
+    """
+    An uploaded STL as the body: oriented (principal axes, or as in the file),
+    rotated, then scaled so its largest cross-stream extent is ``mesh_size``
+    cells -- the reference length, as a sphere's diameter is.
+    """
+    from ..geometry3d.mesh_mask import MeshMask
+
+    mesh = MESHES.get(str(p.get("mesh_id", "")))
+    if mesh is None:
+        raise ValueError("Choose an STL file for the mesh shape (Geometry → STL file, "
+                         "or drop the file on the page).")
+    size = _f(p, "mesh_size", 16.0)
+    if size < 2.0:
+        raise ValueError("The mesh needs to be at least 2 cells across.")
+    orient = p.get("mesh_orient", "auto")
+    orient = orient if orient in ("auto", "none") else "auto"
+    rot = [_f(p, f"mesh_rot_{a}", 0.0) for a in "xyz"]
+    fit = size / max(min(ny, nz), 1)
+
+    def make():
+        return MeshMask(triangles=mesh["tris"], fit_frac=fit, mesh_orient=orient,
+                        mesh_rot_x=rot[0], mesh_rot_y=rot[1], mesh_rot_z=rot[2])
+    return size, f"mesh {mesh['name']}", make
+
+
+#: The solid masks of the last few cases the page previewed or checked, so
+#: an edit that only changes Re does not voxelize the body again.
+_SOLIDS: Dict[str, np.ndarray] = {}
+_SOLIDS_KEPT = 4
+_SOLIDS_LOCK = threading.Lock()
+_GEOMETRY_KEYS = ("mode", "shape", "radius", "width", "height", "depth", "length", "nx", "ny", "nz",
+                  "mesh_id", "mesh_size", "mesh_orient", "mesh_rot_x", "mesh_rot_y", "mesh_rot_z")
+
+
+def _solid_for(p: Dict[str, Any], case: Dict[str, Any]) -> np.ndarray:
+    key = json.dumps([str(p.get(k, "")) for k in _GEOMETRY_KEYS])
+    solid = _SOLIDS.get(key)
+    if solid is None:
+        solid = case["make"]().mark_solid(*case["grid"])
+        with _SOLIDS_LOCK:
+            _SOLIDS[key] = solid
+            while len(_SOLIDS) > _SOLIDS_KEPT:
+                _SOLIDS.pop(next(iter(_SOLIDS)))
+    return solid
 
 
 def _build_solver(p: Dict[str, Any]):
@@ -267,17 +380,19 @@ def _build_solver(p: Dict[str, Any]):
         inlet_perturbation=_f(p, "inlet_perturbation", 0.0),
     )
     geom, D, omega = case["make"](), case["D"], case["omega"]
+    solid = _solid_for(p, case).copy()           # what the preview showed, exactly
     if case["mode"] == "2d":
         from ..lbm.solver import Solver
 
         ny, nx = case["grid"]
-        solid = geom.mark_solid(ny, nx)
         return Solver(Ny=ny, Nx=nx, solid=solid, omega=omega, D=D, **common), case["label"]
 
     from ..lbm.solver3d import Solver3D
 
     nz, ny, nx = case["grid"]
-    solid = geom.mark_solid(nz, ny, nx)
+    if not solid.any():
+        raise ValueError("The mesh covers no cells at this size: make it larger (Size), "
+                         "or check that the STL is a closed surface.")
     return Solver3D(Nz=nz, Ny=ny, Nx=nx, solid=solid, omega=omega, D=D,
                     lattice=p.get("lattice", "d3q19"), ref_area=geom.reference_area(),
                     **common), case["label"]
@@ -337,6 +452,58 @@ def _is_number(v: Any) -> bool:
         return False
 
 
+def _mesh_blockage(solid: np.ndarray, size: float) -> Dict[str, Any]:
+    """
+    Blockage of an uploaded part, by frontal area.
+
+    The other shapes are graded on their extent across the tunnel, which
+    wildly overstates it for a slender part: an aircraft whose span is half
+    the tunnel's height may block 3% of it.  The thresholds are the extent
+    ones' equivalents for a sphere (10% and 20% across are 0.8% and 3.1% of
+    the area), so a compact part scores as a sphere would.
+    """
+    from ..forces3d import projected_frontal_area
+
+    nz, ny, _ = solid.shape
+    area = projected_frontal_area(solid) / float(ny * nz)
+    across = size / float(min(ny, nz))
+    status = "pass" if area < 0.008 else "warn" if area < 0.031 else "fail"
+    return {"status": status, "short": f"blockage {area * 100:.1f}% by area",
+            "message": f"The part blocks {area * 100:.1f}% of the tunnel's cross-section by frontal area, "
+                       f"and spans {across * 100:.0f}% of its height or width. Confinement raises the drag: "
+                       "above ~3% of the area expect it by 10% or more."}
+
+
+def _mesh_check(p: Dict[str, Any], case: Dict[str, Any]) -> Dict[str, Any]:
+    """How the uploaded mesh landed on the grid: cells, frontal area, closedness."""
+    from ..forces3d import projected_frontal_area
+
+    mesh = MESHES.get(str(p.get("mesh_id", ""))) or {}
+    solid = _solid_for(p, case)
+    cells = int(solid.sum())
+    if cells == 0:
+        return {"status": "fail", "short": "the mesh covers no cells",
+                "message": "At this size the whole surface falls between cell centres. "
+                           "Make it larger (Size), or check that the STL is a closed surface."}
+    nz, ny, _ = case["grid"]
+    ratio = projected_frontal_area(solid) / float(ny * nz)
+    short = f"{cells:,} solid cells"
+    notes = []
+    if mesh.get("open_edges"):
+        short += " · not closed"
+        notes.append(f"The surface has {mesh['open_edges']:,} open edges, so what is inside it is "
+                     "ambiguous and cells may be missing or extra: check the preview.")
+    if cells < 100:
+        notes.append(f"Only {cells} cells: parts thinner than a cell fall between the cell centres "
+                     "at this size.")
+    if notes:
+        return {"status": "warn", "short": short, "message": " ".join(notes)}
+    return {"status": "pass", "short": short,
+            "message": f"{cells:,} solid cells, blocking {ratio * 100:.1f}% of the tunnel's "
+                       "cross-section by area -- the area the force coefficients are normalised by."}
+
+
+
 def _preflight(p: Dict[str, Any]) -> Dict[str, Any]:
     """
     What can be said about a case before it runs: the checks that depend only
@@ -366,6 +533,11 @@ def _preflight(p: Dict[str, Any]) -> Dict[str, Any]:
                                                       _f(p, "re", 100.0))}
     except Exception as exc:                 # a half-typed form must not break the page
         checks["budget"] = {"status": "warn", "short": "checks unavailable", "message": str(exc)}
+    if case is not None and shape == "mesh":
+        checks["mesh"] = _mesh_check(p, case)
+        solid = _solid_for(p, case)
+        if solid.any():
+            checks["blockage"] = _mesh_blockage(solid, case["D"])
     out: Dict[str, Any] = {"uncertainty": checks, "error": error}
     try:
         out["reference"] = _reference(p, mode, None)
@@ -694,6 +866,8 @@ def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int) -> Dict[str,
             continue
         out[name] = {"status": comp["status"], "message": comp.get("message", ""),
                      "short": _short_label(name, comp.get("value"), mode, shape, _f(p, "re", 100.0))}
+    if shape == "mesh" and np.asarray(solver.solid).any():
+        out["blockage"] = _mesh_blockage(np.asarray(solver.solid, dtype=bool), _f(p, "mesh_size", 16.0))
     return out
 
 
@@ -965,6 +1139,9 @@ class Handler(BaseHTTPRequestHandler):
             if not blob:
                 return self._json({"error": "not ready yet"}, 404)
             return self._send(200, blob, "application/octet-stream")
+        if u.path == "/api/mesh":
+            info = _mesh_info((q.get("id") or [""])[0])
+            return self._json(info) if info else self._json({"error": "no such mesh"}, 404)
         if u.path == "/api/frames":
             job = JOBS.get((q.get("id") or [""])[0])
             if job is None:
@@ -996,6 +1173,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
+        if u.path == "/api/mesh":                      # the body is the STL file itself
+            if length > MESH_BYTES_MAX:
+                return self._json({"error": f"The file is over {MESH_BYTES_MAX // 2**20} MB."}, 413)
+            data = self.rfile.read(length)
+            try:
+                info = _store_mesh(unquote(self.headers.get("X-Filename") or "mesh.stl"), data)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            return self._json(info)
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
         except json.JSONDecodeError:
@@ -1011,6 +1197,15 @@ class Handler(BaseHTTPRequestHandler):
                     old.frames = []               # and the replays of the last few
             threading.Thread(target=_run_job, args=(job,), daemon=True).start()
             return self._json({"id": job.id})
+
+        if u.path == "/api/preview":
+            p = payload if isinstance(payload, dict) else {}
+            try:
+                case = _case(p)
+                solid = _solid_for(p, case)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            return self._send(200, _geometry_payload(solid), "application/octet-stream")
 
         if u.path == "/api/preflight":
             return self._json(_preflight(payload if isinstance(payload, dict) else {}))

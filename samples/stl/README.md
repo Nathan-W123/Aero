@@ -33,6 +33,15 @@ python3 cli3d.py --shape mesh --stl-path samples/stl/simple_plane.stl \
   --re 100 --nx 96 --ny 48 --nz 48 --stl-fit 0.35 --steps 1000
 ```
 
+## Web UI
+
+1. `python3 webui.py`, open http://localhost:8017
+2. Mode **3D**, shape **mesh**, then **Choose…** next to *STL file* -- or drop
+   the file anywhere on the page
+3. Set **Size** (cells across) and check the preview: parts thinner than a cell
+   at that size fall between the cell centres (`simple_plane.stl`'s wings fill
+   in only from ~80 cells across)
+
 ## GUI
 
 1. Mode **3D**, shape **mesh**
