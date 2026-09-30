@@ -32,6 +32,7 @@ out of step with the solver the way a hand-maintained list does.
 
 from __future__ import annotations
 
+import functools
 import io
 import json
 import threading
@@ -48,7 +49,8 @@ import numpy as np
 
 import matplotlib
 matplotlib.use("Agg")                      # no display server anywhere near this
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 
 from ..benchmarks import (
     build_uncertainty_report, literature_cd_range, mean_uncertainty,
@@ -355,53 +357,148 @@ def _field_payload(solver, mode: str) -> bytes:
 # Rendering
 # ---------------------------------------------------------------------------
 
-def _png(fig) -> bytes:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
+#: Field figures are drawn at about twice the size the page shows them, so
+#: they stay sharp on dense screens; type is sized for the shown size (the plot
+#: panes are ~300-440 px wide).
+FIELD_FIG_WIDTH = 3.6          # inches
+FIELD_FIG_DPI = 200
+_BODY_FILL = "#a3adb9"         # the body, as the 3D view draws it
+_BODY_EDGE = "#2f3a48"
+_FRAME = "#8d9aab"             # the tunnel walls
+_TEXT = "#1b2a3d"
 
 
-def _field_png(solver, mode: str, what: str = "speed") -> bytes:
-    """Velocity magnitude / vorticity / pressure over the mid-plane."""
+@functools.lru_cache(maxsize=None)
+def _ui_font() -> str:
+    """The page's typeface where Matplotlib can find it, else its default."""
+    from matplotlib import font_manager
+    have = {f.name for f in font_manager.fontManager.ttflist}
+    return next((n for n in ("Segoe UI", "Helvetica Neue", "Arial", "Liberation Sans")
+                 if n in have), "DejaVu Sans")
+
+
+def _mid_plane(solver, mode: str):
+    """``(rho, ux, uy, speed, solid)`` on the plane the figures show."""
     if mode == "2d":
         rho, ux, uy = solver.macroscopic()
-        solid = solver.solid
-    else:
-        rho, ux, uy, uz = solver.macroscopic()
-        k = ux.shape[0] // 2
-        rho, ux, uy, solid = rho[k], ux[k], uy[k], solver.solid[k]
+        return rho, ux, uy, np.hypot(ux, uy), solver.solid
+    rho, ux, uy, uz = solver.macroscopic()
+    k = ux.shape[0] // 2
+    speed = np.sqrt(ux[k] ** 2 + uy[k] ** 2 + uz[k] ** 2)
+    return rho[k], ux[k], uy[k], speed, solver.solid[k]
 
+
+def _smoothed(mask: np.ndarray, passes: int = 1) -> np.ndarray:
+    """A 3x3 box blur of a 0/1 mask, so its 0.5 contour is round, not a staircase."""
+    a = mask.astype(float)
+    for _ in range(passes):
+        p = np.pad(a, 1, mode="edge")
+        a = sum(p[i:i + a.shape[0], j:j + a.shape[1]] for i in range(3) for j in range(3)) / 9.0
+    return a
+
+
+def _extend_into(solid: np.ndarray, a: np.ndarray, passes: int = 3) -> np.ndarray:
+    """
+    ``a`` with the solid cells near the surface given their fluid neighbours'
+    mean, so the field runs smoothly under the drawn outline of the body
+    instead of stopping at the staircase of cells.
+    """
+    a = np.where(solid, np.nan, a)
+    for _ in range(passes):
+        gap = np.isnan(a)
+        if not gap.any():
+            break
+        p = np.pad(a, 1, mode="edge")
+        near = np.stack([p[1:-1, :-2], p[1:-1, 2:], p[:-2, 1:-1], p[2:, 1:-1]])
+        known = ~np.isnan(near)
+        count = known.sum(axis=0)
+        mean = np.where(known, near, 0.0).sum(axis=0) / np.maximum(count, 1)
+        a = np.where(gap & (count > 0), mean, a)
+    rest = np.isnan(a)
+    if rest.any():                           # deep inside: hidden under the body
+        a[rest] = np.nanmean(a) if (~rest).any() else 0.0
+    return a
+
+
+def _field_png(solver, mode: str, what: str = "speed", streamlines: bool = False) -> bytes:
+    """
+    Velocity magnitude, vorticity or pressure over the mid-plane.
+
+    Each is scaled by the free stream -- ``|u|/U∞``, ``ωD/U∞`` and ``Cp`` -- so
+    the numbers mean the same on any grid or inlet speed.  The pressure plot
+    carries isobars; ``streamlines`` adds them to the velocity plot (for the
+    final figure: tracing them costs more than the rest of the figure).
+    """
+    rho, ux, uy, speed, solid = _mid_plane(solver, mode)
+    u0 = float(getattr(solver, "u0", 0.0) or 0.05)
+    D = float(getattr(solver, "D", 0.0) or 1.0)
+    fluid = ~solid
+    has_fluid = bool(fluid.any())
+
+    def symmetric(a):
+        lim = float(np.nanpercentile(np.abs(a[fluid]), 99)) if has_fluid else 0.0
+        return lim if np.isfinite(lim) and lim > 0 else 1.0
+
+    isobars = None
     if what == "vorticity":
-        dvdx = np.gradient(uy, axis=1)
-        dudy = np.gradient(ux, axis=0)
-        data, cmap, label = dvdx - dudy, "RdBu_r", "vorticity"
-        lim = np.nanpercentile(np.abs(data[~solid]), 99) if (~solid).any() else 1.0
-        vmin, vmax = -lim, lim
+        data = (np.gradient(uy, axis=1) - np.gradient(ux, axis=0)) * (D / u0)
+        cmap, label = "RdBu_r", r"$\omega D/U_\infty$"
+        vmax = symmetric(data); vmin = -vmax
     elif what == "pressure":
-        data, cmap, label = (rho - 1.0) / 3.0, "coolwarm", "pressure"
-        vals = data[~solid] if (~solid).any() else data
-        lim = np.nanpercentile(np.abs(vals), 99) or 1e-6
-        vmin, vmax = -lim, lim
+        # against the static pressure just inside the inlet, as a tunnel's
+        # upstream tapping would read it; p = rho c_s^2 with c_s^2 = 1/3
+        p = rho / 3.0
+        tap = fluid[:, 1]
+        p_inf = float(np.mean(p[:, 1][tap])) if tap.any() else float(np.mean(p))
+        data = (p - p_inf) / (0.5 * (3.0 * p_inf) * u0 ** 2)
+        cmap, label = "RdBu_r", r"$C_p$"
+        vmax = symmetric(data); vmin = -vmax
+        isobars = np.linspace(vmin, vmax, 13)
     else:
-        data, cmap, label = np.sqrt(ux ** 2 + uy ** 2), "viridis", "|u|"
-        vmin, vmax = 0.0, float(np.nanmax(data)) or 1.0
+        data = speed / u0
+        cmap, label = "viridis", r"$|u|/U_\infty$"
+        vmin, vmax = 0.0, (float(np.nanmax(data[fluid])) if has_fluid else 1.0)
+        if not (np.isfinite(vmax) and vmax > 0):
+            vmax = 1.0
 
-    data = np.ma.masked_where(solid, data)
     ny, nx = data.shape
-    fig, ax = plt.subplots(figsize=(min(11, nx / 44), min(6, ny / 44)))
-    fig.patch.set_facecolor("#ffffff")
-    im = ax.imshow(data, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax,
-                   interpolation="bilinear", aspect="equal")
-    ax.contour(solid.astype(float), levels=[0.5], colors="#1b1b1b", linewidths=0.8)
+    font = _ui_font()
+    fig = Figure(figsize=(FIELD_FIG_WIDTH, max(1.1, 0.87 * FIELD_FIG_WIDTH * ny / nx)),
+                 dpi=FIELD_FIG_DPI, facecolor="#ffffff")
+    ax = fig.subplots()
+    shown = _extend_into(solid, data) if has_fluid else data
+    im = ax.imshow(shown, origin="lower", aspect="equal", interpolation="bilinear",
+                   cmap=cmap, vmin=vmin, vmax=vmax)
+    if isobars is not None and has_fluid:
+        ax.contour(shown, levels=isobars, colors=_TEXT, linewidths=0.3, alpha=0.4)
+    if streamlines and what == "speed" and has_fluid:
+        d = 1.25
+        ax.streamplot(np.arange(nx), np.arange(ny), np.where(solid, 0.0, ux), np.where(solid, 0.0, uy),
+                      density=(d, max(d * ny / nx, 0.3)), color="#ffffff", linewidth=0.4,
+                      arrowsize=0.45, zorder=2)
+    if solid.any():
+        # the body as a filled, smoothed outline, as the 3D view draws it
+        mask = _smoothed(solid)
+        ax.contourf(mask, levels=[0.5, 2.0], colors=[_BODY_FILL], zorder=3)
+        ax.contour(mask, levels=[0.5], colors=[_BODY_EDGE], linewidths=0.6, zorder=4)
+    ax.set_xlim(-0.5, nx - 0.5); ax.set_ylim(-0.5, ny - 0.5)
     ax.set_xticks([]); ax.set_yticks([])
-    for s in ax.spines.values():
-        s.set_visible(False)
-    cb = fig.colorbar(im, ax=ax, fraction=0.028, pad=0.015)
-    cb.set_label(label, fontsize=9)
-    cb.ax.tick_params(labelsize=8)
-    return _png(fig)
+    for side in ax.spines.values():
+        side.set_color(_FRAME); side.set_linewidth(0.6)
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.025, aspect=13)
+    cb.outline.set_linewidth(0.5); cb.outline.set_edgecolor(_FRAME)
+    cb.locator = MaxNLocator(nbins=4)
+    cb.update_ticks()
+    cb.ax.tick_params(labelsize=7, length=2, width=0.5, pad=1.5, colors=_TEXT)
+    for tick in cb.ax.get_yticklabels():
+        tick.set_fontfamily(font)
+    cb.ax.set_title(label, fontsize=8, color=_TEXT, pad=4, loc="left")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=FIELD_FIG_DPI, bbox_inches="tight", pad_inches=0.03,
+                facecolor="#ffffff")
+    return buf.getvalue()
 
 
 def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int) -> Dict[str, Any]:
@@ -608,7 +705,7 @@ def _run_job(job: Job) -> None:
             job.result["reference"] = _reference(p, mode, job.result["coefficients"]["cd"])
         for what in ("speed", "vorticity", "pressure"):
             try:
-                job.figures[what] = _field_png(solver, mode, what)
+                job.figures[what] = _field_png(solver, mode, what, streamlines=True)
             except Exception:
                 pass
         job.figure_step = job.step

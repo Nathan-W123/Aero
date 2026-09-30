@@ -7,212 +7,352 @@
 <style>
 :root{
   color-scheme: light;
-  --ground:#F3EDDC; --surface:#FDFBF2; --panel:#F9F5EA; --sunk:#E8E1CC;
-  --ink:#1F2D21; --muted:#55634F; --faint:#6E7A66;
-  --accent:#15803D; --accent-deep:#14653A; --accent-soft:#DFEFE3;
-  --line:#CBBF9E; --line-soft:#DED5BC;
-  --warn:#8A5A0B; --error:#B3261E;
-  --cd:#127A38; --cl:#5B21B6;
-  --tunnel:#30123b;
-  --top:52px;
+  --frame:#c9d5e5;                         /* the window behind the panes */
+  --edge:#9fb1c8; --edge-soft:#dfe6ef; --groove:#c3d0e1;
+  --tint:#f4f7fb; --cat:#e7edf5;
+  --head-hi:#f8fafd; --head-lo:#dae3ef;
+  --ink:#1b2a3d; --ink2:#3e5372; --faint:#66788f; --title:#15325c;
+  --hover-edge:#7eb4ea; --press-edge:#569de5;
+  --sel:#3a78c9;
+  --err:#c42b1c;
 }
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{height:100%}
-body{
-  margin:0; background:var(--ground); color:var(--ink); overflow:hidden;
-  font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
-  -webkit-font-smoothing:antialiased;
-}
-.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
-h1,h2{margin:0;font-weight:650;letter-spacing:-.01em}
-h1{font-size:16px}
-h2{font-size:11.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--accent)}
-button{font:inherit;cursor:pointer}
+body{margin:0;background:var(--frame);color:var(--ink);overflow:hidden;
+  font:12px/1.4 "Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif}
+.mono{font-family:Consolas,ui-monospace,"SF Mono",Menlo,monospace}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+h1,h2{margin:0;font-size:inherit}
+.app{height:100%;display:grid;grid-template-rows:auto auto minmax(0,1fr) auto;grid-template-columns:minmax(0,1fr)}
 
-.topbar{
-  height:var(--top);display:flex;align-items:center;gap:12px;padding:0 16px;
-  background:var(--panel);border-bottom:1px solid var(--line);
-}
-.topbar .sp{flex:1 1 auto}
-.pill{font-size:12px;color:var(--muted);background:var(--sunk);border-radius:20px;padding:3px 11px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}
-.btn{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:6px;padding:6px 14px;font-weight:550}
-.btn:hover:not(:disabled){border-color:var(--accent)}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.primary:hover:not(:disabled){background:var(--accent-deep)}
-.btn.danger{color:var(--error)}
-.btn.sm{padding:3px 9px;font-size:12px;font-weight:500}
+/* ---- title bar ---- */
+.titlebar{height:28px;display:flex;align-items:center;gap:8px;padding:0 10px;color:var(--title);
+  background:linear-gradient(#e9f0f8,#d3deec);border-bottom:1px solid var(--edge)}
+.titlebar svg{flex:none}
+.titlebar h1{font-weight:400;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-.layout{display:grid;grid-template-columns:300px minmax(0,1fr);height:calc(100% - var(--top))}
-.side{background:var(--panel);border-right:1px solid var(--line);padding:12px 16px 20px;overflow-y:auto}
-.main{display:grid;grid-template-rows:auto minmax(0,1.35fr) minmax(0,1fr);gap:10px;padding:10px 14px 12px;min-height:0}
+/* ---- ribbon ---- */
+.ribbon{background:linear-gradient(#f3f6fa,#e2e9f2);border-bottom:1px solid var(--edge)}
+.rtabs{display:flex;align-items:flex-end;height:25px;padding:0 8px}
+.rtab{height:22px;padding:0 18px;display:flex;align-items:center;color:var(--title);position:relative;z-index:1;
+  background:#fbfcfe;border:1px solid var(--edge);border-bottom:none;border-radius:3px 3px 0 0;margin-bottom:-1px}
+.rbody{display:flex;align-items:stretch;height:88px;padding:3px 4px 0;overflow-x:auto;overflow-y:hidden;
+  background:linear-gradient(#fbfcfe,#f0f4f9 70%,#e5ecf4);border-top:1px solid var(--edge)}
+.rgroup{flex:none;display:flex;flex-direction:column;padding:0 5px;border-right:1px solid var(--groove)}
+.rbtns{flex:1;display:flex;align-items:flex-start;gap:1px}
+.rlabel{text-align:center;font-size:11px;color:var(--ink2);padding:0 2px 3px;white-space:nowrap}
+.rbtn{display:flex;align-items:center;border:1px solid transparent;border-radius:3px;background:none;color:var(--ink);padding:0}
+.rbtn.big{flex-direction:column;gap:3px;min-width:48px;height:64px;padding:4px 5px 0;line-height:1.15;text-align:center}
+.rbtn.big svg{width:32px;height:32px;flex:none}
+.rstack{display:flex;flex-direction:column;gap:1px;padding-top:1px}
+.rbtn.small{gap:5px;height:20px;padding:0 8px 0 4px;white-space:nowrap}
+.rbtn.small svg{width:16px;height:16px;flex:none}
+.rbtn:hover:not(:disabled){background:linear-gradient(#f4f9fe,#dcebfb);border-color:var(--hover-edge)}
+.rbtn:active:not(:disabled){background:linear-gradient(#dcebf8,#c3dbf4);border-color:var(--press-edge)}
+.rbtn:disabled{cursor:default;color:#8f9aa8}
+.rbtn:disabled svg{filter:grayscale(1);opacity:.45}
+#animBtn .ic-play,#animBtn.paused .ic-pause{display:none}
+#animBtn.paused .ic-play{display:block}
+.rbtn:focus-visible,.dtab:focus-visible,summary:focus-visible{outline:1px dotted var(--ink);outline-offset:-3px}
 
-fieldset{border:none;margin:0 0 12px;padding:0}
-fieldset h2{margin-bottom:7px}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:7px}
-.row.three{grid-template-columns:1fr 1fr 1fr}
-.row.one{grid-template-columns:1fr}
-label{display:block;font-size:11px;color:var(--faint);margin-bottom:2px;letter-spacing:.02em}
-input,select{width:100%;font:inherit;font-size:13px;padding:5px 8px;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:5px}
-input:focus,select:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
-.check{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted);margin-bottom:7px}
-.check input{width:auto}
-.hint{font-size:11.5px;color:var(--faint);margin:2px 0 0}
+/* ---- workspace ---- */
+.work{display:grid;grid-template-columns:clamp(250px,19vw,300px) minmax(0,1fr) clamp(300px,25vw,440px);
+  gap:4px;padding:4px;min-height:0}
+.col{display:flex;flex-direction:column;gap:4px;min-height:0;min-width:0}
+.pane{background:#fff;border:1px solid var(--edge);display:flex;flex-direction:column;min-height:0;min-width:0}
+.phead{flex:none;height:23px;display:flex;align-items:center;gap:8px;padding:0 8px;white-space:nowrap;overflow:hidden;
+  background:linear-gradient(var(--head-hi),var(--head-lo));border-bottom:1px solid var(--edge);color:var(--title);font-weight:600}
+.phead .sp{flex:1}
+.phead .aux{font-weight:400;color:var(--ink2);font-size:11px;overflow:hidden;text-overflow:ellipsis}
+.pbody{flex:1;min-height:0;overflow:auto;position:relative}
+.left .case{flex:1 1 0}
+.center .view{flex:1 1 0}
+.center .res{flex:none;height:170px}
+.resbody{display:grid;grid-template-columns:minmax(240px,.8fr) minmax(0,1.7fr);align-content:start}
+.resbody .err{grid-column:1/-1}
+#stats{border-right:1px solid var(--edge-soft);align-self:stretch}
+#checks{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));align-content:start}
+#checks .pcat,#checks .crow.ref{grid-column:1/-1}
 
-.card{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:10px 14px;min-height:0;display:flex;flex-direction:column}
-.card h2{margin-bottom:6px;display:flex;align-items:center;gap:8px}
-.card h2 .sp{flex:1}
-.toprow{display:flex;flex-direction:row;gap:12px;align-items:center;flex-wrap:wrap;padding:9px 14px}
-.status{display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--muted);min-width:0;flex:1 1 260px}
-.status span.t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
-.dot.running{background:var(--accent);animation:pulse 1.1s ease-in-out infinite}
-.dot.done{background:var(--accent)} .dot.error{background:var(--error)} .dot.stopped{background:var(--warn)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-@media (prefers-reduced-motion:reduce){.dot.running{animation:none}}
-.bar{height:4px;background:var(--sunk);border-radius:3px;overflow:hidden;flex:0 0 100%;margin-top:-2px}
-.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
-.stats{display:flex;gap:16px;flex-wrap:wrap}
-.stat{display:flex;flex-direction:column;line-height:1.15}
-.stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
-.stat .v{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}
-.stat .v small{font-size:11px;font-weight:400;color:var(--muted)}
-.checks{flex:0 0 100%;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.chip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);background:var(--panel);
-  border:1px solid var(--line-soft);border-radius:12px;padding:2px 9px;cursor:help;white-space:nowrap}
-.chip i{width:7px;height:7px;border-radius:50%;flex:none;background:var(--faint)}
-.chip.pass i{background:var(--accent)} .chip.warn i{background:var(--warn)} .chip.fail i{background:var(--error)}
-.chip.ref{color:var(--ink);font-weight:550}
-.err{background:#FBEAE8;border:1px solid #E4B9B4;color:var(--error);border-radius:6px;padding:6px 10px;font-size:13px;flex:0 0 100%}
+/* property grid */
+.pg summary,.pcat{display:flex;align-items:center;gap:5px;height:22px;padding:0 6px;list-style:none;user-select:none;
+  background:var(--cat);border-bottom:1px solid var(--edge-soft);font-weight:600;color:var(--ink)}
+.pg summary{cursor:pointer}
+.pg summary::-webkit-details-marker{display:none}
+.pg summary::before{content:"";border:4px solid transparent;border-left:5px solid var(--ink2);border-right:0;
+  margin:0 3px 0 2px;transition:transform .12s}
+.pg details[open]>summary::before{transform:rotate(90deg)}
+.prow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.08fr);min-height:22px;border-bottom:1px solid var(--edge-soft)}
+.prow>label,.prow>.pl{display:flex;align-items:center;padding:0 6px 0 19px;border-right:1px solid var(--edge-soft);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prow:hover>label{background:var(--tint)}
+.prow:focus-within>label{background:var(--sel);color:#fff}
+.pv{display:flex;align-items:center;min-width:0}
+.pv input,.pv select{flex:1;min-width:0;width:100%;height:21px;border:0;border-radius:0;background:transparent;padding:0 5px}
+.pv input:focus,.pv select:focus{outline:1px solid var(--press-edge);outline-offset:-1px;background:#fff}
+.pv input[type=checkbox]{flex:none;width:14px;height:14px;margin:0 6px}
+.pv .u{flex:none;padding:0 6px 0 2px;color:var(--faint);font-size:11px}
+.pv.num{padding:2px 6px;gap:5px;font-variant-numeric:tabular-nums;flex-wrap:wrap}
+.pv.num small{color:var(--faint);font-size:11px}
+.pdesc{flex:none;height:96px;overflow:auto;padding:5px 8px;border-top:1px solid var(--edge);background:var(--tint);color:var(--ink2)}
+.pdesc b{display:block;color:var(--ink)}
+.crow{display:flex;align-items:flex-start;gap:6px;padding:2px 6px 2px 16px;border-bottom:1px solid var(--edge-soft);cursor:help}
+.crow svg{flex:none;width:14px;height:14px;margin-top:1px}
+.crow.ref{font-weight:600}
+.pempty{padding:9px 10px;color:var(--faint)}
+.err{margin:6px;padding:6px 8px;background:#fdecea;border:1px solid #e3aaa3;color:var(--err)}
 
-.midrow{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:10px;min-height:0}
-.botrow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;min-height:0}
-.fill{flex:1;min-height:0;position:relative}
-.viewer{background:var(--tunnel);border-radius:7px;overflow:hidden;position:relative}
+/* ---- viewport ---- */
+.doctabs{flex:none;display:flex;align-items:flex-end;gap:2px;height:28px;padding:0 6px;
+  background:linear-gradient(#eef3f9,#dbe4ef);border-bottom:1px solid var(--edge)}
+.dtab{display:flex;align-items:center;gap:6px;height:23px;padding:0 13px 0 9px;margin-bottom:-1px;color:var(--ink2);
+  background:none;border:1px solid transparent;border-bottom:none;border-radius:3px 3px 0 0}
+.dtab svg{width:16px;height:16px;flex:none}
+.dtab:hover:not(.on){background:rgba(255,255,255,.65);border-color:var(--groove)}
+.dtab.on{background:#fff;border-color:var(--edge);color:var(--ink);font-weight:600}
+.viewer{flex:1;min-height:0;position:relative;overflow:hidden;background:linear-gradient(#fff,#e9eef5)}
 .viewer canvas{display:block;width:100%;height:100%;cursor:grab}
 .viewer canvas:active{cursor:grabbing}
-.viewer .legend{position:absolute;left:10px;bottom:8px;font-size:11px;color:#c9bcd9;display:flex;align-items:center;gap:6px;pointer-events:none}
-.viewer .legend i{display:inline-block;width:96px;height:6px;border-radius:3px}
-.viewer .legend .hint{margin-left:10px;color:#9d8fb3}
-.viewer .empty{position:absolute;inset:0;display:grid;place-items:center;color:#9d8fb3;font-size:13px;pointer-events:none}
-.seg{display:inline-flex}
-.seg .btn{border-radius:0}
-.seg .btn:first-child{border-radius:6px 0 0 6px}
-.seg .btn + .btn{margin-left:-1px}
-.seg .btn:last-child{border-radius:0 6px 6px 0}
-.seg .btn.on{background:var(--accent);border-color:var(--accent);color:#fff;position:relative}
+.viewer .empty{position:absolute;inset:0;display:grid;place-items:center;color:#7d8ca2;font-size:13px;pointer-events:none}
+.cmap{flex:none;display:flex;align-items:center;gap:12px;height:46px;padding:0 12px;color:var(--ink2);
+  border-top:1px solid var(--edge);background:linear-gradient(#fbfcfe,#edf2f8)}
+.cm-name{font-weight:600;color:var(--ink);white-space:nowrap}
+.cm-scale{position:relative;flex:none;width:min(360px,40%);height:32px}
+.cm-scale i{position:absolute;left:0;right:0;top:3px;height:13px;border:1px solid #6d7d94}
+.cm-ticks span{position:absolute;top:19px;transform:translateX(-50%);font-size:10.5px;line-height:1;white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.cm-ticks span::before{content:"";position:absolute;left:50%;top:-3px;height:3px;border-left:1px solid #6d7d94}
+.cm-ticks span:first-child{transform:none}
+.cm-ticks span:first-child::before{left:0}
+.cm-ticks span:last-child{transform:translateX(-100%)}
+.cm-ticks span:last-child::before{left:auto;right:0}
+.cmap .hint{margin-left:auto;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---- plots ---- */
+.right{display:grid;grid-template-rows:repeat(4,minmax(0,1fr))}
+.chartbox{overflow:hidden}
 svg.chart{display:block;width:100%;height:100%}
-figure{margin:0;flex:1;min-height:0;background:#fff;border:1px solid var(--line-soft);border-radius:6px;overflow:hidden;display:grid;place-items:center}
-figure img{width:100%;height:100%;object-fit:contain;display:block}
-figure .empty{color:var(--faint);font-size:12.5px}
-@media (max-width:900px){
+figure{margin:0;flex:1;min-height:0;display:grid;place-items:center;overflow:hidden;position:relative}
+figure img{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);object-fit:contain;display:block}
+figure .empty{color:var(--faint)}
+
+/* ---- status bar ---- */
+.statusbar{display:flex;align-items:stretch;height:24px;color:var(--ink2);font-size:11.5px;
+  background:linear-gradient(#f0f4f9,#dbe4ef);border-top:1px solid var(--edge)}
+.sb{flex:none;display:flex;align-items:center;gap:7px;padding:0 10px;border-left:1px solid var(--groove);white-space:nowrap;min-width:0}
+.sb:first-child{flex:1 1 auto;border-left:0}
+.sb .t{overflow:hidden;text-overflow:ellipsis}
+.sb.setup{display:block;line-height:23px;max-width:38vw;overflow:hidden;text-overflow:ellipsis}
+.dot{width:9px;height:9px;border-radius:50%;flex:none;background:#98a6b8;box-shadow:inset 0 0 0 1px rgba(0,0,0,.18)}
+.dot.running{background:#2fa84f;animation:pulse 1.1s ease-in-out infinite}
+.dot.done{background:#2fa84f} .dot.error{background:var(--err)} .dot.stopped{background:#e0a100}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.dot.running{animation:none}}
+.bar{width:150px;height:13px;overflow:hidden;border:1px solid #93a3b8;border-radius:2px;background:linear-gradient(#f4f4f4,#e1e1e1)}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(#93e293,#3fb54f 55%,#2f9e41);transition:width .25s}
+
+@media (max-width:1100px){
   body{overflow:auto}
-  .layout{grid-template-columns:1fr;height:auto}
-  .main{grid-template-rows:auto 520px 300px}
-  .midrow{grid-template-columns:1fr}
-  .botrow{grid-template-columns:1fr}
+  .app{height:auto;min-height:100%}
+  .work{grid-template-columns:minmax(0,1fr)}
+  .left .case{flex:none}
+  .left .pbody{overflow:visible}
+  .center .view{flex:none;height:62vh;min-height:360px}
+  .center .res{height:auto}
+  .right{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,240px)}
+  .statusbar{position:sticky;bottom:0}
+}
+@media (max-width:620px){
+  .resbody,#checks{grid-template-columns:minmax(0,1fr)}
+  #stats{border-right:0}
+  .right{grid-template-columns:minmax(0,1fr);grid-template-rows:repeat(4,220px)}
+  .sb.setup,.cmap .hint{display:none}
+  .cm-scale{width:55%}
 }
 </style>
 </head>
 <body>
+<div class="app">
 
-<div class="topbar">
-  <h1>Aero CFD</h1>
-  <span class="pill mono" id="setupPill">no run yet</span>
-  <span class="sp"></span>
-  <button class="btn primary" id="runBtn">Run</button>
-  <button class="btn danger" id="stopBtn" disabled>Stop</button>
-</div>
+<header class="titlebar">
+  <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><rect x=".5" y=".5" width="17" height="17" rx="3.5" fill="#2b62b0"/><path d="M2.6 6.1c3.4-1.3 7.4-1.2 12.6.7M2.8 13.2c3.6.9 7.6.8 12.4-.6" stroke="#9fc4f4" fill="none"/><path d="M2.8 10.3c2.4-3.1 6.9-3.8 12.4-1.5-4.8.3-8.4 1.2-12.4 1.5z" fill="#fff"/></svg>
+  <h1 id="winTitle">Untitled — Aero CFD</h1>
+</header>
 
-<div class="layout">
-  <aside class="side">
-    <fieldset>
-      <h2>Case</h2>
-      <div class="row">
-        <div><label for="mode">Mode</label>
-          <select id="mode"><option value="2d">2D</option><option value="3d">3D</option></select></div>
-        <div><label for="shape">Shape</label><select id="shape"></select></div>
+<nav class="ribbon" aria-label="Toolbar">
+  <div class="rtabs"><span class="rtab">Home</span></div>
+  <div class="rbody">
+    <div class="rgroup" role="group" aria-label="Simulation">
+      <div class="rbtns">
+        <button class="rbtn big" id="runBtn" title="Build the case and start the solver">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="gRun" x2="0" y2="1"><stop offset="0" stop-color="#72d872"/><stop offset="1" stop-color="#1f8a34"/></linearGradient></defs><circle cx="16" cy="16" r="13.5" fill="url(#gRun)" stroke="#1a6b2b"/><path d="M12.8 9.8v12.4l9.8-6.2z" fill="#fff"/></svg>
+          <span>Run</span></button>
+        <button class="rbtn big" id="stopBtn" disabled title="Stop the solver; what it has computed so far is kept">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="gStop" x2="0" y2="1"><stop offset="0" stop-color="#f27a6c"/><stop offset="1" stop-color="#b8261b"/></linearGradient></defs><circle cx="16" cy="16" r="13.5" fill="url(#gStop)" stroke="#8a1c14"/><rect x="11" y="11" width="10" height="10" rx="1.2" fill="#fff"/></svg>
+          <span>Stop</span></button>
       </div>
-      <div class="row" id="dimRow"></div>
-      <div class="row">
-        <div><label for="re">Reynolds number</label><input id="re" type="number" value="100" min="0.1" step="10"></div>
-        <div><label for="u0">Inlet u₀</label><input id="u0" type="number" value="0.05" min="0.001" max="0.2" step="0.01"></div>
-      </div>
-      <div class="row three" id="gridRow"></div>
-      <div class="row one">
-        <div><label for="steps">Steps</label><input id="steps" type="number" value="3000" min="50" step="500"></div>
-      </div>
-    </fieldset>
-    <fieldset>
-      <h2>Solver</h2>
-      <div class="row">
-        <div><label for="collision">Collision</label><select id="collision"></select></div>
-        <div><label for="backend">Backend</label><select id="backend"></select></div>
-      </div>
-      <div class="row" id="latticeRow" hidden>
-        <div><label for="lattice">Lattice</label><select id="lattice"></select></div><div></div>
-      </div>
-      <div class="row">
-        <div><label for="wall_bc">Wall BC</label><select id="wall_bc"></select></div>
-        <div><label for="outlet_bc">Outlet BC</label><select id="outlet_bc"></select></div>
-      </div>
-      <div class="check"><input type="checkbox" id="les"><label for="les" style="margin:0">Smagorinsky LES</label></div>
-      <div class="row one">
-        <div><label for="inlet_perturbation">Inlet perturbation (fraction of u₀)</label>
-          <input id="inlet_perturbation" type="number" value="0.02" min="0" max="0.5" step="0.01"></div>
-      </div>
-      <p class="hint" id="pertHint">A small perturbation is what trips vortex shedding above Re ≈ 47.</p>
-    </fieldset>
-  </aside>
-
-  <main class="main">
-    <div class="card toprow">
-      <div class="status"><span class="dot" id="dot"></span><span class="t" id="statusText">Set a case and press Run.</span></div>
-      <div class="stats" id="stats"></div>
-      <span class="mono" id="elapsed" style="font-size:12px;color:var(--muted)"></span>
-      <div class="bar"><i id="bar"></i></div>
-      <div class="checks" id="checks" hidden></div>
-      <div id="errBox" hidden class="err"></div>
+      <div class="rlabel">Simulation</div>
     </div>
-
-    <div class="midrow">
-      <div class="card">
-        <h2>Wind tunnel <span class="sp"></span>
-          <span class="seg" id="qtySeg" role="group" aria-label="Quantity shown">
-            <button class="btn sm on" data-q="smoke" title="Dye released upstream and carried through the computed velocity field, coloured by speed">Smoke</button>
-            <button class="btn sm" data-q="wake" title="How much the body disturbs the flow, |u − U∞|: clear in the free stream, a plume in the wake">Wake</button>
-            <button class="btn sm" data-q="vorticity" title="How fast the flow spins, |∇×u|: boundary layers, shear layers and vortices">Vorticity</button>
-          </span>
-          <button class="btn sm" id="animBtn" title="Freeze or resume the smoke">Pause</button>
-          <button class="btn sm" id="resetBtn">Reset view</button></h2>
-        <div class="fill viewer">
-          <canvas id="tunnel"></canvas>
-          <div class="empty" id="tunnelEmpty">The flow appears once a run starts</div>
-          <div class="legend"><span id="lgName">speed |u|</span><span>0</span><i id="lgBar"></i><span id="lgHi">high</span><span class="hint">drag to rotate · wheel to zoom</span></div>
+    <div class="rgroup" role="group" aria-label="View">
+      <div class="rbtns">
+        <button class="rbtn big" data-view="iso" title="Three-quarter view from upstream">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><g stroke="#3d5a80" stroke-width="1.1" stroke-linejoin="round"><path d="M6 13h14v14H6z" fill="#a9c9ef"/><path d="M6 13l6-6h14l-6 6z" fill="#d6e6f9"/><path d="M20 13l6-6v14l-6 6z" fill="#7faee6"/></g></svg>
+          <span>Iso</span></button>
+        <button class="rbtn big" data-view="front" title="Look downstream at the front of the body">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><g stroke="#3d5a80" stroke-width="1.1" stroke-linejoin="round"><path d="M6 13h14v14H6z" fill="#3f7fd0"/><path d="M6 13l6-6h14l-6 6z" fill="#f4f7fb"/><path d="M20 13l6-6v14l-6 6z" fill="#e3eaf3"/></g></svg>
+          <span>Front</span></button>
+        <button class="rbtn big" data-view="side" title="Side on: the flow runs left to right">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><g stroke="#3d5a80" stroke-width="1.1" stroke-linejoin="round"><path d="M6 13h14v14H6z" fill="#eef2f8"/><path d="M6 13l6-6h14l-6 6z" fill="#f4f7fb"/><path d="M20 13l6-6v14l-6 6z" fill="#3f7fd0"/></g></svg>
+          <span>Side</span></button>
+        <button class="rbtn big" data-view="top" title="From above: the flow runs left to right">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><g stroke="#3d5a80" stroke-width="1.1" stroke-linejoin="round"><path d="M6 13h14v14H6z" fill="#eef2f8"/><path d="M6 13l6-6h14l-6 6z" fill="#3f7fd0"/><path d="M20 13l6-6v14l-6 6z" fill="#e3eaf3"/></g></svg>
+          <span>Top</span></button>
+        <div class="rstack">
+          <button class="rbtn small" id="zoomInBtn" title="Zoom in (or use the mouse wheel)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.6" fill="#e8f2fd" stroke="#3d5a80" stroke-width="1.3"/><path d="M10 10l4.2 4.2" stroke="#3d5a80" stroke-width="2" stroke-linecap="round"/><path d="M4.3 6.5h4.4M6.5 4.3v4.4" stroke="#2b62b0" stroke-width="1.3"/></svg>
+            <span>Zoom in</span></button>
+          <button class="rbtn small" id="zoomOutBtn" title="Zoom out (or use the mouse wheel)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.6" fill="#e8f2fd" stroke="#3d5a80" stroke-width="1.3"/><path d="M10 10l4.2 4.2" stroke="#3d5a80" stroke-width="2" stroke-linecap="round"/><path d="M4.3 6.5h4.4" stroke="#2b62b0" stroke-width="1.3"/></svg>
+            <span>Zoom out</span></button>
+          <button class="rbtn small" id="resetBtn" title="Fit the whole tunnel in the view">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 5V1.5H5M11 1.5h3.5V5M14.5 11v3.5H11M5 14.5H1.5V11" fill="none" stroke="#3d5a80" stroke-width="1.3"/><rect x="5" y="5" width="6" height="6" fill="#8db8ea" stroke="#2b62b0"/></svg>
+            <span>Fit</span></button>
         </div>
       </div>
-      <div class="card">
-        <h2>Convergence <span class="sp"></span>
-          <span style="font-size:11px;color:var(--muted);text-transform:none;letter-spacing:0">
-            <i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--cd);vertical-align:-1px"></i> C<sub>d</sub>&nbsp;&nbsp;
-            <i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--cl);vertical-align:-1px"></i> C<sub>l</sub></span></h2>
-        <div class="fill"><svg class="chart" id="chart" role="img" aria-label="Drag and lift coefficient against step"></svg></div>
+      <div class="rlabel">View</div>
+    </div>
+    <div class="rgroup" role="group" aria-label="Smoke">
+      <div class="rbtns">
+        <button class="rbtn big" id="animBtn" title="Freeze or resume the smoke">
+          <svg class="ic-pause" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="gAnim" x2="0" y2="1"><stop offset="0" stop-color="#7cb7f0"/><stop offset="1" stop-color="#2463b5"/></linearGradient></defs><circle cx="16" cy="16" r="13.5" fill="url(#gAnim)" stroke="#1d4f91"/><rect x="11.2" y="10" width="3.5" height="12" rx=".8" fill="#fff"/><rect x="17.3" y="10" width="3.5" height="12" rx=".8" fill="#fff"/></svg>
+          <svg class="ic-play" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13.5" fill="url(#gAnim)" stroke="#1d4f91"/><path d="M13 9.8v12.4l9.8-6.2z" fill="#fff"/></svg>
+          <span id="animLbl">Pause</span></button>
+        <button class="rbtn big" id="restartBtn" title="Clear the smoke and let it in again from the inlet">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13.5" fill="url(#gAnim)" stroke="#1d4f91"/><rect x="10" y="10" width="2.8" height="12" rx=".7" fill="#fff"/><path d="M22.6 9.8v12.4L13.4 16z" fill="#fff"/></svg>
+          <span>Restart</span></button>
       </div>
+      <div class="rlabel">Smoke</div>
     </div>
+    <div class="rgroup" role="group" aria-label="Export">
+      <div class="rbtns">
+        <div class="rstack">
+          <button class="rbtn small" id="saveImgBtn" disabled title="Save the view as a PNG">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="#eaf3fd" stroke="#3d5a80"/><path d="M2.3 12.7l4.2-4.7 3 3 2-2 2.2 3.7z" fill="#4f8fdc"/><circle cx="11" cy="5.8" r="1.4" fill="#e8a33c"/></svg>
+            <span>Save image</span></button>
+          <button class="rbtn small" id="saveCsvBtn" disabled title="The drag and lift history, one row per sample">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" rx="1" fill="#fff" stroke="#2f7a3a"/><path d="M2 2h12v3.5H2z" fill="#bfe3c4"/><path d="M1.5 5.5h13M1.5 9.5h13M6 1.5v13" stroke="#2f7a3a"/></svg>
+            <span>History (CSV)</span></button>
+          <button class="rbtn small" id="saveJsonBtn" disabled title="Case, coefficients, checks and history">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 1.5h6l3 3v10h-9z" fill="#fff" stroke="#3d5a80"/><path d="M9.5 1.5v3h3" fill="none" stroke="#3d5a80"/><path d="M7 7.2c-1 0-1 .4-1 1.2s-.3 1-.9 1c.6 0 .9.2.9 1s0 1.2 1 1.2M9 7.2c1 0 1 .4 1 1.2s.3 1 .9 1c-.6 0-.9.2-.9 1s0 1.2-1 1.2" fill="none" stroke="#2b62b0" stroke-width=".9"/></svg>
+            <span>Results (JSON)</span></button>
+        </div>
+      </div>
+      <div class="rlabel">Export</div>
+    </div>
+  </div>
+</nav>
 
-    <div class="botrow">
-      <div class="card"><h2>Velocity</h2><figure id="fig_speed"><span class="empty">—</span></figure></div>
-      <div class="card"><h2>Vorticity</h2><figure id="fig_vorticity"><span class="empty">—</span></figure></div>
-      <div class="card"><h2>Pressure</h2><figure id="fig_pressure"><span class="empty">—</span></figure></div>
-    </div>
-  </main>
+<div class="work">
+  <div class="col left">
+    <section class="pane case" aria-labelledby="caseHead">
+      <h2 class="phead" id="caseHead">Case Properties</h2>
+      <div class="pbody pg" id="props">
+        <details open><summary>Geometry</summary>
+          <div class="prow" data-desc="2D solves a plane (D2Q9 lattice); 3D solves a volume (D3Q19 or D3Q27), at roughly Nz times the cost per step.">
+            <label for="mode">Mode</label><div class="pv"><select id="mode"><option value="2d">2D</option><option value="3d">3D</option></select></div></div>
+          <div class="prow" data-desc="The body in the tunnel. Its size is set below, in lattice cells.">
+            <label for="shape">Shape</label><div class="pv"><select id="shape"></select></div></div>
+          <div id="dimRow"></div>
+        </details>
+        <details open><summary>Flow</summary>
+          <div class="prow" data-desc="Re = U∞·D/ν. Together with u₀ and the body size it sets the viscosity, and so the relaxation rate ω; the solver refuses cases too close to ω = 2.">
+            <label for="re">Reynolds number</label><div class="pv"><input id="re" type="number" value="100" min="0.1" step="10"></div></div>
+          <div class="prow" data-desc="Inlet speed in lattice units. Lower is closer to incompressible but needs more steps for the same flow time; stay at or below 0.1.">
+            <label for="u0">Inlet u₀</label><div class="pv"><input id="u0" type="number" value="0.05" min="0.001" max="0.2" step="0.01"><span class="u">lu/step</span></div></div>
+          <div class="prow" id="pertRow" data-desc="">
+            <label for="inlet_perturbation">Inlet perturbation</label><div class="pv"><input id="inlet_perturbation" type="number" value="0.02" min="0" max="0.5" step="0.01"><span class="u">× u₀</span></div></div>
+        </details>
+        <details open><summary>Tunnel grid</summary>
+          <div id="gridRow"></div>
+        </details>
+        <details open><summary>Solver</summary>
+          <div class="prow" data-desc="How each cell relaxes toward equilibrium. BGK is the simplest; regularized, TRT and MRT stay stable closer to ω = 2 (fine grids, higher Re).">
+            <label for="collision">Collision</label><div class="pv"><select id="collision"></select></div></div>
+          <div class="prow" id="latticeRow" hidden data-desc="D3Q19 is the usual choice; D3Q27 is more isotropic, at about 40% more work per cell.">
+            <label for="lattice">Lattice</label><div class="pv"><select id="lattice"></select></div></div>
+          <div class="prow" data-desc="numba compiles the kernels for this CPU; numpy is the portable fallback; auto picks the fastest one available.">
+            <label for="backend">Backend</label><div class="pv"><select id="backend"></select></div></div>
+          <div class="prow" data-desc="Time steps to run. The free stream crosses the tunnel in about Nx / u₀ steps, and the averages come from the second half of the run.">
+            <label for="steps">Steps</label><div class="pv"><input id="steps" type="number" value="3000" min="50" step="500"></div></div>
+          <div class="prow" data-desc="Smagorinsky subgrid model: adds eddy viscosity where the resolved shear is strong. For under-resolved, high-Re runs.">
+            <label for="les">Smagorinsky LES</label><div class="pv"><input type="checkbox" id="les"></div></div>
+        </details>
+        <details open><summary>Boundaries</summary>
+          <div class="prow" data-desc="The tunnel's side walls. slip: frictionless, so no boundary layers grow on them; noslip: solid walls with boundary layers.">
+            <label for="wall_bc">Wall</label><div class="pv"><select id="wall_bc"></select></div></div>
+          <div class="prow" data-desc="How flow leaves the tunnel. convective carries vortices out with little reflection; zerogradient copies the last interior column.">
+            <label for="outlet_bc">Outlet</label><div class="pv"><select id="outlet_bc"></select></div></div>
+        </details>
+      </div>
+      <div class="pdesc" aria-live="polite"><b id="descName">Case Properties</b><span id="descText">Select a property to see what it does.</span></div>
+    </section>
+  </div>
+
+  <div class="col center">
+    <section class="pane view" aria-label="Wind tunnel">
+      <div class="doctabs" id="qtySeg" role="tablist" aria-label="Quantity shown">
+        <button class="dtab on" data-q="smoke" role="tab" aria-selected="true" title="Dye released upstream and carried through the computed velocity field, coloured by how much the body disturbs the flow">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.2 12.5h8a2.6 2.6 0 0 0 .4-5.2 3.7 3.7 0 0 0-7.1-1A3.1 3.1 0 0 0 4.2 12.5z" fill="#dbe2f1" stroke="#5a6e93"/></svg>Smoke</button>
+        <button class="dtab" data-q="wake" role="tab" aria-selected="false" title="How much the body disturbs the flow, |u − U∞|: clear in the free stream, a plume in the wake">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="4" cy="8" r="2.4" fill="#9aa8bb" stroke="#56667d"/><path d="M7 5.4c2 0 2.5 1.1 4 1.1s1.8-.7 3-.7M7 10.6c2 0 2.5-1.1 4-1.1s1.8.7 3 .7M7.4 8h6.6" fill="none" stroke="#2f7fd8" stroke-width="1.2" stroke-linecap="round"/></svg>Wake</button>
+        <button class="dtab" data-q="vorticity" role="tab" aria-selected="false" title="How fast the flow spins, |∇×u|: boundary layers, shear layers and vortices">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 8.2c0-.9 1.4-.9 1.4.2 0 1.4-2 1.9-3 .7-1.4-1.6.1-4 2.2-3.8 2.6.3 3.6 3.2 2.1 5.2-1.8 2.4-5.8 2.1-7-.6" fill="none" stroke="#d0442f" stroke-width="1.3" stroke-linecap="round"/></svg>Vorticity</button>
+      </div>
+      <div class="viewer">
+        <canvas id="tunnel"></canvas>
+        <div class="empty" id="tunnelEmpty">The flow appears once a run starts</div>
+      </div>
+      <div class="cmap">
+        <span class="cm-name" id="lgName">smoke · |u − U∞|</span>
+        <div class="cm-scale"><i id="lgBar"></i><div class="cm-ticks" id="lgTicks"></div></div>
+        <span id="lgUnit"></span>
+        <span class="hint" id="viewHint">drag to rotate · wheel to zoom</span>
+      </div>
+    </section>
+    <section class="pane res" aria-labelledby="resHead">
+      <h2 class="phead" id="resHead">Results</h2>
+      <div class="pbody resbody">
+        <div id="errBox" hidden class="err"></div>
+        <div class="pg" id="stats"><div class="pempty">No results yet — set up a case and press Run.</div></div>
+        <div class="pg" id="checks" hidden></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="col right">
+    <section class="pane" aria-label="Convergence">
+      <h2 class="phead">Convergence<span class="sp"></span><span class="aux mono" id="chartRead"></span></h2>
+      <div class="pbody chartbox"><svg class="chart" id="chart" role="img" aria-label="Drag and lift coefficient against step"></svg></div>
+    </section>
+    <section class="pane"><h2 class="phead">Velocity</h2><figure id="fig_speed"><span class="empty">—</span></figure></section>
+    <section class="pane"><h2 class="phead">Vorticity</h2><figure id="fig_vorticity"><span class="empty">—</span></figure></section>
+    <section class="pane"><h2 class="phead">Pressure</h2><figure id="fig_pressure"><span class="empty">—</span></figure></section>
+  </div>
+</div>
+
+<footer class="statusbar">
+  <span class="sb"><span class="dot" id="dot"></span><span class="t" id="statusText">Ready</span></span>
+  <span class="sb"><span class="bar" role="progressbar" aria-label="Run progress"><i id="bar"></i></span><span class="mono" id="pct">0%</span></span>
+  <span class="sb mono" id="elapsed">0.0 s</span>
+  <span class="sb mono setup" id="setupPill">no run yet</span>
+</footer>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
-let schema = null, jobId = null, poll = null;
+let schema = null, jobId = null, poll = null, lastStatus = null;
 let lastState = "", figStamp = -1, fieldStamp = -1, formSynced = false, geomLoaded = false;
 
 // ---------------------------------------------------------------- form ----
@@ -224,17 +364,35 @@ const DIMS = {
   "3d:cylinder":  [["radius","Radius",8],["length","Span length",24]],
 };
 const GRIDS = {"2d":[["nx","Nx",400],["ny","Ny",200]], "3d":[["nx","Nx",96],["ny","Ny",48],["nz","Nz",48]]};
+const DESC = {
+  radius: "Body radius in cells. Resolution is what matters most: below about 8 cells across, the boundary layer spans barely a cell and Cd reads high.",
+  width: "Body width (streamwise), in cells.",
+  height: "Body height (cross-stream), in cells. This is the reference length D.",
+  depth: "Body depth (spanwise), in cells.",
+  length: "Length of the cylinder along the span, in cells.",
+  nx: "Tunnel length, streamwise, in cells. The body sits a third of the way along; the wake needs room behind it.",
+  ny: "Tunnel height, in cells. The body's share of it (blockage) raises Cd: the checks under Results say by how much.",
+  nz: "Tunnel width, spanwise, in cells.",
+};
 function fill(sel, items){ sel.innerHTML = items.map(v=>`<option value="${v}">${v}</option>`).join(""); }
 function inputs(host, defs){
   host.innerHTML = defs.map(([id,lab,val]) =>
-    `<div><label for="${id}">${lab}</label><input id="${id}" type="number" value="${val}" step="1" min="1"></div>`).join("");
+    `<div class="prow" data-desc="${esc(DESC[id] || "")}"><label for="${id}">${lab}</label>`
+    + `<div class="pv"><input id="${id}" type="number" value="${val}" step="1" min="1"><span class="u">cells</span></div></div>`).join("");
 }
+// The property grid's description box follows the property being edited.
+let described = null;
+function describe(row){
+  described = row;
+  $("#descName").textContent = row ? row.querySelector("label").textContent : "Case Properties";
+  $("#descText").textContent = row ? row.dataset.desc : "Select a property to see what it does.";
+}
+$("#props").addEventListener("focusin", e => { const r = e.target.closest(".prow"); if(r) describe(r); });
 function syncShape(){
   const mode = $("#mode").value;
   fill($("#shape"), mode === "2d" ? schema.shapes_2d : schema.shapes_3d);
   $("#latticeRow").hidden = mode !== "3d";
   inputs($("#gridRow"), GRIDS[mode]);
-  $("#gridRow").className = "row " + (mode === "3d" ? "three" : "");
   // A sphere's wake is steady until Re ≈ 210 and sheds only above ≈ 270, so a
   // perturbation tuned for the 2D cylinder (onset 47) just forces noise into Cd.
   $("#inlet_perturbation").value = mode === "3d" ? "0" : "0.02";
@@ -242,9 +400,11 @@ function syncShape(){
   // BGK goes unstable (the default sphere diverges in ~300 steps); the
   // regularized operator is stable there at the same cost.
   $("#collision").value = mode === "3d" ? "regularized" : "bgk";
-  $("#pertHint").textContent = mode === "3d"
-    ? "Only needed to trip shedding: a sphere's wake is steady below Re ≈ 210 and sheds above ≈ 270. Leave at 0 below that — it adds noise, not physics."
-    : "A small perturbation is what trips vortex shedding above Re ≈ 47.";
+  $("#pertRow").dataset.desc = mode === "3d"
+    ? "Random inlet noise, as a fraction of u₀. Only needed to trip shedding: a sphere's wake is steady below Re ≈ 210 and sheds above ≈ 270. Leave at 0 below that — it adds noise, not physics."
+    : "Random inlet noise, as a fraction of u₀. A small perturbation is what trips vortex shedding above Re ≈ 47.";
+  if(described && !described.isConnected) described = null;
+  describe(described);
   syncDims();
 }
 function syncDims(){ inputs($("#dimRow"), DIMS[$("#mode").value + ":" + $("#shape").value] || []); }
@@ -271,7 +431,8 @@ async function boot(){
   if(/^[a-f0-9]{6,32}$/.test(fromUrl) && (await fetch(`/api/status?id=${fromUrl}`)).ok) attach(fromUrl);
 }
 $("#runBtn").addEventListener("click", async () => {
-  $("#errBox").hidden = true; $("#stats").innerHTML = ""; $("#checks").hidden = true;
+  $("#errBox").hidden = true; $("#checks").hidden = true;
+  $("#stats").innerHTML = '<div class="pempty">Waiting for the first samples…</div>';
   for(const k of ["speed","vorticity","pressure"]) $("#fig_"+k).innerHTML = '<span class="empty">rendering…</span>';
   formSynced = true;
   const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(params())});
@@ -279,6 +440,31 @@ $("#runBtn").addEventListener("click", async () => {
 });
 $("#stopBtn").addEventListener("click", async () => {
   if(jobId) await fetch("/api/stop", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({id: jobId})});
+});
+
+// -------------------------------------------------------------- export ----
+function download(name, href){
+  const a = document.createElement("a"); a.href = href; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+function downloadText(name, text, type){
+  const url = URL.createObjectURL(new Blob([text], {type}));
+  download(name, url); setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function caseName(){
+  const s = lastStatus && lastStatus.result && lastStatus.result.setup;
+  return (s ? s.label : "aero").replace(/[^A-Za-z0-9.=-]+/g, "_");
+}
+$("#saveImgBtn").addEventListener("click", () => download(`${caseName()}_${tunnel.quantity()}.png`, tunnel.snapshot()));
+$("#saveCsvBtn").addEventListener("click", () => {
+  const cell = v => (v === null || v === undefined) ? "" : v;
+  const rows = (lastStatus.history || []).map(d => `${d.step},${cell(d.cd)},${cell(d.cl)}`);
+  downloadText(`${caseName()}_history.csv`, ["step,Cd,Cl", ...rows].join("\n") + "\n", "text/csv");
+});
+$("#saveJsonBtn").addEventListener("click", () => {
+  const j = lastStatus;
+  const out = {params: j.params, state: j.state, step: j.step, elapsed_s: j.elapsed, result: j.result, history: j.history};
+  downloadText(`${caseName()}_results.json`, JSON.stringify(out, null, 2), "application/json");
 });
 
 // ------------------------------------------------------------- polling ----
@@ -299,11 +485,13 @@ async function tick(){
   let j; try { j = await (await fetch(`/api/status?id=${jobId}`)).json(); }
   catch(e){ console.error("status poll failed:", e); $("#statusText").textContent = "lost contact with the server — is webui.py still running?"; return; }
   if(j.error && !j.state) return;
-  lastState = j.state;
+  lastState = j.state; lastStatus = j;
   $("#dot").className = "dot " + j.state;
   $("#statusText").textContent = j.message || j.state;
-  $("#elapsed").textContent = j.elapsed ? j.elapsed.toFixed(1) + " s" : "";
-  $("#bar").style.width = j.total ? (100 * j.step / j.total).toFixed(1) + "%" : "0%";
+  $("#elapsed").textContent = (j.elapsed || 0).toFixed(1) + " s";
+  const pct = j.total ? 100 * j.step / j.total : 0;
+  $("#bar").style.width = pct.toFixed(1) + "%"; $("#pct").textContent = pct.toFixed(0) + "%";
+  $("#saveCsvBtn").disabled = $("#saveJsonBtn").disabled = !(j.history && j.history.length);
 
   if(!formSynced && j.params){
     formSynced = true;
@@ -316,25 +504,30 @@ async function tick(){
     }
   }
   const s = j.result.setup;
-  if(s) $("#setupPill").textContent = `${s.label} · ${s.grid.join("×")} · ω=${s.omega} · ν=${s.nu}`
+  if(s){
+    const setup = `${s.label} · ${s.grid.join("×")} · ω=${s.omega} · ν=${s.nu}`
       + (s.ref_area ? ` · A=${s.ref_area}` : "") + (s.backend ? ` · ${s.backend}` : "");
+    $("#setupPill").textContent = setup; $("#setupPill").title = setup;
+    document.title = $("#winTitle").textContent = `${s.label} — Aero CFD`;
+  }
   if(j.state === "error"){ $("#errBox").hidden = false; $("#errBox").textContent = j.error || "the run failed"; }
 
-  drawChart(j.history);
+  drawChart(j.history, j.result.coefficients);
   const c = j.result.coefficients;
   const f4 = v => (v === null || v === undefined) ? "—" : v.toFixed(4);
-  if(c) $("#stats").innerHTML = `
-    <div class="stat" title="± is the 95% statistical uncertainty of the mean, from ${c.cd_n_eff ?? "?"} effective independent samples. It does not include systematic errors such as blockage or resolution — see the checks below."><span class="k">C_d · 95% stat.</span><span class="v">${f4(c.cd)}<small> ±${f4(c.cd_sem95)}</small></span></div>
-    <div class="stat" title="Standard deviation of the per-step drag signal: how much it fluctuates, not how uncertain the mean is."><span class="k">C_d fluctuation σ</span><span class="v">${f4(c.cd_std)}</span></div>
-    <div class="stat"><span class="k">C_l · 95% stat.</span><span class="v">${f4(c.cl)}<small> ±${f4(c.cl_sem95)}</small></span></div>
-    <div class="stat"><span class="k">Steps</span><span class="v">${j.step.toLocaleString()}</span></div>
-    <div class="stat"><span class="k">Cells</span><span class="v">${(s ? s.cells : 0).toLocaleString()}</span></div>`;
+  // (the label's text sits in its own span: a flex item trims the space after <sub>)
+  const row = (k, v, tip) => `<div class="prow"${tip ? ` title="${esc(tip)}"` : ""}><span class="pl"><span>${k}</span></span><span class="pv num">${v}</span></div>`;
+  if(c) $("#stats").innerHTML = '<div class="pcat">Coefficients · mean ± 95%</div>'
+    + row("C<sub>d</sub>", `${f4(c.cd)}<small>± ${f4(c.cd_sem95)}</small>`,
+          `± is the 95% statistical uncertainty of the mean, from ${c.cd_n_eff ?? "?"} effective independent samples. It does not include systematic errors such as blockage or resolution — see the checks below.`)
+    + row("C<sub>d</sub> fluctuation σ", f4(c.cd_std), "Standard deviation of the per-step drag signal: how much it fluctuates, not how uncertain the mean is.")
+    + row("C<sub>l</sub>", `${f4(c.cl)}<small>± ${f4(c.cl_sem95)}</small>`);
 
   renderChecks(j.result);
 
   if(j.has_geometry && !geomLoaded){
     const g = await fetchPacked(`/api/geometry?id=${jobId}`);
-    if(g){ tunnel.setGeometry(g); geomLoaded = true; }
+    if(g){ tunnel.setGeometry(g); geomLoaded = true; $("#saveImgBtn").disabled = false; }
   }
   if(j.field_step !== fieldStamp && j.field_step >= 0){
     const f = await fetchPacked(`/api/field?id=${jobId}`);
@@ -356,56 +549,156 @@ async function tick(){
 
 // -------------------------------------------------------------- checks ----
 // The uncertainty budget: a statistical ± can never cover a systematic bias,
-// so each systematic effect gets its own chip, and the expected value for the
-// run *as configured* (confinement included) sits first.
+// so each systematic effect gets its own row, and the expected value for the
+// run *as configured* (confinement included) sits first.  Status is carried
+// by the icon's shape as well as its colour.
 const CHECK_ORDER = ["statistical", "blockage", "domain_length", "discretization", "bc_sensitivity", "convergence"];
+const STATUS_ICON = {
+  pass: '<svg viewBox="0 0 14 14" aria-label="pass"><circle cx="7" cy="7" r="6.5" fill="#2c8a3c"/><path d="M4 7.3l2 2 4-4.5" fill="none" stroke="#fff" stroke-width="1.6"/></svg>',
+  warn: '<svg viewBox="0 0 14 14" aria-label="warning"><path d="M7 1l6.3 11.4H.7z" fill="#e3a008" stroke="#a86f00" stroke-width=".8" stroke-linejoin="round"/><path d="M7 4.8v3.8" stroke="#fff" stroke-width="1.6"/><circle cx="7" cy="10.4" r=".9" fill="#fff"/></svg>',
+  fail: '<svg viewBox="0 0 14 14" aria-label="fail"><circle cx="7" cy="7" r="6.5" fill="#c42b1c"/><path d="M4.6 4.6l4.8 4.8m0-4.8l-4.8 4.8" stroke="#fff" stroke-width="1.6"/></svg>',
+  info: '<svg viewBox="0 0 14 14" aria-label="note"><circle cx="7" cy="7" r="6.5" fill="#3a78c9"/><path d="M7 6v4.4" stroke="#fff" stroke-width="1.6"/><circle cx="7" cy="4" r=".95" fill="#fff"/></svg>',
+};
 function esc(t){ return String(t).replace(/[&<>"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch])); }
 function renderChecks(res){
   const box = $("#checks"), u = res.uncertainty, r = res.reference;
   if(!u && !r){ box.hidden = true; return; }
-  let html = "";
+  let html = '<div class="pcat">Checks</div>';
   if(r){
-    const exp = r.expected != null ? `expected ≈ ${r.expected.toFixed(2)}` : "literature";
+    const exp = r.expected != null ? `Expected C<sub>d</sub> ≈ ${r.expected.toFixed(2)}` : "Literature value";
     const band = r.band ? ` [${r.band[0].toFixed(2)}–${r.band[1].toFixed(2)}]` : "";
     const un = r.unconfined != null ? ` · unconfined ${r.unconfined.toFixed(2)}` : "";
-    html += `<span class="chip ref ${r.status || ""}" title="${esc(r.note || "")}"><i></i>${exp}${band}${un}</span>`;
+    html += `<div class="crow ref" title="${esc(r.note || "")}">${STATUS_ICON[r.status] || STATUS_ICON.info}<span>${exp}${band}${un}</span></div>`;
   }
   for(const name of CHECK_ORDER){
     const c = u && u[name]; if(!c) continue;
-    html += `<span class="chip ${c.status}" title="${esc(c.message)}"><i></i>${esc(c.short || name)}</span>`;
+    html += `<div class="crow" title="${esc(c.message)}">${STATUS_ICON[c.status] || STATUS_ICON.info}<span>${esc(c.short || name)}</span></div>`;
   }
   box.innerHTML = html; box.hidden = false;
 }
 
 // --------------------------------------------------------------- chart ----
-function drawChart(hist){
-  const svg = $("#chart");
-  const W = Math.max(svg.clientWidth, 200), H = Math.max(svg.clientHeight, 120);
-  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-  const L = 50, R = 12, T = 10, B = 26;
-  if(!hist || hist.length < 2){
-    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="#6E7A66" font-size="12">no samples yet</text>`; return;
-  }
-  const xs = hist.map(d=>d.step);
-  const all = hist.flatMap(d=>[d.cd, d.cl]).filter(Number.isFinite);
-  let lo = Math.min(...all), hi = Math.max(...all);
-  if(hi - lo < 1e-9){ hi += 0.5; lo -= 0.5; }
-  const pad = (hi - lo) * 0.1; lo -= pad; hi += pad;
-  const X = v => L + (W-L-R) * (v - xs[0]) / Math.max(xs[xs.length-1] - xs[0], 1);
-  const Y = v => T + (H-T-B) * (1 - (v - lo) / (hi - lo));
-  const path = k => hist.filter(d=>Number.isFinite(d[k])).map((d,i)=>`${i?"L":"M"}${X(d.step).toFixed(1)} ${Y(d[k]).toFixed(1)}`).join(" ");
-  let g = "";
-  for(let i=0;i<=4;i++){ const v = lo + (hi-lo)*i/4, y = Y(v);
-    g += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}" stroke="#DED5BC"/>`
-       + `<text x="${L-7}" y="${(y+4).toFixed(1)}" text-anchor="end" font-size="10" fill="#6E7A66" font-family="ui-monospace,monospace">${v.toFixed(2)}</text>`; }
-  for(let i=0;i<=3;i++){ const v = xs[0] + (xs[xs.length-1]-xs[0])*i/3;
-    g += `<text x="${X(v).toFixed(1)}" y="${H-8}" text-anchor="middle" font-size="10" fill="#6E7A66" font-family="ui-monospace,monospace">${Math.round(v).toLocaleString()}</text>`; }
-  svg.innerHTML = g + `<path d="${path("cl")}" fill="none" stroke="#5B21B6" stroke-width="1.5"/>`
-                    + `<path d="${path("cd")}" fill="none" stroke="#127A38" stroke-width="2"/>`;
+// Cd above, Cl below, on a shared step axis: small multiples rather than one
+// axis, because the two differ in size (Cd ~ 1, Cl ~ 0 +- a little) and one
+// scale flattens whichever is smaller.  Each range ignores the first 15% of
+// the run, where the start-up transient can be ten times the settled value;
+// the transient runs off the top or bottom instead, as do the odd spikes
+// (the range spans the 5th to 95th percentile).  The shaded band is the second
+// half of the run, which is what the reported means average over; once the
+// run is done the mean and its 95% interval are drawn across it.
+const SERIES = [{k: "cd", sub: "d", color: "#1f5fbf", width: 1.8, share: 0.56},
+                {k: "cl", sub: "l", color: "#d9730d", width: 1.5, share: 0.44}];
+let lastHist = [], lastCoef = null, chartGeom = null, chartHovering = false;
+const CHART_NOTE = "shaded: averaging window";
+function niceTicks(lo, hi, n){
+  const raw = (hi - lo) / Math.max(n, 1), mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(v => v >= raw * 0.999);
+  const dec = Math.min(6, (String(+step.toPrecision(6)).split(".")[1] || "").length);
+  const ticks = [];
+  for(let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + step * 1e-9; v += step) ticks.push(v);
+  return {ticks, fmt: v => (Math.abs(v) < step * 1e-6 ? 0 : v).toFixed(dec)};
 }
-let lastHist = [];
-new ResizeObserver(() => drawChart(lastHist)).observe($("#chart"));
-const _drawChart = drawChart; drawChart = h => { lastHist = h || []; _drawChart(lastHist); };
+function drawChart(samples, coef){
+  lastHist = samples || []; lastCoef = coef || null;
+  const svg = $("#chart");
+  const W = Math.max(svg.clientWidth, 200), H = Math.max(svg.clientHeight, 90);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  chartGeom = null;
+  const hist = lastHist.filter(d => Number.isFinite(d.step));
+  if(hist.length < 2){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="#66788f" font-size="12">no samples yet</text>`;
+    $("#chartRead").textContent = ""; return;
+  }
+  const L = 46, R = 10, T = 3, B = 17, GAP = 6;
+  const end = hist[hist.length - 1].step, X = v => L + (W - L - R) * v / Math.max(end, 1);
+  const win = end / 2, settle = 0.2 * end, plotH = H - T - B - GAP;
+  const xt = niceTicks(0, end, Math.max(2, Math.floor((W - L - R) / 72)));
+  let out = "", top = T;
+  const panels = [];
+  for(const sr of SERIES){
+    const h = Math.round(plotH * sr.share), y0 = top, y1 = top + h;
+    top = y1 + GAP;
+    const pts = hist.filter(d => Number.isFinite(d[sr.k]));
+    out += `<rect x="${L}" y="${y0}" width="${W - L - R}" height="${h}" fill="#fff"/>`
+         + `<rect x="${X(win).toFixed(1)}" y="${y0}" width="${(X(end) - X(win)).toFixed(1)}" height="${h}" fill="#eef3fa"/>`;
+    for(const v of xt.ticks) out += `<line x1="${X(v).toFixed(1)}" x2="${X(v).toFixed(1)}" y1="${y0}" y2="${y1}" stroke="#eef1f5"/>`;
+    const mean = coef ? coef[sr.k] : null, ci = coef ? coef[sr.k + "_sem95"] : null;
+    let Y = null;
+    if(pts.length){
+      const settled = pts.filter(d => d.step >= settle);
+      const vals = (settled.length >= 3 ? settled : pts).map(d => d[sr.k]).sort((a, b) => a - b);
+      const q = f => vals[Math.round(f * (vals.length - 1))];
+      let lo = q(0.05), hi = q(0.95);
+      if(Number.isFinite(mean)){ lo = Math.min(lo, mean - (ci || 0)); hi = Math.max(hi, mean + (ci || 0)); }
+      const mid = (lo + hi) / 2, half = Math.max(0.62 * (hi - lo), 0.01 * Math.abs(mid), 1e-3);
+      lo = mid - half; hi = mid + half;
+      Y = v => y1 - h * (v - lo) / (hi - lo);
+      const yt = niceTicks(lo, hi, h >= 70 ? 3 : 2);
+      for(const v of yt.ticks){
+        const y = Y(v).toFixed(1);
+        out += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}" stroke="#e3e9f1"/>`
+             + `<text class="tk" x="${L - 5}" y="${(+y + 3.5).toFixed(1)}" text-anchor="end">${yt.fmt(v)}</text>`;
+      }
+      out += `<clipPath id="clip_${sr.k}"><rect x="${L}" y="${y0}" width="${W - L - R}" height="${h}"/></clipPath><g clip-path="url(#clip_${sr.k})">`;
+      if(Number.isFinite(mean)){
+        const yb = Y(mean + (ci || 0)), band = Math.max(Y(mean - (ci || 0)) - yb, 1);
+        out += `<rect x="${X(win).toFixed(1)}" y="${yb.toFixed(1)}" width="${(X(end) - X(win)).toFixed(1)}" height="${band.toFixed(1)}" fill="${sr.color}" fill-opacity=".16"/>`
+             + `<line x1="${X(win).toFixed(1)}" x2="${X(end).toFixed(1)}" y1="${Y(mean).toFixed(1)}" y2="${Y(mean).toFixed(1)}" stroke="#1b2a3d" stroke-width="1" stroke-dasharray="4 3"/>`;
+      }
+      out += `<path d="${pts.map((d, i) => `${i ? "L" : "M"}${X(d.step).toFixed(1)} ${Y(d[sr.k]).toFixed(1)}`).join(" ")}" fill="none" stroke="${sr.color}" stroke-width="${sr.width}" stroke-linejoin="round"/></g>`;
+      if(Number.isFinite(mean) && X(end) - X(win) > 90){
+        const ym = Y(mean), above = ym - y0 > 16;
+        out += `<text class="lb" x="${(X(end) - 5).toFixed(1)}" y="${(above ? ym - 5 : ym + 13).toFixed(1)}" text-anchor="end">mean ${mean.toFixed(4)} ± ${(ci || 0).toFixed(4)}</text>`;
+      }
+    } else {
+      out += `<text class="tk" x="${(L + W - R) / 2}" y="${(y0 + y1) / 2 + 4}" text-anchor="middle">no data</text>`;
+    }
+    out += `<rect x="${L}" y="${y0}" width="${W - L - R}" height="${h}" fill="none" stroke="#c9d4e2"/>`
+         + `<text class="nm" x="${L + 6}" y="${y0 + 13}">C<tspan dy="3" font-size="8.5">${sr.sub}</tspan></text>`;
+    panels.push({k: sr.k, Y, y0, y1});
+  }
+  for(const v of xt.ticks){
+    if(v === 0) continue;                                   // "step" stands there
+    const x = X(v), anchor = x > W - R - 18 ? "end" : "middle";
+    out += `<text class="tk" x="${x.toFixed(1)}" y="${H - 4}" text-anchor="${anchor}">${Math.round(v).toLocaleString()}</text>`;
+  }
+  out += `<text class="tk" x="${L - 5}" y="${H - 4}" text-anchor="end">step</text>`;
+  svg.innerHTML = `<style>.tk{font:10px Consolas,ui-monospace,monospace;fill:#5d6f88}`
+    + `.lb{font:10.5px "Segoe UI",system-ui,sans-serif;fill:#3e5372;paint-order:stroke;stroke:#fff;stroke-width:3px}`
+    + `.nm{font:600 11.5px "Segoe UI",system-ui,sans-serif;fill:#1b2a3d;paint-order:stroke;stroke:#fff;stroke-width:3px}</style>`
+    + out
+    + `<g id="chartHover" display="none"><line y1="${T}" y2="${H - B}" stroke="#7d8ca2" stroke-dasharray="3 3"/>`
+    + SERIES.map(sr => `<circle r="4" fill="${sr.color}" stroke="#fff" stroke-width="2"/>`).join("") + `</g>`;
+  chartGeom = {W, X, panels, hist};
+  if(!chartHovering) $("#chartRead").textContent = CHART_NOTE;
+}
+function chartHover(e){
+  const svg = $("#chart"), hov = $("#chartHover");
+  if(!chartGeom || !hov) return;
+  chartHovering = true;
+  const {W, X, panels, hist} = chartGeom, box = svg.getBoundingClientRect();
+  const px = (e.clientX - box.left) * W / box.width;
+  let i = 0;
+  for(let k = 1; k < hist.length; k++) if(Math.abs(X(hist[k].step) - px) < Math.abs(X(hist[i].step) - px)) i = k;
+  const d = hist[i], x = X(d.step).toFixed(1);
+  const [line, ...dots] = hov.children;
+  line.setAttribute("x1", x); line.setAttribute("x2", x);
+  panels.forEach((p, n) => {
+    const v = d[p.k], show = p.Y && Number.isFinite(v) && p.Y(v) >= p.y0 && p.Y(v) <= p.y1;
+    dots[n].setAttribute("display", show ? "inline" : "none");
+    if(show){ dots[n].setAttribute("cx", x); dots[n].setAttribute("cy", p.Y(v).toFixed(1)); }
+  });
+  hov.setAttribute("display", "inline");
+  const f = v => Number.isFinite(v) ? v.toFixed(4) : "—";
+  $("#chartRead").textContent = `step ${d.step.toLocaleString()} · Cd ${f(d.cd)} · Cl ${f(d.cl)}`;
+}
+$("#chart").addEventListener("pointermove", chartHover);
+$("#chart").addEventListener("pointerleave", () => {
+  const hov = $("#chartHover"); if(hov) hov.setAttribute("display", "none");
+  chartHovering = false;
+  $("#chartRead").textContent = chartGeom ? CHART_NOTE : "";
+});
+new ResizeObserver(() => drawChart(lastHist, lastCoef)).observe($("#chart"));
 
 // ------------------------------------------------------------ 3D tunnel ----
 // Volume rendering, WebGL2.  Three views of the computed flow:
@@ -432,8 +725,10 @@ const _drawChart = drawChart; drawChart = h => { lastHist = h || []; _drawChart(
 // WebGL2 it falls back to the mid-plane on a 2D canvas.
 const tunnel = (() => {
   const cv = $("#tunnel");
-  // Turbo, 17 control points (matplotlib's table).  Its darkest colour is the
-  // background, so the faintest flow fades into it rather than onto it.
+  // Turbo, 17 control points (matplotlib's table).  The flow is drawn on a
+  // white background, so each quantity uses Turbo from a little way up (its
+  // near-black start would outline every faint wisp in dark purple): 'from'
+  // is where on the table a zero value sits.
   const TURBO = ["#30123b","#4040a2","#466be3","#4294ff","#28bceb","#18ddc2","#32f298","#6dfe62",
                  "#a4fc3c","#cdec34","#eecf3a","#fdac34","#fb7e21","#eb500e","#d02f05","#a91601","#7a0403"]
     .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
@@ -443,9 +738,9 @@ const tunnel = (() => {
     return [0, 1, 2].map(k => a[k] + (b[k] - a[k]) * u);
   };
   const QTY = {
-    smoke:     {density: 0.10, unit: "u₀",   name: "smoke · |u − U∞|"},
-    wake:      {density: 0.13, lo: 0.03, hi: 0.85, unit: "u₀",   name: "|u − U∞|"},
-    vorticity: {density: 0.10, lo: 0.05, hi: 0.90, unit: "u₀/D", name: "|ω|"},
+    smoke:     {density: 0.13, from: 0.18, unit: "u₀",   name: "smoke · |u − U∞|"},
+    wake:      {density: 0.13, from: 0.12, lo: 0.03, hi: 0.85, unit: "u₀",   name: "|u − U∞|"},
+    vorticity: {density: 0.10, from: 0.12, lo: 0.05, hi: 0.90, unit: "u₀/D", name: "|ω|"},
   };
   const CROSS_SECONDS = 4;          // free stream crosses the tunnel in this long on screen
   const view = {yaw: -0.52, pitch: 0.34, zoom: 1};
@@ -455,6 +750,7 @@ const tunnel = (() => {
   // the field's features are ~1/12 of that, so puffs come out ~half a body
   const source = {c: [0, 0], radius: 12, repeat: 80};
   let simCells = 0;                                   // how far the free stream has moved, cells
+  let wasFlat = false;                                // the last geometry was a 2D slab
   // render scale: drops when frames run long, so weak GPUs stay smooth
   const perf = {scale: Math.min(window.devicePixelRatio || 1, 1.5), frames: 0, since: performance.now()};
 
@@ -472,8 +768,8 @@ const tunnel = (() => {
     const RENDER_FS = `#version 300 es
       precision highp float; precision highp sampler3D;
       uniform sampler3D uVol, uSolid, uVel, uDye, uDyePrev; uniform sampler2D uLut;
-      uniform vec3 uEye, uRight, uUp, uFwd, uBox, uCell, uBg;
-      uniform float uTanHalf, uAspect, uDensity, uLo, uHi, uPixel, uFrac;
+      uniform vec3 uEye, uRight, uUp, uFwd, uBox, uCell, uBgTop, uBgBottom, uLine;
+      uniform float uTanHalf, uAspect, uDensity, uLo, uHi, uPixel, uFrac, uFrom;
       uniform bool uHasSolid, uHasVol, uSmoke;
       in vec2 vNdc; out vec4 outColor;
 
@@ -482,20 +778,20 @@ const tunnel = (() => {
         vec3 lo = min(a, b), hi = max(a, b);
         return vec2(max(max(lo.x, lo.y), lo.z), min(min(hi.x, hi.y), hi.z));
       }
-      // faint tunnel edges: a point on the box surface near two faces at once
+      // tunnel edges: a point on the box surface near two faces at once (the
+      // second-largest of the three nearnesses), soft over about a pixel
       float edge(vec3 p, float w){
-        vec3 d = min(p, uBox - p);
-        vec3 on = step(d, vec3(w));
-        return step(1.5, on.x + on.y + on.z);
+        vec3 n = 1.0 - smoothstep(0.3 * w, 1.25 * w, min(p, uBox - p));
+        return max(max(min(n.x, n.y), min(n.x, n.z)), min(n.y, n.z));
       }
       void main(){
         vec3 rd = normalize(uFwd + vNdc.x * uTanHalf * uAspect * uRight + vNdc.y * uTanHalf * uUp);
         vec2 t = hitBox(uEye, rd);
-        if(t.x >= t.y || t.y <= 0.0){ outColor = vec4(uBg, 1.0); return; }
+        vec3 bg = mix(uBgBottom, uBgTop, smoothstep(-1.0, 1.0, vNdc.y));
+        if(t.x >= t.y || t.y <= 0.0){ outColor = vec4(bg, 1.0); return; }
         t.x = max(t.x, 0.0);
         float px = 1.3 * uPixel;                      // ~ a pixel per unit distance
-        vec3 lines = vec3(0.62, 0.55, 0.78) * (0.30 * edge(uEye + rd * t.x, px * t.x)
-                                              + 0.14 * edge(uEye + rd * t.y, px * t.y));
+        bg = mix(bg, uLine, 0.55 * edge(uEye + rd * t.x, px * t.x) + 0.22 * edge(uEye + rd * t.y, px * t.y));
         float dt = 0.5;                               // half a cell
         float tt = t.x + dt * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
         vec4 acc = vec4(0.0);
@@ -534,7 +830,7 @@ const tunnel = (() => {
                 // disturbed smoke is also denser, so the wake stands out of
                 // the stream around it
                 float s = texture(uVol, tc).r;
-                vec3 col = texture(uLut, vec2(0.18 + 0.82 * s, 0.5)).rgb * (1.05 + 0.35 * s);
+                vec3 col = texture(uLut, vec2(uFrom + (1.0 - uFrom) * s, 0.5)).rgb;
                 float a = 1.0 - exp(-uDensity * c * (0.35 + 1.6 * s) * dt);
                 acc.rgb += (1.0 - acc.a) * a * col;
                 acc.a += (1.0 - acc.a) * a;
@@ -544,7 +840,7 @@ const tunnel = (() => {
               float w = smoothstep(uLo, uHi, v);
               if(w > 0.0){
                 float a = 1.0 - exp(-uDensity * w * dt);
-                vec3 c = texture(uLut, vec2(v, 0.5)).rgb * (1.0 + 0.5 * w);
+                vec3 c = texture(uLut, vec2(uFrom + (1.0 - uFrom) * v, 0.5)).rgb;
                 acc.rgb += (1.0 - acc.a) * a * c;
                 acc.a += (1.0 - acc.a) * a;
               }
@@ -552,7 +848,7 @@ const tunnel = (() => {
           }
           tt += dt;
         }
-        outColor = vec4(acc.rgb + (1.0 - acc.a) * (uBg + lines), 1.0);
+        outColor = vec4(acc.rgb + (1.0 - acc.a) * bg, 1.0);
       }`;
     // One slice of the dye advection: this cell's dye is whatever was at the
     // point the flow carried here from, one step ago.  Inside the body there
@@ -598,7 +894,7 @@ const tunnel = (() => {
       return [p, loc];
     };
     [render, R] = program(RENDER_FS, ["uVol","uSolid","uVel","uDye","uLut","uEye","uRight","uUp","uFwd","uBox",
-      "uCell","uBg","uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol","uSmoke",
+      "uCell","uBgTop","uBgBottom","uLine","uFrom","uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol","uSmoke",
       "uDyePrev","uFrac"]);
     [advect, A] = program(ADVECT_FS, ["uDye","uVel","uSolid","uNoise","uGrid","uBox","uZ","uStep","uVelScale",
       "uAdvanced","uSrcR","uRepeat","uSrcC","uFlat"]);
@@ -631,7 +927,8 @@ const tunnel = (() => {
     gl.useProgram(render);
     gl.uniform1i(R.uVol, 0); gl.uniform1i(R.uSolid, 1); gl.uniform1i(R.uLut, 2); gl.uniform1i(R.uVel, 3);
     gl.uniform1i(R.uDye, 5); gl.uniform1i(R.uDyePrev, 6);
-    const bg = turbo(0).map(v => v / 255); gl.uniform3f(R.uBg, bg[0], bg[1], bg[2]);
+    gl.uniform3f(R.uBgTop, 1, 1, 1); gl.uniform3f(R.uBgBottom, 0.914, 0.933, 0.961);   // #fff -> #e9eef5
+    gl.uniform3f(R.uLine, 0.30, 0.38, 0.50);
     gl.useProgram(advect);
     gl.uniform1i(A.uDye, 5); gl.uniform1i(A.uVel, 3); gl.uniform1i(A.uSolid, 1); gl.uniform1i(A.uNoise, 4);
     fbo = gl.createFramebuffer();
@@ -773,7 +1070,10 @@ const tunnel = (() => {
       pace(); request();
     }
     lastFrame = moving ? now : 0;
-
+    paint();
+  }
+  // Render the current state without advancing it (also used by snapshot()).
+  function paint(){
     gl.useProgram(render);
     gl.viewport(0, 0, cv.width, cv.height);
     const box = boxDims(), c = box.map(v => v / 2), tanHalf = Math.tan(20 * Math.PI / 180), aspect = cv.width / cv.height;
@@ -794,7 +1094,7 @@ const tunnel = (() => {
     gl.uniform3f(R.uBox, ...box); gl.uniform3f(R.uCell, 1 / full[2], 1 / full[1], 1 / Math.max(full[0], 1));
     gl.uniform1f(R.uTanHalf, tanHalf); gl.uniform1f(R.uAspect, aspect); gl.uniform1f(R.uPixel, 2 * tanHalf / cv.height);
     gl.uniform1f(R.uDensity, flat ? q.density * 10 / box[2] : q.density);
-    gl.uniform1f(R.uLo, q.lo || 0); gl.uniform1f(R.uHi, q.hi || 1);
+    gl.uniform1f(R.uLo, q.lo || 0); gl.uniform1f(R.uHi, q.hi || 1); gl.uniform1f(R.uFrom, q.from);
     gl.uniform1i(R.uHasSolid, hasSolid ? 1 : 0); gl.uniform1i(R.uHasVol, fld ? 1 : 0);
     gl.uniform1i(R.uSmoke, qty === "smoke" && dyeShape ? 1 : 0);
     gl.uniform1f(R.uFrac, dyeShape && fld ? Math.min(simAcc / stepSeconds(), 1) : 1);
@@ -804,7 +1104,7 @@ const tunnel = (() => {
   // Fallback: the mid-plane, coloured the same way, on a plain 2D canvas.
   // Smoke needs the GPU, so the fallback shows the speed there instead.
   function draw2d(){
-    const W = cv.width, H = cv.height, bg = turbo(0);
+    const W = cv.width, H = cv.height, bg = [255, 255, 255], from = QTY[qty].from;
     ctx2d.fillStyle = `rgb(${bg.join(",")})`; ctx2d.fillRect(0, 0, W, H);
     if(!fld) return;
     const [sz, sy, sx] = fld.header.shape, k = sz >> 1, img = new ImageData(sx, sy);
@@ -816,7 +1116,7 @@ const tunnel = (() => {
     for(let y = 0; y < sy; y++) for(let x = 0; x < sx; x++){
       const o = 4 * ((sy - 1 - y) * sx + x);
       if(solidAt(y, x)){ img.data.set([158, 160, 165, 255], o); continue; }
-      const v = Math.min(1, value((k * sy + y) * sx + x)), c = turbo(v), w = qty === "smoke" ? 1 : Math.min(1, v * 2.5);
+      const v = Math.min(1, value((k * sy + y) * sx + x)), c = turbo(from + (1 - from) * v), w = qty === "smoke" ? 1 : Math.min(1, v * 2.5);
       img.data.set([bg[0] + (c[0] - bg[0]) * w, bg[1] + (c[1] - bg[1]) * w, bg[2] + (c[2] - bg[2]) * w, 255], o);
     }
     const off = document.createElement("canvas"); off.width = sx; off.height = sy; off.getContext("2d").putImageData(img, 0, 0);
@@ -824,17 +1124,28 @@ const tunnel = (() => {
     ctx2d.imageSmoothingEnabled = true; ctx2d.drawImage(off, (W - sx * s) / 2, (H - sy * s) / 2, sx * s, sy * s);
   }
 
+  // The colour-map bar under the view: the part of Turbo this quantity uses,
+  // with ticks in the quantity's units.
   function legend(){
     const q = QTY[qty], sc = fld && fld.header.scales ? fld.header.scales : null;
-    const scale = sc ? (qty === "smoke" ? sc.wake : sc[qty]) : null;
+    const scale = sc ? +(qty === "smoke" ? sc.wake : sc[qty]) : null;
+    const from = q.from;
     $("#lgName").textContent = q.name;
-    $("#lgHi").textContent = scale ? `${+(+scale).toFixed(2)} ${q.unit}` : "high";
+    $("#lgUnit").textContent = scale ? q.unit : "";
+    $("#lgTicks").innerHTML = [0, 0.25, 0.5, 0.75, 1].map(t =>
+      `<span style="left:${t * 100}%">${scale ? +(t * scale).toPrecision(2) : t === 0 ? "0" : t === 1 ? "high" : ""}</span>`).join("");
+    $("#lgBar").style.background = `linear-gradient(90deg, ${Array.from({length: 17}, (_, i) =>
+      `rgb(${turbo(from + (1 - from) * i / 16).map(Math.round).join(",")})`).join(",")})`;
   }
   function setGeometry(g){
     geom = g; full = g.header.shape;
     if(gl){ upload(1, texSolid, smoothMask(g.solid, full), full); hasSolid = true; }
     placeSource(g);
-    if(full[0] <= 1){ view.yaw = 0; view.pitch = 0.22; }
+    // a 2D run is a thin slab: only the iso and side views show it
+    const flat = full[0] <= 1;
+    if(flat || flat !== wasFlat) setView("iso");
+    wasFlat = flat;
+    for(const b of document.querySelectorAll('[data-view="front"],[data-view="top"]')) b.disabled = flat;
     $("#tunnelEmpty").hidden = true; request();
   }
   function setField(f){
@@ -852,8 +1163,10 @@ const tunnel = (() => {
     if(!QTY[name] || name === qty) return;
     qty = name;
     if(fld && gl && name !== "smoke") upload(0, texVol, fld[qty], volShape);
-    for(const b of document.querySelectorAll("#qtySeg .btn")) b.classList.toggle("on", b.dataset.q === qty);
-    $("#animBtn").disabled = qty !== "smoke";
+    for(const b of document.querySelectorAll("#qtySeg [data-q]")){
+      b.classList.toggle("on", b.dataset.q === qty); b.setAttribute("aria-selected", b.dataset.q === qty);
+    }
+    $("#animBtn").disabled = $("#restartBtn").disabled = !gl || qty !== "smoke";
     legend(); request();
   }
   function reset(){
@@ -861,7 +1174,27 @@ const tunnel = (() => {
     if(gl){ upload(0, texVol, new Uint8Array(1), [1, 1, 1]); upload(1, texSolid, new Uint8Array(1), [1, 1, 1]); }
     $("#tunnelEmpty").hidden = false; request();
   }
-  function resetView(){ view.yaw = full[0] <= 1 ? 0 : -0.52; view.pitch = full[0] <= 1 ? 0.22 : 0.34; view.zoom = 1; request(); }
+  // Camera presets.  The flow runs along +x; "front" looks downstream at the
+  // body's upstream face, "side" and "top" show the flow left to right.
+  function setView(name){
+    const flat = full[0] <= 1;
+    const [yaw, pitch] = {iso: flat ? [0, 0.22] : [-0.52, 0.34], front: [-Math.PI / 2, 0], side: [0, 0], top: [0, 1.55]}[name];
+    view.yaw = yaw; view.pitch = pitch; view.zoom = 1; request();
+  }
+  function zoomBy(f){ view.zoom = Math.min(6, Math.max(0.4, view.zoom * f)); request(); }
+  // A PNG of the view as it is now, at full screen resolution even when the
+  // live view is rendering smaller to keep up.  WebGL clears its buffer once
+  // a frame is shown, so render and read back in the same task.
+  function snapshot(){
+    const keep = [cv.width, cv.height], s = Math.max(window.devicePixelRatio || 1, 1);
+    cv.width = Math.round(cv.clientWidth * s); cv.height = Math.round(cv.clientHeight * s);
+    if(gl) paint(); else draw2d();
+    const url = cv.toDataURL("image/png");
+    [cv.width, cv.height] = keep; request();
+    return url;
+  }
+  // Clear the dye; the smoke comes in from the inlet again.
+  function restartSmoke(){ if(gl && dyeShape){ makeDye(dyeShape); request(); } }
 
   new ResizeObserver(resize).observe(cv); resize();
   let dragAt = null;
@@ -869,22 +1202,25 @@ const tunnel = (() => {
   cv.addEventListener("pointerup", () => { dragAt = null; });
   cv.addEventListener("pointermove", e => { if(!dragAt) return;
     view.yaw -= (e.clientX - dragAt[0]) * 0.008;
-    view.pitch = Math.min(1.45, Math.max(-1.45, view.pitch + (e.clientY - dragAt[1]) * 0.008));
+    view.pitch = Math.min(1.55, Math.max(-1.55, view.pitch + (e.clientY - dragAt[1]) * 0.008));
     dragAt = [e.clientX, e.clientY]; request(); });
-  cv.addEventListener("wheel", e => { e.preventDefault();
-    view.zoom = Math.min(6, Math.max(0.4, view.zoom * (e.deltaY < 0 ? 1.1 : 0.9))); request(); }, {passive: false});
-  for(const b of document.querySelectorAll("#qtySeg .btn")) b.addEventListener("click", () => setQuantity(b.dataset.q));
-  $("#resetBtn").addEventListener("click", resetView);
+  cv.addEventListener("wheel", e => { e.preventDefault(); zoomBy(e.deltaY < 0 ? 1.1 : 0.9); }, {passive: false});
+  for(const b of document.querySelectorAll("#qtySeg [data-q]")) b.addEventListener("click", () => setQuantity(b.dataset.q));
+  for(const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => setView(b.dataset.view));
+  $("#zoomInBtn").addEventListener("click", () => zoomBy(1.25));
+  $("#zoomOutBtn").addEventListener("click", () => zoomBy(0.8));
+  $("#resetBtn").addEventListener("click", () => { view.zoom = 1; request(); });
+  $("#restartBtn").addEventListener("click", restartSmoke);
   $("#animBtn").addEventListener("click", () => {
-    running = !running; $("#animBtn").textContent = running ? "Pause" : "Play"; request();
+    running = !running; $("#animBtn").classList.toggle("paused", !running);
+    $("#animLbl").textContent = running ? "Pause" : "Play"; request();
   });
-  $("#lgBar").style.background = `linear-gradient(90deg, ${TURBO.map(c => `rgb(${c.join(",")})`).join(",")})`;
   if(!gl){
-    document.querySelector(".viewer .legend .hint").textContent = "mid-plane slice · the 3D view needs WebGL2";
-    $("#animBtn").hidden = true;
+    $("#viewHint").textContent = "mid-plane slice · the 3D view needs WebGL2";
+    for(const b of document.querySelectorAll("#animBtn, #restartBtn, [data-view], #zoomInBtn, #zoomOutBtn, #resetBtn")) b.disabled = true;
   }
   legend();
-  return {setGeometry, setField, reset, setQuantity};
+  return {setGeometry, setField, reset, setQuantity, snapshot, quantity: () => qty};
 })();
 
 boot();

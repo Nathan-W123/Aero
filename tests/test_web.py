@@ -303,3 +303,43 @@ def test_field_payload_is_strided_to_the_voxel_budget(monkeypatch):
     header, parts = _unpack(web._field_payload(solver, "3d"))
     assert header["factor"] >= 2 and header["full"] == [24, 24, 40]
     assert parts["wake"].size <= 5000 * 1.2
+
+
+# ---------------------------------------------------------------------------
+# Field figures
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode", ["2d", "3d"])
+def test_field_figures_render_with_their_final_detail(mode):
+    """
+    The last figures of a run add streamlines and isobars.  The run loop
+    swallows figure errors (a figure must never sink a run), so a failure in
+    that path would only show as a figure quietly missing its detail.
+    """
+    p = {"mode": mode, "shape": "sphere" if mode == "3d" else "cylinder", "radius": 4,
+         "re": 20, "u0": 0.05, "nx": 40, "ny": 24, "nz": 24, "backend": "numpy"}
+    solver, _ = web._build_solver(p)
+    solver.run(steps=30, check_every=10 ** 9, verbose=False)
+    for what in ("speed", "vorticity", "pressure"):
+        for detail in (False, True):
+            png = web._field_png(solver, mode, what, streamlines=detail)
+            assert png.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_body_cells_take_their_fluid_neighbours_values():
+    solid = np.zeros((5, 5), dtype=bool)
+    solid[1:4, 1:4] = True
+    a = np.arange(25, dtype=float).reshape(5, 5)
+    out = web._extend_into(solid, a)
+    assert np.array_equal(out[~solid], a[~solid])          # the fluid is untouched
+    assert out[1, 2] == a[0, 2]                              # one fluid neighbour
+    assert out[1, 1] == pytest.approx((a[0, 1] + a[1, 0]) / 2)
+    assert np.isfinite(out).all()                            # the middle, a pass later
+
+
+def test_smoothed_outline_keeps_a_straight_wall_in_place():
+    solid = np.zeros((8, 8), dtype=bool)
+    solid[:, :4] = True
+    s = web._smoothed(solid)
+    # the 0.5 level of a blurred half-plane sits on the original boundary
+    assert np.all(s[:, 3] > 0.5) and np.all(s[:, 4] < 0.5)
