@@ -3,13 +3,82 @@ Boundary condition implementations for the D2Q9 LBM solver.
 
 Applied each timestep in this order, after streaming:
   1. Mid-link bounce-back   (obstacle surface)
-  2. Inlet BC               (left wall, x=0)   — velocity or pressure Zou-He
+  2. Inlet BC               (left wall, x=0)   — regularized velocity, or pressure Zou-He
   3. Outlet BC              (right wall, x=Nx-1) — convective or pressure Zou-He
   4. Wall BC                (top y=Ny-1, bottom y=0) — slip or no-slip
 """
 
 import numpy as np
-from .d2q9 import E, OPP
+from .d2q9 import E, OPP, W
+
+_EX = E[:, 0].astype(np.float64)
+_EY = E[:, 1].astype(np.float64)
+# Q_i = e_i e_i - c_s^2 I, the tensor a regularized population carries its stress on
+_QXX = _EX * _EX - 1.0 / 3.0
+_QYY = _EY * _EY - 1.0 / 3.0
+_QXY = _EX * _EY
+
+
+def _regularized_inlet(f: np.ndarray, ux: np.ndarray, uy: np.ndarray) -> None:
+    """
+    Regularized velocity inlet at x=0 (Latt & Chopard, PRE 77, 056703, 2008).
+
+    The density comes from the known populations as in Zou-He, and the
+    unknown, east-going ones from bouncing back their non-equilibrium parts.
+    Then *every* population in the column is rebuilt as the equilibrium at
+    the target velocity plus the part of the non-equilibrium that is a
+    viscous stress, ``w_i Q_i : Pi_neq / (2 c_s^4)``.
+
+    Zou-He stops after the bounce-back, which leaves the higher-order,
+    non-hydrodynamic content of the inlet populations to whatever the
+    bounce-back produced.  With BGK close to omega = 2 that content is barely
+    damped: in the web UI's default 2D rectangle case (omega = 1.89) it grew
+    at the inlet until the run diverged 800 steps in, and a cylinder of the
+    same size did the same.  Rebuilding from ``Pi_neq`` removes the source.
+    Density and momentum are exactly Zou-He's: the stress term carries
+    neither.
+    """
+    col = f[:, :, 0]
+    rho = ((col[0] + col[2] + col[4]) + 2.0 * (col[3] + col[6] + col[7])) / np.maximum(1.0 - ux, 1e-8)
+    eu = _EX[:, None] * ux + _EY[:, None] * uy
+    feq = W[:, None] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * (ux * ux + uy * uy))
+    neq = col - feq
+    neq[1], neq[5], neq[8] = neq[3], neq[7], neq[6]     # bounce-back of the unknowns
+    pxx = _EX @ (_EX[:, None] * neq)
+    pyy = _EY @ (_EY[:, None] * neq)
+    pxy = _EX @ (_EY[:, None] * neq)
+    f[:, :, 0] = feq + 4.5 * W[:, None] * (_QXX[:, None] * pxx + _QYY[:, None] * pyy
+                                           + 2.0 * _QXY[:, None] * pxy)
+
+
+def apply_inlet_regularized(
+    f: np.ndarray,
+    u0: float,
+    *,
+    uy_amp: float = 0.0,
+    step: int = 0,
+) -> None:
+    """
+    Regularized velocity inlet at the left wall (x=0): ux = u0, uy = 0.
+
+    The solver's velocity inlet (see :func:`_regularized_inlet` for why it is
+    not plain Zou-He).  ``uy_amp`` adds the same travelling transverse
+    perturbation as :func:`apply_inlet_zou_he`, to trigger vortex shedding.
+    """
+    ny = f.shape[1]
+    _regularized_inlet(f, np.full(ny, float(u0)), np.zeros(ny))
+    if uy_amp > 0.0:
+        _perturb_inlet(f, u0, uy_amp, step)
+
+
+def _perturb_inlet(f: np.ndarray, u0: float, uy_amp: float, step: int) -> None:
+    """A travelling sinusoidal transverse kick to the inlet column (mass-neutral)."""
+    ny = f.shape[1]
+    uy = uy_amp * u0 * np.sin(2.0 * np.pi * np.arange(ny) / max(ny, 1) + 0.17 * step)
+    f[2, :, 0] += uy * 0.25
+    f[4, :, 0] -= uy * 0.25
+    f[5, :, 0] += uy * 0.15
+    f[8, :, 0] -= uy * 0.15
 
 
 def apply_inlet_zou_he(
@@ -24,6 +93,9 @@ def apply_inlet_zou_he(
 
     Optional ``uy_amp`` adds a travelling sinusoidal transverse perturbation
     (fraction of u0) to trigger vortex shedding at supercritical Re.
+
+    Kept for reference: the solver uses :func:`apply_inlet_regularized`,
+    which BGK tolerates much closer to omega = 2.
     """
     col = 0
 
@@ -37,12 +109,18 @@ def apply_inlet_zou_he(
     f[8, :, col] = f[6, :, col] + 0.5 * (f[2, :, col] - f[4, :, col]) + (1.0 / 6.0) * rho_in * u0
 
     if uy_amp > 0.0:
-        ny = f.shape[1]
-        uy = uy_amp * u0 * np.sin(2.0 * np.pi * np.arange(ny) / max(ny, 1) + 0.17 * step)
-        f[2, :, col] += uy * 0.25
-        f[4, :, col] -= uy * 0.25
-        f[5, :, col] += uy * 0.15
-        f[8, :, col] -= uy * 0.15
+        _perturb_inlet(f, u0, uy_amp, step)
+
+
+def apply_inlet_velocity_field_regularized(
+    f: np.ndarray,
+    ux_target: np.ndarray,
+    uy_target: np.ndarray,
+) -> None:
+    """Regularized velocity inlet with per-row target velocities at x=0."""
+    ny = f.shape[1]
+    _regularized_inlet(f, np.broadcast_to(np.asarray(ux_target, dtype=np.float64), (ny,)),
+                       np.broadcast_to(np.asarray(uy_target, dtype=np.float64), (ny,)))
 
 
 def apply_inlet_velocity_field(

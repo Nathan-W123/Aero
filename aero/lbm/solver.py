@@ -35,8 +35,8 @@ from .d2q9 import Q, E, W, OPP, compute_macroscopic, compute_feq
 from . import kernels as _kernels
 from .kernels_mrt import MRTKernel2D
 from .boundary import (
-    apply_inlet_zou_he,
-    apply_inlet_velocity_field,
+    apply_inlet_regularized,
+    apply_inlet_velocity_field_regularized,
     apply_inlet_zou_he_pressure,
     apply_outlet_convective,
     apply_outlet_zero_gradient,
@@ -535,13 +535,13 @@ class Solver:
 
         if self.inlet_bc == "velocity":
             if self.synthetic_inflow:
-                apply_inlet_velocity_field(
+                apply_inlet_velocity_field_regularized(
                     f_post,
                     np.full(self.Ny, self.u0, dtype=np.float64),
                     self._update_synthetic_inflow(),
                 )
             else:
-                apply_inlet_zou_he(
+                apply_inlet_regularized(
                     f_post,
                     self.u0,
                     uy_amp=self.inlet_perturbation,

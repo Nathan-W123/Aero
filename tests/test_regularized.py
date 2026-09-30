@@ -130,10 +130,14 @@ def test_numpy_and_numba_agree(collision):
 # Stability — the reason the operator exists
 # ---------------------------------------------------------------------------
 
-def test_regularized_outlasts_bgk_at_low_viscosity():
+def test_both_operators_survive_low_viscosity_with_the_regularized_inlet():
     """
-    At omega = 1.95 the ghost moments are barely damped and BGK blows up;
-    regularization removes them, which is the whole point.
+    This used to assert that BGK blows up here (omega = 1.95) and the
+    regularized operator does not -- "the ghost moments are barely damped".
+    It was the Zou-He inlet that blew up: with the regularized inlet BGK
+    survives this case, and a scan around it (omega 1.95-1.99, u0 0.09-0.15)
+    found no case where the regularized operator outlasts BGK, several where
+    it is the other way round (omega 1.97, u0 0.09 among them).
     """
     pytest.importorskip("numba")
     ny, nx = 64, 128
@@ -151,7 +155,7 @@ def test_regularized_outlasts_bgk_at_low_viscosity():
         except RuntimeError:
             return False
 
-    assert not survives("bgk"), "BGK unexpectedly stable — pick a harder case"
+    assert survives("bgk")
     assert survives("regularized")
 
 

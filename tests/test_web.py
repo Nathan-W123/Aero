@@ -147,20 +147,34 @@ def test_a_failing_case_reports_the_reason_rather_than_hanging():
     assert job.finished is not None
 
 
-def test_a_run_that_blows_up_is_reported_even_before_it_turns_nan():
+def test_a_run_that_blows_up_is_reported_even_before_it_turns_nan(monkeypatch):
     """
-    BGK on the default 3D sphere (omega 1.92) diverges within ~300 steps, but
-    its drag stays finite -- ~1e40 -- for a while before reaching NaN, so a
-    NaN check alone let it finish as "complete" with garbage fields.
+    A diverging run's drag can stay finite -- ~1e40 -- for a while before it
+    reaches NaN, so a NaN check alone let such a run finish as "complete" with
+    garbage fields.  BGK on the default sphere used to do exactly that, until
+    the inlet was regularized; here the blow-up is injected.
     """
-    pytest.importorskip("numba")
+    build = web._build_solver
+
+    def diverging(p):
+        solver, label = build(p)
+        run = solver.run
+
+        def run_then_blow_up(*args, **kwargs):
+            out = run(*args, **kwargs)
+            solver.Cd_history[-1] = 1e40
+            return out
+        solver.run = run_then_blow_up
+        return solver, label
+
+    monkeypatch.setattr(web, "_build_solver", diverging)
     job = web.Job(id="t_blowup", params={
-        "mode": "3d", "shape": "sphere", "radius": 7, "re": 100, "u0": 0.05,
-        "nx": 96, "ny": 48, "nz": 48, "steps": 600, "collision": "bgk", "backend": "numba",
+        "mode": "2d", "shape": "cylinder", "radius": 6, "re": 20, "u0": 0.05,
+        "nx": 80, "ny": 40, "steps": 200, "backend": "numpy",
     })
     web._run_job(job)
     assert job.state == "error"
-    assert "diverged" in job.error and "regularized" in job.error
+    assert "diverged" in job.error and "collision operator" in job.error
 
 
 def test_cancelling_stops_the_run_partway():

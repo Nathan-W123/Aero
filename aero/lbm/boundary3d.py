@@ -3,7 +3,7 @@ Boundary conditions for the 3D LBM solver (D3Q19 or D3Q27).
 
 Applied each timestep in this order (after streaming):
   1. Mid-link bounce-back   (obstacle surface)
-  2. Inlet BC               (left face, x=0)   — Zou-He velocity
+  2. Inlet BC               (left face, x=0)   — regularized Zou-He velocity
   3. Outlet BC              (right face, x=Nx-1) — convective or zero-gradient
   4. Wall BC                (top y=Ny-1, bottom y=0) — slip or no-slip
   (z direction: periodic by default via streaming)
@@ -21,7 +21,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from .lattice3d import D3Q19, Lattice3D, compute_feq, compute_macroscopic
+from .lattice3d import CS2, D3Q19, Lattice3D, compute_feq, compute_macroscopic
 
 try:
     import numba as nb
@@ -201,6 +201,75 @@ def _zou_he_x_inlet(
     return rho
 
 
+# The six independent components of a symmetric 3x3 tensor, and how many times
+# each appears in a full contraction Q : Pi.
+_PAIRS = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
+_PAIR_COUNT = (1.0, 1.0, 1.0, 2.0, 2.0, 2.0)
+_REG_TABLES: Dict[str, tuple] = {}
+
+
+def _regularization_tables(lat: Lattice3D) -> tuple:
+    """``(E2, QW)``: ``E2[k, i] = e_ia e_ib`` and ``QW[i, k] = w_i n_k Q_iab / (2 cs^4)``."""
+    t = _REG_TABLES.get(lat.name)
+    if t is None:
+        e = np.stack([lat.ex, lat.ey, lat.ez])                     # (3, Q)
+        e2 = np.stack([e[a] * e[b] for a, b in _PAIRS])             # (6, Q)
+        q = e2 - np.array([CS2 if a == b else 0.0 for a, b in _PAIRS])[:, None]
+        qw = (q * np.array(_PAIR_COUNT)[:, None]).T * (np.asarray(lat.W)[:, None] / (2.0 * CS2 ** 2))
+        t = (np.ascontiguousarray(e2), np.ascontiguousarray(qw))
+        _REG_TABLES[lat.name] = t
+    return t
+
+
+def _array_module(a):
+    if type(a) is np.ndarray:
+        return np
+    try:                                    # the solver's CuPy backend
+        import cupy                         # type: ignore
+        return cupy.get_array_module(a)
+    except ImportError:
+        return np
+
+
+def _regularize_x_face(f, rho, ux_t, uy_t, uz_t, lat: Lattice3D, c: int = 0) -> None:
+    """
+    Rebuild every population on the x-normal face ``c`` as the equilibrium at
+    the imposed velocity plus the regularized non-equilibrium stress,
+    ``w_i Q_i : Pi_neq / (2 cs^4)`` (Latt & Chopard, PRE 77, 056703, 2008).
+
+    Run after :func:`_zou_he_x_inlet`, whose density and momentum it keeps
+    exactly (the stress term carries neither).  What it removes is the
+    higher-order, non-hydrodynamic content the Zou-He reconstruction leaves in
+    the face populations.  BGK close to omega = 2 barely damps that content:
+    the web UI's default sphere (omega = 1.92) diverged 200 steps in, starting
+    at the inlet, and the same happened in 2D.
+    """
+    xp = _array_module(f)
+    shape = rho.shape
+    u = [xp.broadcast_to(xp.asarray(t, dtype=xp.float64), shape) for t in (ux_t, uy_t, uz_t)]
+    feq = xp.asarray(compute_feq(rho, *u, lat)) if xp is np else _feq_xp(xp, rho, u, lat)
+    e2, qw = _regularization_tables(lat)
+    if xp is not np:
+        e2, qw = xp.asarray(e2), xp.asarray(qw)
+    neq = f[:, :, :, c] - feq
+    pi = xp.tensordot(e2, neq, axes=1)                      # (6, Nz, Ny)
+    f[:, :, :, c] = feq + xp.tensordot(qw, pi, axes=1)
+
+
+def _feq_xp(xp, rho, u, lat: Lattice3D):
+    """:func:`compute_feq` for a non-NumPy array module."""
+    ux, uy, uz = u
+    usq = ux * ux + uy * uy + uz * uz
+    feq = xp.empty((lat.Q, *rho.shape), dtype=xp.float64)
+    for i in range(lat.Q):
+        eu = float(lat.ex[i]) * ux + float(lat.ey[i]) * uy + float(lat.ez[i]) * uz
+        poly = 1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq
+        if lat.h3:
+            poly = poly + 4.5 * (eu * eu * eu - eu * usq)
+        feq[i] = float(lat.W[i]) * rho * poly
+    return feq
+
+
 def apply_inlet_zou_he_3d(
     f: np.ndarray,
     u0: float,
@@ -212,9 +281,10 @@ def apply_inlet_zou_he_3d(
     use_numba: Optional[bool] = None,
 ) -> None:
     """
-    3D Zou-He velocity BC at left face (x=0): impose ux=u0, uy≈0, uz≈0.
+    3D velocity BC at left face (x=0): impose ux=u0, uy≈0, uz≈0.
 
-    Optional spanwise uz_amp and vertical uy_amp perturbations (fraction of u0)
+    Zou-He, then regularized (see :func:`_regularize_x_face`).  Optional
+    spanwise uz_amp and vertical uy_amp perturbations (fraction of u0)
     trigger 3D shedding at supercritical Re.
     """
     nz, ny = f.shape[1], f.shape[2]
@@ -235,7 +305,8 @@ def apply_inlet_zou_he_3d(
                 * np.sin(2.0 * np.pi * zz / max(nz, 1) + phase)
             )[:, None]
 
-    _zou_he_x_inlet(f, ux_t, uy_t, uz_t, lattice, use_numba=use_numba)
+    rho = _zou_he_x_inlet(f, ux_t, uy_t, uz_t, lattice, use_numba=use_numba)
+    _regularize_x_face(f, rho, ux_t, uy_t, uz_t, lattice)
 
 
 def apply_inlet_velocity_field_3d(
@@ -247,15 +318,10 @@ def apply_inlet_velocity_field_3d(
     lattice: Lattice3D = D3Q19,
     use_numba: Optional[bool] = None,
 ) -> None:
-    """3D Zou-He inlet with per-cell target velocity fields at x=0."""
-    _zou_he_x_inlet(
-        f,
-        np.asarray(ux_target, dtype=np.float64),
-        np.asarray(uy_target, dtype=np.float64),
-        np.asarray(uz_target, dtype=np.float64),
-        lattice,
-        use_numba=use_numba,
-    )
+    """3D regularized Zou-He inlet with per-cell target velocity fields at x=0."""
+    targets = [np.asarray(t, dtype=np.float64) for t in (ux_target, uy_target, uz_target)]
+    rho = _zou_he_x_inlet(f, *targets, lattice, use_numba=use_numba)
+    _regularize_x_face(f, rho, *targets, lattice)
 
 
 def apply_inlet_sem_3d(
@@ -269,7 +335,7 @@ def apply_inlet_sem_3d(
     use_numba: Optional[bool] = None,
 ) -> None:
     """
-    Zou-He 3D velocity BC at x=0 with SEM fluctuations.
+    Regularized Zou-He 3D velocity BC at x=0 with SEM fluctuations.
 
     Imposes (ux, uy, uz) = (u0 + u_prime, v_prime, w_prime) on the inlet face.
 
@@ -277,14 +343,10 @@ def apply_inlet_sem_3d(
     ----------
     u_prime, v_prime, w_prime : (Nz, Ny) arrays from SEMInlet.fluctuation()
     """
-    _zou_he_x_inlet(
-        f,
-        u0 + np.asarray(u_prime, dtype=np.float64),
-        np.asarray(v_prime, dtype=np.float64),
-        np.asarray(w_prime, dtype=np.float64),
-        lattice,
-        use_numba=use_numba,
-    )
+    targets = [u0 + np.asarray(u_prime, dtype=np.float64),
+               np.asarray(v_prime, dtype=np.float64), np.asarray(w_prime, dtype=np.float64)]
+    rho = _zou_he_x_inlet(f, *targets, lattice, use_numba=use_numba)
+    _regularize_x_face(f, rho, *targets, lattice)
 
 
 # ---------------------------------------------------------------------------
