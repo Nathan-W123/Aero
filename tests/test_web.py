@@ -230,3 +230,55 @@ def test_job_reports_an_uncertainty_budget_and_a_reference():
     assert r["expected"] > r["unconfined"]            # 6/16 blockage raises it
     assert r["status"] in ("pass", "fail")
     json.dumps(job.public(), allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# The volume the 3D viewer renders
+# ---------------------------------------------------------------------------
+
+def _unpack(blob: bytes):
+    nl = blob.index(b"\n")
+    header = json.loads(blob[:nl])
+    off, out = nl + 1, {}
+    for part in header["parts"]:
+        out[part["name"]] = np.frombuffer(blob, dtype=part["dtype"], count=part["count"], offset=off)
+        off += part["count"] * np.dtype(part["dtype"]).itemsize
+    return header, out
+
+
+@pytest.mark.parametrize("mode", ["2d", "3d"])
+def test_field_payload_is_the_wake_and_vorticity_as_bytes(mode):
+    """
+    The viewer volume-renders one byte per voxel.  The wake |u - U_inf| must
+    be clear (zero) in an undisturbed stream and inside the body, which is
+    drawn as a surface from the geometry instead.
+    """
+    p = {"mode": mode, "shape": "sphere" if mode == "3d" else "cylinder", "radius": 4,
+         "re": 20, "u0": 0.05, "nx": 40, "ny": 24, "nz": 24, "backend": "numpy"}
+    solver, _ = web._build_solver(p)
+    header, parts = _unpack(web._field_payload(solver, mode))
+    assert set(parts) == {"wake", "vorticity"}
+    assert all(a.dtype == np.uint8 for a in parts.values())
+    shape = header["shape"]
+    assert parts["wake"].size == int(np.prod(shape))
+    solid = np.asarray(solver.solid, bool).reshape(shape)
+    wake = parts["wake"].reshape(shape)
+    assert wake[solid].max() == 0                        # the body is not fog
+    assert wake[~solid].max() == 0                       # a fresh uniform stream is undisturbed
+    assert header["scales"]["wake"] == web.WAKE_FULL_SCALE
+
+    solver.run(steps=40, check_every=10 ** 9, verbose=False)
+    header, parts = _unpack(web._field_payload(solver, mode))
+    wake = parts["wake"].reshape(shape)
+    assert wake[~solid].max() > 20                       # the body now disturbs the flow
+    assert parts["vorticity"].max() == 255               # scaled to its own percentile
+    assert header["scales"]["vorticity"] > 0
+
+
+def test_field_payload_is_strided_to_the_voxel_budget(monkeypatch):
+    monkeypatch.setattr(web, "FIELD_VOXELS_MAX", 5000)
+    solver, _ = web._build_solver({"mode": "3d", "shape": "sphere", "radius": 4, "re": 20,
+                                   "u0": 0.05, "nx": 40, "ny": 24, "nz": 24, "backend": "numpy"})
+    header, parts = _unpack(web._field_payload(solver, "3d"))
+    assert header["factor"] >= 2 and header["full"] == [24, 24, 40]
+    assert parts["wake"].size <= 5000 * 1.2

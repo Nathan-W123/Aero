@@ -13,7 +13,7 @@
   --line:#CBBF9E; --line-soft:#DED5BC;
   --warn:#8A5A0B; --error:#B3261E;
   --cd:#127A38; --cl:#5B21B6;
-  --tunnel:#0E1710;
+  --tunnel:#30123b;
   --top:52px;
 }
 *{box-sizing:border-box}
@@ -93,10 +93,15 @@ input:focus,select:focus{outline:2px solid var(--accent-soft);border-color:var(-
 .viewer{background:var(--tunnel);border-radius:7px;overflow:hidden;position:relative}
 .viewer canvas{display:block;width:100%;height:100%;cursor:grab}
 .viewer canvas:active{cursor:grabbing}
-.viewer .legend{position:absolute;left:10px;bottom:8px;font-size:11px;color:#9fb3a3;display:flex;align-items:center;gap:8px;pointer-events:none}
-.viewer .legend i{display:inline-block;width:64px;height:6px;border-radius:3px;
-  background:linear-gradient(90deg,#3b1d6e,#2a6f8f,#2fb47c,#e8e04a)}
-.viewer .empty{position:absolute;inset:0;display:grid;place-items:center;color:#6f8474;font-size:13px;pointer-events:none}
+.viewer .legend{position:absolute;left:10px;bottom:8px;font-size:11px;color:#c9bcd9;display:flex;align-items:center;gap:6px;pointer-events:none}
+.viewer .legend i{display:inline-block;width:96px;height:6px;border-radius:3px}
+.viewer .legend .hint{margin-left:10px;color:#9d8fb3}
+.viewer .empty{position:absolute;inset:0;display:grid;place-items:center;color:#9d8fb3;font-size:13px;pointer-events:none}
+.seg{display:inline-flex}
+.seg .btn{border-radius:0}
+.seg .btn:first-child{border-radius:6px 0 0 6px}
+.seg .btn + .btn{margin-left:-1px;border-radius:0 6px 6px 0}
+.seg .btn.on{background:var(--accent);border-color:var(--accent);color:#fff;position:relative}
 svg.chart{display:block;width:100%;height:100%}
 figure{margin:0;flex:1;min-height:0;background:#fff;border:1px solid var(--line-soft);border-radius:6px;overflow:hidden;display:grid;place-items:center}
 figure img{width:100%;height:100%;object-fit:contain;display:block}
@@ -174,12 +179,15 @@ figure .empty{color:var(--faint);font-size:12.5px}
     <div class="midrow">
       <div class="card">
         <h2>Wind tunnel <span class="sp"></span>
-          <button class="btn sm" id="pauseBtn">Pause</button>
+          <span class="seg" id="qtySeg" role="group" aria-label="Quantity shown">
+            <button class="btn sm on" data-q="wake" title="How much the body disturbs the flow, |u − U∞|: clear in the free stream, a plume in the wake">Wake</button>
+            <button class="btn sm" data-q="vorticity" title="How fast the flow spins, |∇×u|: boundary layers, shear layers and vortices">Vorticity</button>
+          </span>
           <button class="btn sm" id="resetBtn">Reset view</button></h2>
         <div class="fill viewer">
           <canvas id="tunnel"></canvas>
-          <div class="empty" id="tunnelEmpty">Streamlets appear once a run starts</div>
-          <div class="legend"><span>slow</span><i></i><span>fast</span><span style="margin-left:10px">drag to rotate · wheel to zoom</span></div>
+          <div class="empty" id="tunnelEmpty">The flow appears once a run starts</div>
+          <div class="legend"><span id="lgName">|u − U∞|</span><span>0</span><i id="lgBar"></i><span id="lgHi">high</span><span class="hint">drag to rotate · wheel to zoom</span></div>
         </div>
       </div>
       <div class="card">
@@ -393,169 +401,267 @@ new ResizeObserver(() => drawChart(lastHist)).observe($("#chart"));
 const _drawChart = drawChart; drawChart = h => { lastHist = h || []; _drawChart(lastHist); };
 
 // ------------------------------------------------------------ 3D tunnel ----
-// Dependency-free: a perspective projection onto a 2D canvas.  The body is
-// drawn from its surface voxels, shaded by a crude normal; streamlets are
-// particles advected through the (trilinearly interpolated) velocity field,
-// seeded at the inlet, drawn as fading trails coloured by speed.
+// Volume rendering, WebGL2.  Every pixel casts a ray through a 3D texture of
+// one scalar -- the wake |u - U∞| or the vorticity -- and gathers colour from
+// the Turbo scale and opacity from a transfer function that leaves the free
+// stream clear, so the flow reads as a glowing medium rather than arrows.
+// The body is a second texture (the smoothed solid mask); rays stop on it and
+// it is lit as a surface.  Only the view and the data change, so it draws on
+// demand.  Without WebGL2 it falls back to the mid-plane on a 2D canvas.
 const tunnel = (() => {
-  const cv = $("#tunnel"), ctx = cv.getContext("2d");
-  const view = {yaw:-0.62, pitch:0.36, zoom:1, paused:false};
-  let geom = null, fld = null, surf = [], parts = [], full = [1,1,1], dpr = 1, W = 0, H = 0;
-  const N_TRAIL = 16;
+  const cv = $("#tunnel");
+  // Turbo, 17 control points (matplotlib's table).  Its darkest colour is the
+  // background, so the faintest flow fades into it rather than onto it.
+  const TURBO = ["#30123b","#4040a2","#466be3","#4294ff","#28bceb","#18ddc2","#32f298","#6dfe62",
+                 "#a4fc3c","#cdec34","#eecf3a","#fdac34","#fb7e21","#eb500e","#d02f05","#a91601","#7a0403"]
+    .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
+  const turbo = t => {
+    t = Math.min(Math.max(t, 0), 1) * (TURBO.length - 1);
+    const i = Math.min(t | 0, TURBO.length - 2), u = t - i, a = TURBO[i], b = TURBO[i + 1];
+    return [0, 1, 2].map(k => a[k] + (b[k] - a[k]) * u);
+  };
+  const QTY = {
+    wake:      {density: 0.13, lo: 0.03, hi: 0.85, unit: "u₀",   name: "|u − U∞|"},
+    vorticity: {density: 0.10, lo: 0.05, hi: 0.90, unit: "u₀/D", name: "|ω|"},
+  };
+  const view = {yaw: -0.52, pitch: 0.34, zoom: 1};
+  let qty = "wake", geom = null, fld = null, full = [1, 1, 1], queued = false;
 
-  function resize(){
-    dpr = Math.min(window.devicePixelRatio || 1, 2);
-    W = cv.clientWidth; H = cv.clientHeight;
-    cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr);
-  }
-  new ResizeObserver(resize).observe(cv); resize();
+  const gl = cv.getContext("webgl2", {antialias: false, depth: false, stencil: false});
+  const ctx2d = gl ? null : cv.getContext("2d");
 
-  function setGeometry(g){
-    geom = g; full = g.header.shape;                 // [nz, ny, nx]
-    const [nz, ny, nx] = full, S = g.solid, idx = (z,y,x) => (z*ny + y)*nx + x;
-    surf = [];
-    for(let z=0; z<nz; z++) for(let y=0; y<ny; y++) for(let x=0; x<nx; x++){
-      if(!S[idx(z,y,x)]) continue;
-      let nX=0, nY=0, nZ=0, open=false;
-      const chk = (dz,dy,dx) => { const zz=z+dz, yy=y+dy, xx=x+dx;
-        if(nz>1 && (zz<0||zz>=nz)) return; if(yy<0||yy>=ny||xx<0||xx>=nx) return;
-        if(!S[idx(zz,yy,xx)]){ open=true; nX+=dx; nY+=dy; nZ+=dz; } };
-      chk(0,0,1); chk(0,0,-1); chk(0,1,0); chk(0,-1,0); if(nz>1){ chk(1,0,0); chk(-1,0,0); }
-      if(open){ const l = Math.hypot(nX,nY,nZ)||1; surf.push([x+.5, y+.5, z+.5, nX/l, nY/l, nZ/l]); }
-    }
-    if(nz === 1){ view.yaw = -0.25; view.pitch = 0.55; }
-    $("#tunnelEmpty").hidden = true;
-    if(parts.length === 0) seedAll();
-  }
-  function setField(f){ fld = f; }
-  function reset(){ geom = null; fld = null; surf = []; parts = []; $("#tunnelEmpty").hidden = false; }
-  function resetView(){ view.yaw = full[0] === 1 ? -0.25 : -0.62; view.pitch = full[0] === 1 ? 0.55 : 0.36; view.zoom = 1; }
+  // --------------------------------------------------------------- GL ---
+  let prog = null, U = {}, texVol, texSolid, texLut, volShape = [1, 1, 1], hasSolid = false;
+  if(gl){
+    const VS = `#version 300 es
+      in vec2 aPos; out vec2 vNdc;
+      void main(){ vNdc = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+    const FS = `#version 300 es
+      precision highp float; precision highp sampler3D;
+      uniform sampler3D uVol, uSolid; uniform sampler2D uLut;
+      uniform vec3 uEye, uRight, uUp, uFwd, uBox, uCell, uBg;
+      uniform float uTanHalf, uAspect, uDensity, uLo, uHi;
+      uniform bool uHasSolid, uHasVol;
+      in vec2 vNdc; out vec4 outColor;
 
-  function solidAt(x,y,z){
-    const [nz,ny,nx] = full; const xi=x|0, yi=y|0, zi=nz>1 ? (z|0) : 0;
-    if(xi<0||yi<0||xi>=nx||yi>=ny||(nz>1&&(zi<0||zi>=nz))) return true;
-    return !!geom.solid[(zi*ny+yi)*nx+xi];
-  }
-  function sampleU(x,y,z){
-    if(!fld) return [0,0,0];
-    const [sz,sy,sx] = fld.header.shape, f = fld.header.factor;
-    let gx = x/f, gy = y/f, gz = sz>1 ? z/f : 0;
-    gx = Math.min(Math.max(gx,0), sx-1.001); gy = Math.min(Math.max(gy,0), sy-1.001); gz = Math.min(Math.max(gz,0), Math.max(sz-1.001,0));
-    const x0=gx|0, y0=gy|0, z0=gz|0, tx=gx-x0, ty=gy-y0, tz=gz-z0;
-    const x1=Math.min(x0+1,sx-1), y1=Math.min(y0+1,sy-1), z1=Math.min(z0+1,sz-1);
-    const I = (z,y,x) => (z*sy+y)*sx+x;
-    const lerp = (a,b,t) => a+(b-a)*t;
-    const tri = A => {
-      const c00=lerp(A[I(z0,y0,x0)],A[I(z0,y0,x1)],tx), c10=lerp(A[I(z0,y1,x0)],A[I(z0,y1,x1)],tx);
-      const c01=lerp(A[I(z1,y0,x0)],A[I(z1,y0,x1)],tx), c11=lerp(A[I(z1,y1,x0)],A[I(z1,y1,x1)],tx);
-      return lerp(lerp(c00,c10,ty), lerp(c01,c11,ty), tz);
-    };
-    return [tri(fld.ux), tri(fld.uy), tri(fld.uz)];
-  }
-  function seed(p){
-    const [nz,ny,nx] = full;
-    for(let k=0;k<12;k++){
-      const x = 0.5 + Math.random()*2.5, y = 0.5 + Math.random()*(ny-1), z = nz>1 ? 0.5 + Math.random()*(nz-1) : 0.5;
-      if(!solidAt(x,y,z)){ p.x=x; p.y=y; p.z=z; break; }
-    }
-    p.age = 0; p.life = 260 + Math.random()*200; p.stuck = 0; p.trail = [];
-    p.pre = Math.floor(Math.random()*40);         // stagger births so they don't march in a wall
-  }
-  function seedAll(){
-    const n = full[0] > 1 ? 700 : 420;
-    parts = Array.from({length:n}, () => { const p = {}; seed(p); p.pre = Math.floor(Math.random()*600); return p; });
-  }
-  function advance(){
-    if(!fld || !geom) return;
-    const [nz,ny,nx] = full, umax = fld.header.umax || 1e-9;
-    const dt = (nx / 240) / umax;                 // a full traverse in ~4 s at 60 fps
-    for(const p of parts){
-      if(p.pre > 0){ p.pre--; continue; }
-      const [ux,uy,uz] = sampleU(p.x,p.y,p.z);
-      const sp = Math.hypot(ux,uy,uz);
-      p.x += ux*dt; p.y += uy*dt; if(nz>1) p.z += uz*dt;
-      p.age++; p.stuck = sp < umax*0.02 ? p.stuck+1 : 0;
-      p.trail.push([p.x,p.y,p.z,sp/umax]); if(p.trail.length > N_TRAIL) p.trail.shift();
-      if(p.x >= nx-1 || p.x < 0 || p.y < 0 || p.y >= ny || (nz>1 && (p.z<0||p.z>=nz)) || solidAt(p.x,p.y,p.z) || p.age > p.life || p.stuck > 40) seed(p);
-    }
-  }
-  // viridis-ish ramp: purple -> teal -> green -> yellow
-  const RAMP = [[59,29,110],[42,111,143],[47,180,124],[232,224,74]];
-  function ramp(t){
-    t = Math.min(Math.max(t,0),1) * (RAMP.length-1); const i = Math.min(t|0, RAMP.length-2), u = t-i;
-    const a = RAMP[i], b = RAMP[i+1]; return [a[0]+(b[0]-a[0])*u, a[1]+(b[1]-a[1])*u, a[2]+(b[2]-a[2])*u];
-  }
-  function project(x,y,z){
-    const [nz,ny,nx] = full;
-    const px = x-nx/2, py = y-ny/2, pz = z-nz/2;
-    const cy=Math.cos(view.yaw), sy=Math.sin(view.yaw), cp=Math.cos(view.pitch), sp=Math.sin(view.pitch);
-    const X = px*cy - pz*sy, Zr = px*sy + pz*cy;
-    const Y = py*cp - Zr*sp, Z = py*sp + Zr*cp;
-    const Dd = Math.max(nx,ny,nz)*2.4;
-    const per = Dd/(Dd - Z), s = Math.min(W/nx, H/Math.max(ny, nz*0.9))*0.78*view.zoom;
-    return [W/2 + X*per*s, H/2 - Y*per*s, Z, per*s];
-  }
-  function draw(){
-    ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.fillStyle = "#0E1710"; ctx.fillRect(0,0,W,H);
-    if(!geom){ requestAnimationFrame(draw); return; }
-    const [nz,ny,nx] = full;
-    // tunnel edges
-    const C = [[0,0,0],[nx,0,0],[nx,ny,0],[0,ny,0],[0,0,nz],[nx,0,nz],[nx,ny,nz],[0,ny,nz]].map(c=>project(...c));
-    const E = nz>1 ? [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]] : [[0,1],[1,2],[2,3],[3,0]];
-    ctx.strokeStyle = "rgba(160,190,168,0.28)"; ctx.lineWidth = 1;
-    ctx.beginPath(); for(const [a,b] of E){ ctx.moveTo(C[a][0],C[a][1]); ctx.lineTo(C[b][0],C[b][1]); } ctx.stroke();
-    // inlet arrow hint
-    const i0 = project(0, ny/2, nz/2), i1 = project(Math.max(nx*0.06,3), ny/2, nz/2);
-    ctx.strokeStyle = "rgba(160,190,168,0.5)"; ctx.beginPath(); ctx.moveTo(i0[0],i0[1]); ctx.lineTo(i1[0],i1[1]); ctx.stroke();
-
-    // body: depth-sorted surface voxels with a simple headlight shade
-    const bodyPts = surf.map(v => { const q = project(v[0],v[1],v[2]); return [q[0],q[1],q[2],q[3],v[3],v[4],v[5]]; });
-    bodyPts.sort((a,b)=>b[2]-a[2]);
-    const bodyDepth = bodyPts.length ? bodyPts[bodyPts.length>>1][2] : 0;
-    const cy=Math.cos(view.yaw), sy=Math.sin(view.yaw), cp=Math.cos(view.pitch), sp=Math.sin(view.pitch);
-    const trails = [];
-    for(const p of parts){ if(p.trail.length > 1){ const h = p.trail[p.trail.length-1]; trails.push([p, project(h[0],h[1],h[2])[2]]); } }
-    const drawTrails = behind => {
-      ctx.lineCap = "round";
-      for(const [p, d] of trails){
-        if(behind ? d <= bodyDepth : d > bodyDepth) continue;
-        const fade = p.age > p.life-40 ? (p.life-p.age)/40 : 1;
-        const n = p.trail.length;
-        for(let i=1;i<n;i++){
-          const a = project(p.trail[i-1][0],p.trail[i-1][1],p.trail[i-1][2]), b = project(p.trail[i][0],p.trail[i][1],p.trail[i][2]);
-          const c = ramp(p.trail[i][3]); const al = (i/n)*0.85*fade;
-          ctx.strokeStyle = `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${al.toFixed(3)})`;
-          ctx.lineWidth = 0.8 + 1.4*(i/n) * Math.min(b[3]/2, 1.6);
-          ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
-        }
+      vec2 hitBox(vec3 ro, vec3 rd){
+        vec3 inv = 1.0 / rd, a = -ro * inv, b = (uBox - ro) * inv;
+        vec3 lo = min(a, b), hi = max(a, b);
+        return vec2(max(max(lo.x, lo.y), lo.z), min(min(hi.x, hi.y), hi.z));
       }
-    };
-    drawTrails(true);
-    for(const q of bodyPts){
-      // normal in view space, lit from the camera
-      const nX = q[4]*cy - q[6]*sy, nZr = q[4]*sy + q[6]*cy, nY = q[5]*cp - nZr*sp, nZ = q[5]*sp + nZr*cp;
-      const lit = Math.max(0, -nZ)*0.75 + Math.max(0,nY)*0.25 + 0.18;
-      const r = Math.max(1.2, q[3]*0.62);
-      ctx.fillStyle = `rgb(${(40+120*lit)|0},${(90+140*lit)|0},${(60+110*lit)|0})`;
-      ctx.beginPath(); ctx.arc(q[0],q[1],r,0,6.283); ctx.fill();
-    }
-    drawTrails(false);
-    if(!view.paused) advance();
-    requestAnimationFrame(draw);
+      // faint tunnel edges: a point on the box surface near two faces at once
+      float edge(vec3 p, float w){
+        vec3 d = min(p, uBox - p);
+        vec3 on = step(d, vec3(w));
+        return step(1.5, on.x + on.y + on.z);
+      }
+      void main(){
+        vec3 rd = normalize(uFwd + vNdc.x * uTanHalf * uAspect * uRight + vNdc.y * uTanHalf * uUp);
+        vec2 t = hitBox(uEye, rd);
+        if(t.x >= t.y || t.y <= 0.0){ outColor = vec4(uBg, 1.0); return; }
+        t.x = max(t.x, 0.0);
+        float px = 1.6 * uTanHalf / 400.0;            // ~ a pixel per unit distance
+        vec3 lines = vec3(0.62, 0.55, 0.78) * (0.30 * edge(uEye + rd * t.x, px * t.x)
+                                              + 0.14 * edge(uEye + rd * t.y, px * t.y));
+        float dt = 0.5;                               // half a cell
+        float tt = t.x + dt * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        vec4 acc = vec4(0.0);
+        for(int i = 0; i < 2048; i++){
+          if(tt > t.y || acc.a > 0.985) break;
+          vec3 tc = (uEye + rd * tt) / uBox;
+          if(uHasSolid && texture(uSolid, tc).r > 0.5){
+            // pin the surface down between the last two samples, so the
+            // shading does not inherit the jittered step
+            float a = tt - dt, b = tt;
+            for(int k = 0; k < 6; k++){
+              float m = 0.5 * (a + b);
+              if(texture(uSolid, (uEye + rd * m) / uBox).r > 0.5) b = m; else a = m;
+            }
+            tc = (uEye + rd * b) / uBox;
+            vec3 h = 1.5 * uCell;
+            vec3 g = vec3(texture(uSolid, tc + vec3(h.x, 0, 0)).r - texture(uSolid, tc - vec3(h.x, 0, 0)).r,
+                          texture(uSolid, tc + vec3(0, h.y, 0)).r - texture(uSolid, tc - vec3(0, h.y, 0)).r,
+                          texture(uSolid, tc + vec3(0, 0, h.z)).r - texture(uSolid, tc - vec3(0, 0, h.z)).r);
+            // no gradient means the ray came in through a face of the tunnel
+            // (the end cap of a 2D slab, or a body touching a wall): use its normal
+            vec3 face = -sign(rd) * step(vec3(t.x - 1e-3), min(-uEye / rd, (uBox - uEye) / rd));
+            vec3 n = dot(g, g) > 1e-4 ? -normalize(g) : (dot(face, face) > 0.0 ? normalize(face) : -rd);
+            float head = max(dot(n, -rd), 0.0);
+            float key = max(dot(n, normalize(vec3(-0.35, 0.85, 0.40))), 0.0);
+            vec3 body = vec3(0.70, 0.71, 0.73) * (0.24 + 0.50 * head + 0.32 * key) + vec3(0.25) * pow(head, 30.0);
+            acc.rgb += (1.0 - acc.a) * body;
+            acc.a = 1.0;
+            break;
+          }
+          if(uHasVol){
+            float v = texture(uVol, tc).r;
+            float w = smoothstep(uLo, uHi, v);
+            if(w > 0.0){
+              float a = 1.0 - exp(-uDensity * w * dt);
+              vec3 c = texture(uLut, vec2(v, 0.5)).rgb * (1.0 + 0.5 * w);
+              acc.rgb += (1.0 - acc.a) * a * c;
+              acc.a += (1.0 - acc.a) * a;
+            }
+          }
+          tt += dt;
+        }
+        outColor = vec4(acc.rgb + (1.0 - acc.a) * (uBg + lines), 1.0);
+      }`;
+    const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+    gl.linkProgram(prog);
+    if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    for(const n of ["uVol","uSolid","uLut","uEye","uRight","uUp","uFwd","uBox","uCell","uBg",
+                    "uTanHalf","uAspect","uDensity","uLo","uHi","uHasSolid","uHasVol"]) U[n] = gl.getUniformLocation(prog, n);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, "aPos");
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    const tex3 = unit => { const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, t);
+      for(const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, p, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 1, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1)); return t; };
+    texVol = tex3(0); texSolid = tex3(1);
+    texLut = gl.createTexture(); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texLut);
+    const lut = new Uint8Array(256 * 4);
+    for(let i = 0; i < 256; i++){ const c = turbo(i / 255); lut.set([c[0], c[1], c[2], 255], 4 * i); }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lut);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.uniform1i(U.uVol, 0); gl.uniform1i(U.uSolid, 1); gl.uniform1i(U.uLut, 2);
+    const bg = turbo(0).map(v => v / 255); gl.uniform3f(U.uBg, bg[0], bg[1], bg[2]);
   }
-  requestAnimationFrame(draw);
 
-  // interaction
-  let drag = null;
-  cv.addEventListener("mousedown", e => { drag = [e.clientX, e.clientY]; });
-  window.addEventListener("mouseup", () => { drag = null; });
-  window.addEventListener("mousemove", e => { if(!drag) return;
-    view.yaw += (e.clientX-drag[0])*0.008; view.pitch = Math.min(1.4, Math.max(-1.4, view.pitch + (e.clientY-drag[1])*0.008)); drag = [e.clientX,e.clientY]; });
-  cv.addEventListener("wheel", e => { e.preventDefault(); view.zoom = Math.min(4, Math.max(0.4, view.zoom * (e.deltaY < 0 ? 1.1 : 0.9))); }, {passive:false});
-  $("#pauseBtn").addEventListener("click", () => { view.paused = !view.paused; $("#pauseBtn").textContent = view.paused ? "Play" : "Pause"; });
+  function upload(unit, tex, data, shape){                 // shape = [nz, ny, nx]
+    gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, tex);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, shape[2], shape[1], shape[0], 0, gl.RED, gl.UNSIGNED_BYTE, data);
+  }
+  // A 3x3x3 box blur of the solid mask, so the trilinear surface at 0.5 is
+  // rounded rather than a staircase of cube corners.
+  function smoothMask(S, [nz, ny, nx]){
+    let a = Float32Array.from(S, v => v ? 1 : 0), b = new Float32Array(a.length);
+    const passes = [[1, nx], [nx, ny], [nx * ny, nz]];
+    for(const [stride, n] of passes){
+      if(n < 3) continue;
+      for(let i = 0; i < a.length; i++){
+        const k = Math.floor(i / stride) % n;
+        const lo = k > 0 ? a[i - stride] : a[i], hi = k < n - 1 ? a[i + stride] : a[i];
+        b[i] = (lo + a[i] + hi) / 3;
+      }
+      [a, b] = [b, a];
+    }
+    return Uint8Array.from(a, v => Math.round(v * 255));
+  }
+
+  function boxDims(){
+    const [nz, ny, nx] = full;
+    return [nx, ny, nz > 1 ? nz : Math.max(4, 0.12 * Math.max(nx, ny))];   // a 2D run is drawn as a slab
+  }
+  function resize(){
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    cv.width = Math.max(1, Math.round(cv.clientWidth * dpr));
+    cv.height = Math.max(1, Math.round(cv.clientHeight * dpr));
+    request();
+  }
+  function request(){ if(!queued){ queued = true; requestAnimationFrame(draw); } }
+
+  function draw(){
+    queued = false;
+    if(!gl){ draw2d(); return; }
+    gl.viewport(0, 0, cv.width, cv.height);
+    const box = boxDims(), c = box.map(v => v / 2), tanHalf = Math.tan(20 * Math.PI / 180), aspect = cv.width / cv.height;
+    const cp = Math.cos(view.pitch), dir = [cp * Math.sin(view.yaw), Math.sin(view.pitch), cp * Math.cos(view.yaw)];
+    const norm = v => { const l = Math.hypot(...v) || 1; return v.map(x => x / l); };
+    const cross = (a, b) => [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]];
+    const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const fwd = dir.map(v => -v), right = norm(cross(fwd, [0, 1, 0])), up = cross(right, fwd);
+    // the distance at which all eight corners fit, with a margin, then zoom
+    let fit = 0;
+    for(const sx of [-1, 1]) for(const sy of [-1, 1]) for(const sz of [-1, 1]){
+      const o = [sx * c[0], sy * c[1], sz * c[2]], zc = dot(o, fwd);
+      fit = Math.max(fit, Math.abs(dot(o, right)) / (tanHalf * aspect * 0.9) - zc, Math.abs(dot(o, up)) / (tanHalf * 0.84) - zc);
+    }
+    const dist = fit / view.zoom, eye = c.map((v, i) => v + dist * dir[i]);
+    const q = QTY[qty], flat = full[0] <= 1;
+    gl.uniform3f(U.uEye, ...eye); gl.uniform3f(U.uFwd, ...fwd); gl.uniform3f(U.uRight, ...right); gl.uniform3f(U.uUp, ...up);
+    gl.uniform3f(U.uBox, ...box); gl.uniform3f(U.uCell, 1 / full[2], 1 / full[1], 1 / Math.max(full[0], 1));
+    gl.uniform1f(U.uTanHalf, tanHalf); gl.uniform1f(U.uAspect, aspect);
+    gl.uniform1f(U.uDensity, flat ? q.density * 10 / box[2] : q.density); gl.uniform1f(U.uLo, q.lo); gl.uniform1f(U.uHi, q.hi);
+    gl.uniform1i(U.uHasSolid, hasSolid ? 1 : 0); gl.uniform1i(U.uHasVol, fld ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // Fallback: the mid-plane, coloured the same way, on a plain 2D canvas.
+  function draw2d(){
+    const W = cv.width, H = cv.height, bg = turbo(0);
+    ctx2d.fillStyle = `rgb(${bg.join(",")})`; ctx2d.fillRect(0, 0, W, H);
+    if(!fld) return;
+    const [sz, sy, sx] = fld.header.shape, k = sz >> 1, A = fld[qty], img = new ImageData(sx, sy);
+    const fs = fld.header.factor || 1, [gz, gy, gx] = full;
+    const solidAt = (y, x) => geom && geom.solid[((Math.min(k * fs, gz - 1)) * gy + Math.min(y * fs, gy - 1)) * gx + Math.min(x * fs, gx - 1)];
+    for(let y = 0; y < sy; y++) for(let x = 0; x < sx; x++){
+      const o = 4 * ((sy - 1 - y) * sx + x);
+      if(solidAt(y, x)){ img.data.set([158, 160, 165, 255], o); continue; }
+      const v = A[(k * sy + y) * sx + x] / 255, c = turbo(v), w = Math.min(1, v * 2.5);
+      img.data.set([bg[0] + (c[0] - bg[0]) * w, bg[1] + (c[1] - bg[1]) * w, bg[2] + (c[2] - bg[2]) * w, 255], o);
+    }
+    const off = document.createElement("canvas"); off.width = sx; off.height = sy; off.getContext("2d").putImageData(img, 0, 0);
+    const s = Math.min(W / sx, H / sy) * 0.94;
+    ctx2d.imageSmoothingEnabled = true; ctx2d.drawImage(off, (W - sx * s) / 2, (H - sy * s) / 2, sx * s, sy * s);
+  }
+
+  function legend(){
+    const q = QTY[qty], scale = fld && fld.header.scales ? fld.header.scales[qty] : null;
+    $("#lgName").textContent = q.name;
+    $("#lgHi").textContent = scale ? `${+scale.toFixed(2)} ${q.unit}` : "high";
+  }
+  function setGeometry(g){
+    geom = g; full = g.header.shape;
+    if(gl){ upload(1, texSolid, smoothMask(g.solid, full), full); hasSolid = true; }
+    if(full[0] <= 1){ view.yaw = 0; view.pitch = 0.22; }
+    $("#tunnelEmpty").hidden = true; request();
+  }
+  function setField(f){
+    fld = f; volShape = f.header.shape;
+    if(!geom) full = f.header.full;
+    if(gl) upload(0, texVol, f[qty], volShape);
+    legend(); $("#tunnelEmpty").hidden = true; request();
+  }
+  function setQuantity(name){
+    if(!QTY[name] || name === qty) return;
+    qty = name;
+    if(fld && gl) upload(0, texVol, fld[qty], volShape);
+    for(const b of document.querySelectorAll("#qtySeg .btn")) b.classList.toggle("on", b.dataset.q === qty);
+    legend(); request();
+  }
+  function reset(){
+    geom = null; fld = null; hasSolid = false; full = [1, 1, 1];
+    if(gl){ upload(0, texVol, new Uint8Array(1), [1, 1, 1]); upload(1, texSolid, new Uint8Array(1), [1, 1, 1]); }
+    $("#tunnelEmpty").hidden = false; request();
+  }
+  function resetView(){ view.yaw = full[0] <= 1 ? 0 : -0.52; view.pitch = full[0] <= 1 ? 0.22 : 0.34; view.zoom = 1; request(); }
+
+  new ResizeObserver(resize).observe(cv); resize();
+  let dragAt = null;
+  cv.addEventListener("pointerdown", e => { dragAt = [e.clientX, e.clientY]; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener("pointerup", () => { dragAt = null; });
+  cv.addEventListener("pointermove", e => { if(!dragAt) return;
+    view.yaw -= (e.clientX - dragAt[0]) * 0.008;
+    view.pitch = Math.min(1.45, Math.max(-1.45, view.pitch + (e.clientY - dragAt[1]) * 0.008));
+    dragAt = [e.clientX, e.clientY]; request(); });
+  cv.addEventListener("wheel", e => { e.preventDefault();
+    view.zoom = Math.min(6, Math.max(0.4, view.zoom * (e.deltaY < 0 ? 1.1 : 0.9))); request(); }, {passive: false});
+  for(const b of document.querySelectorAll("#qtySeg .btn")) b.addEventListener("click", () => setQuantity(b.dataset.q));
   $("#resetBtn").addEventListener("click", resetView);
-  return {setGeometry, setField, reset};
+  $("#lgBar").style.background = `linear-gradient(90deg, ${TURBO.map(c => `rgb(${c.join(",")})`).join(",")})`;
+  if(!gl) document.querySelector(".viewer .legend .hint").textContent = "mid-plane slice · the 3D view needs WebGL2";
+  legend();
+  return {setGeometry, setField, reset, setQuantity};
 })();
 
 boot();

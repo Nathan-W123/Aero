@@ -281,24 +281,63 @@ def _geometry_payload(solid: np.ndarray) -> bytes:
                  solid.astype(np.uint8))
 
 
+#: Voxels sent to the browser's volume renderer per refresh; larger grids are
+#: strided down to about this.  One byte a voxel, so a few MB on localhost.
+FIELD_VOXELS_MAX = 2_500_000
+
+#: Disturbance speed |u - U_inf| at the top of the colour scale, in units of u0.
+WAKE_FULL_SCALE = 1.2
+
+
 def _field_payload(solver, mode: str) -> bytes:
-    """Velocity, strided down so the largest axis has ~48 samples."""
+    """
+    Two scalar volumes for the viewer's volume renderer, one byte a voxel.
+
+    ``wake`` is |u - U_inf| / u0: how much the body disturbs the flow.  It is
+    zero in the free stream, so the free stream renders as clear space and the
+    wake as a plume; full scale is WAKE_FULL_SCALE u0.  ``vorticity`` is
+    |curl u| D / u0, scaled to its 99.5th percentile over the fluid so the
+    shear layers show at any Reynolds number (the scale is in the header, for
+    the legend).  Inside the body both are zero: the body is drawn from the
+    geometry, as a surface.
+    """
     if mode == "2d":
         _, ux, uy = solver.macroscopic()
         ux, uy = ux[None], uy[None]
         uz = np.zeros_like(ux)
     else:
         _, ux, uy, uz = solver.macroscopic()
+    solid = solver.solid.get() if hasattr(solver.solid, "get") else solver.solid
+    solid = np.asarray(solid, dtype=bool).reshape(ux.shape)
     nz, ny, nx = ux.shape
-    f = max(1, int(np.ceil(max(nx, ny, nz) / 48)))
+    f = max(1, int(np.ceil((ux.size / FIELD_VOXELS_MAX) ** (1.0 / 3.0))))
     sl = (slice(None, None, f),) * 3
-    ux, uy, uz = ux[sl], uy[sl], uz[sl]
-    speed = np.sqrt(ux * ux + uy * uy + uz * uz)
-    umax = float(np.nanmax(speed)) if speed.size else 0.0
+    ux, uy, uz = (np.nan_to_num(a[sl].astype(np.float32)) for a in (ux, uy, uz))
+    solid = solid[sl]
+    u0 = float(getattr(solver, "u0", 0.05)) or 0.05
+    d_ref = float(getattr(solver, "D", 1.0)) or 1.0
+
+    def ddx(a, axis):                                  # axes are (z, y, x)
+        return np.gradient(a, float(f), axis=axis) if a.shape[axis] > 1 else np.zeros_like(a)
+
+    wake = np.sqrt((ux - u0) ** 2 + uy * uy + uz * uz) / u0
+    wx = ddx(uz, 1) - ddx(uy, 0)
+    wy = ddx(ux, 0) - ddx(uz, 2)
+    wz = ddx(uy, 2) - ddx(ux, 1)
+    vort = np.sqrt(wx * wx + wy * wy + wz * wz) * (d_ref / u0)
+    wake[solid] = 0.0
+    vort[solid] = 0.0
+    fluid = vort[~solid]
+    v_scale = max(float(np.percentile(fluid, 99.5)) if fluid.size else 1.0, 1e-6)
+
+    def byte(a, full_scale):
+        return np.clip(a * (255.0 / full_scale) + 0.5, 0.0, 255.0).astype(np.uint8)
+
     return _pack(
-        {"shape": list(ux.shape), "factor": f, "full": [nz, ny, nx],
-         "umax": umax, "names": ["ux", "uy", "uz"]},
-        ux.astype(np.float32), uy.astype(np.float32), uz.astype(np.float32),
+        {"shape": list(wake.shape), "factor": f, "full": [nz, ny, nx], "u0": u0,
+         "scales": {"wake": WAKE_FULL_SCALE, "vorticity": _num(v_scale, 3)},
+         "names": ["wake", "vorticity"]},
+        byte(wake, WAKE_FULL_SCALE), byte(vort, v_scale),
     )
 
 
