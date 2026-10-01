@@ -23,6 +23,7 @@ from aero.geometry3d.sphere import Sphere
 from aero.geometry3d.box import Box
 from aero.geometry3d.cylinder3d import Cylinder3D
 from aero.benchmarks import build_uncertainty_report, build_validation_report, sphere_expected_cd
+from aero.blockage import blockage_of_case
 from aero.autoconfig import autoconfigure_3d
 from aero.lbm.solver3d import Solver3D
 from aero.case import SimulationCase
@@ -195,6 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Start of 2× refined z-slab (coarse grid index)")
     p.add_argument("--refine-z-hi", type=int, default=None,
                    help="End of 2× refined z-slab (exclusive, coarse grid index)")
+    p.add_argument("--refine-body", action="store_true",
+                   help="Run a box around the body at twice the resolution, two fine steps per "
+                        "step, with the body voxelized again there and the forces taken from it "
+                        "(aero.lbm.refine3d)")
 
     # Run control
     p.add_argument("--steps", type=int, default=20000)
@@ -531,7 +536,32 @@ def main() -> int:
         beta=args.beta,
         T_ref=args.T_ref,
     )
-    if _use_multiblock:
+    if args.refine_body:
+        from aero.lbm.refine3d import RefinedSolver3D, fine_body_mask, refinement_box
+        if _use_multiblock:
+            print("[X] --refine-body and --refine-z-lo/--refine-z-hi are two refinements; pick one.")
+            return 1
+        unused = [name for name, on in (("--checkpoint-every", args.checkpoint_every),
+                                        ("--auto-stop", args.auto_stop), ("--export-hdf5", args.export_hdf5),
+                                        ("--statistics", args.statistics), ("--resume-from", args.resume_from))
+                  if on]
+        if unused:
+            print(f"[X] --refine-body does not support {', '.join(unused)} yet.")
+            return 1
+        try:
+            box = refinement_box(solid, D)
+            fine = fine_body_mask(geom, (args.nz, args.ny, args.nx), box)
+            _rb_kw = {k: v for k, v in _solver_kw.items() if k not in ("Nz", "Ny", "Nx", "solid")}
+            solver = RefinedSolver3D(args.nz, args.ny, args.nx, solid, box, fine, **_rb_kw)
+        except ValueError as exc:
+            print(f"[X] {exc}")
+            return 1
+        z0, z1, y0, y1, x0, x1 = box
+        work = solver.cells
+        print(f"Refined   : x[{x0},{x1}) y[{y0},{y1}) z[{z0},{z1}) at 2x  "
+              f"(~{work['updates_per_step'] / work['coarse']:.1f}x the work of the plain grid, "
+              f"{work['uniform_fine_updates_per_step'] / work['coarse']:.0f}x to refine it all)")
+    elif _use_multiblock:
         from aero.lbm.multiblock import MultiblockSolver3D
         _mb_kw = {k: v for k, v in _solver_kw.items() if k not in ("Nz", "Ny", "Nx", "solid")}
         solver = MultiblockSolver3D(
@@ -630,7 +660,9 @@ def main() -> int:
         params=vars(args),
         cd=result.get("Cd_mean"),
         grid_cd_values=result.get("grid_cd_values"),
-        blockage=blockage,
+        # the blockage model's measure, frontal area as an equivalent disc,
+        # where the case has a formula for it; the extent ratio otherwise
+        blockage=(blockage_of_case("3d", args.shape, vars(args)) or {"b": blockage})["b"],
     )
     uncertainty = build_uncertainty_report(
         mode="3d",

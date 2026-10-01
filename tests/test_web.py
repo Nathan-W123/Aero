@@ -374,7 +374,8 @@ def test_preflight_reports_blockage_before_anything_runs():
     assert out["error"] is None
     checks = out["uncertainty"]
     assert {"stability", "blockage", "domain_length", "discretization"} <= set(checks)
-    assert "29%" in checks["blockage"]["short"]
+    assert "6.7% by area" in checks["blockage"]["short"]          # pi 7^2 / 48^2
+    assert "29%" in checks["blockage"]["message"]                   # D / span
     assert out["reference"]["expected"] > out["reference"]["unconfined"]     # confinement
     assert out["setup"]["cells"] == 96 * 48 * 48
     json.dumps(out)
@@ -535,6 +536,7 @@ def test_a_slender_mesh_is_graded_on_its_frontal_area():
     area = float(b["short"].split()[1].rstrip("%"))
     assert area < 5.0
     assert "42%" in b["message"]                 # the extent is still reported
+    assert b["status"] != "fail"
 
 
 def test_preview_is_the_mask_the_run_uses():
@@ -584,3 +586,123 @@ def test_the_sample_aircraft_keeps_its_shape_at_the_size_its_readme_gives():
     small = web._preflight(_mesh_params(plane, mesh_size="24", mesh_orient="none",
                                         nx="144", ny="72", nz="96"))["uncertainty"]["mesh"]
     assert small["status"] == "warn" and "needs about 48" in small["short"]
+
+
+# ---------------------------------------------------------------------------
+# Grid study
+# ---------------------------------------------------------------------------
+
+def test_a_scaled_case_is_the_same_flow_on_a_finer_grid():
+    p = {"mode": "3d", "shape": "sphere", "radius": "7", "nx": "96", "ny": "48", "nz": "48",
+         "re": "100", "u0": "0.05", "steps": "3000"}
+    q = web._scaled_case(p, 2 ** 0.5)
+    assert float(q["radius"]) == pytest.approx(7 * 2 ** 0.5, rel=1e-5)
+    assert (q["nx"], q["ny"], q["nz"]) == ("136", "68", "68")
+    assert q["steps"] == "4243"                       # the same flow time
+    assert (q["re"], q["u0"]) == ("100", "0.05")      # the same flow
+    a, b = web._case(p), web._case(q)
+    assert b["D"] / b["grid"][1] == pytest.approx(a["D"] / a["grid"][1], rel=0.01)   # blockage
+
+
+def test_a_grid_study_runs_three_levels_and_reports_the_gci():
+    job = web.Job(id="t_study", kind="study", params={
+        "mode": "2d", "shape": "cylinder", "radius": 6, "re": 20, "u0": 0.05,
+        "nx": 96, "ny": 48, "steps": 600, "backend": "numpy", "study_levels": "coarser"})
+    web._run_study(job)
+    assert job.state == "done", job.error
+    st = job.result["study"]
+    cells = [lv["cells_across"] for lv in st["levels"]]
+    assert len(cells) == 3 and cells == sorted(cells) and cells[-1] == pytest.approx(12.0)
+    assert [lv["case"] for lv in st["levels"]] == [False, False, True]
+    assert len(st["plan"]) == 3
+    a = st["analysis"]
+    assert a["gci"] is not None and a["status"] in ("pass", "warn", "fail")
+    if a["convergence"] != "divergent":
+        fx = a["free_air_extrapolated"]               # the best estimate: zero cell size, free air
+        assert fx["cd"] < a["extrapolated"] and fx["uncertainty"] > 0
+    assert job.result["uncertainty"]["discretization"]["short"].startswith("grid study")
+    assert job.step == job.total                      # the bar covers every level
+    assert job.level == 2
+    json.dumps(job.public())                          # strict JSON all the way down
+
+
+def test_a_stopped_study_keeps_the_levels_it_finished():
+    job = web.Job(id="t_study_stop", kind="study", params={
+        "mode": "2d", "shape": "cylinder", "radius": 6, "re": 20, "u0": 0.05,
+        "nx": 96, "ny": 48, "steps": 400, "backend": "numpy"})
+    original = web._simulate
+    calls = []
+
+    def stop_on_the_second_level(job_, *a, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            job_._cancel.set()
+        return original(job_, *a, **kw)
+
+    web._simulate = stop_on_the_second_level
+    try:
+        web._run_study(job)
+    finally:
+        web._simulate = original
+    assert job.state == "stopped"
+    assert len(job.result["study"]["levels"]) == 1
+    assert job.result["study"]["analysis"] is None
+
+
+# ---------------------------------------------------------------------------
+# Refinement near the body
+# ---------------------------------------------------------------------------
+
+def _refined(**kw):
+    p = {"mode": "3d", "shape": "sphere", "radius": 3, "nx": 48, "ny": 24, "nz": 24, "re": 20,
+         "u0": 0.05, "steps": 60, "collision": "bgk", "refine": True}
+    p.update(kw)
+    return p
+
+
+def test_a_refined_run_completes_and_reports_its_block():
+    job = web.Job(id="t_refined", params=_refined())
+    web._run_job(job)
+    assert job.state == "done", job.error
+    ref = job.result["setup"]["refined"]
+    assert ref["fine_cells"] > 0 and 1.0 < ref["work"] < ref["work_uniform_fine"]
+    assert "refined" in job.result["setup"]["label"]
+    assert job.result["uncertainty"]["refinement"]["status"] == "pass"
+    assert np.isfinite(job.result["coefficients"]["cd"])
+
+
+def test_preflight_says_where_the_refined_block_goes():
+    res = web._preflight({"mode": "3d", "shape": "sphere", "radius": "7", "refine": True})
+    chk = res["uncertainty"]["refinement"]
+    assert chk["status"] == "pass" and "28 cells across" in chk["short"]
+
+
+def test_preflight_says_when_the_body_is_too_close_to_the_walls_to_refine():
+    res = web._preflight({"mode": "3d", "shape": "sphere", "radius": "21", "refine": True})
+    assert res["uncertainty"]["refinement"]["status"] == "fail"
+
+
+def test_refinement_doubles_the_resolution_the_estimate_counts():
+    plain = web._preflight({"mode": "3d", "shape": "sphere", "radius": "7"})
+    fine = web._preflight({"mode": "3d", "shape": "sphere", "radius": "7", "refine": True})
+    assert "14 cells across" in plain["uncertainty"]["discretization"]["short"]
+    assert "28 cells across" in fine["uncertainty"]["discretization"]["short"]
+
+
+def test_a_blockage_study_widens_the_tunnel_and_extrapolates_to_free_air():
+    job = web.Job(id="t_block", kind="study", params={
+        "mode": "2d", "shape": "cylinder", "radius": 4, "re": 20, "u0": 0.05,
+        "nx": 80, "ny": 32, "steps": 800, "backend": "numpy", "study": "blockage"})
+    web._run_study(job)
+    assert job.state == "done", job.error
+    st = job.result["study"]
+    assert st["kind"] == "blockage"
+    b = [lv["blockage"] for lv in st["levels"]]
+    cd = [lv["cd"] for lv in st["levels"]]
+    assert b == pytest.approx([0.25, 0.25 * 32 / 46, 0.125], rel=1e-5)
+    assert [lv["grid"][0] for lv in st["levels"]] == [32, 46, 64]       # widened, parity kept
+    assert cd[0] > cd[1] > cd[2]                       # a wider tunnel, less drag
+    assert st["analysis"]["extrapolated"] < cd[-1]
+    assert job.result["uncertainty"]["blockage"]["short"].startswith("blockage study")
+    assert [lv["case"] for lv in st["levels"]] == [True, False, False]
+    json.dumps(job.public())

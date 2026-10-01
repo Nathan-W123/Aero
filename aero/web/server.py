@@ -54,8 +54,8 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
 from ..benchmarks import (
-    build_uncertainty_report, literature_cd_range, mean_uncertainty,
-    reference_length_cells, schiller_naumann_cd, sphere_expected_cd,
+    build_uncertainty_report, grid_convergence_index, literature_cd_range, mean_uncertainty,
+    reference_length_cells, schiller_naumann_cd,
 )
 from ..lbm.lattice3d import LATTICES
 from ..lbm.physics import base_nu_from_omega
@@ -124,6 +124,10 @@ class Job:
     #: see _record_frame
     frames: List[Tuple[int, float, np.ndarray, np.ndarray]] = field(default_factory=list)
     frame_shape: List[int] = field(default_factory=list)
+    #: "run", or "study" for a grid study; a study's levels count up from 0,
+    #: and the page starts its chart and viewer afresh when the level moves on
+    kind: str = "run"
+    level: int = 0
     _cancel: threading.Event = field(default_factory=threading.Event)
 
     def public(self) -> Dict[str, Any]:
@@ -143,6 +147,8 @@ class Job:
             "has_geometry": self.geometry is not None,
             "field_step": self.field_step,
             "frame_step": self.frames[-1][0] if self.frames else -1,
+            "kind": self.kind,
+            "level": self.level,
             "params": self.params,
         }
 
@@ -160,6 +166,12 @@ def _f(params, key, default):
         return float(params.get(key, default))
     except (TypeError, ValueError):
         return float(default)
+
+
+def _on(params, key) -> bool:
+    """A checkbox's value, which may arrive as a JSON boolean or as text."""
+    v = params.get(key, False)
+    return v.strip().lower() in ("1", "true", "yes", "on") if isinstance(v, str) else bool(v)
 
 
 def _i(params, key, default):
@@ -393,9 +405,15 @@ def _build_solver(p: Dict[str, Any]):
     if not solid.any():
         raise ValueError("The mesh covers no cells at this size: make it larger (Size), "
                          "or check that the STL is a closed surface.")
-    return Solver3D(Nz=nz, Ny=ny, Nx=nx, solid=solid, omega=omega, D=D,
-                    lattice=p.get("lattice", "d3q19"), ref_area=geom.reference_area(),
-                    **common), case["label"]
+    kw = dict(omega=omega, D=D, lattice=p.get("lattice", "d3q19"), ref_area=geom.reference_area(), **common)
+    if _on(p, "refine"):
+        from ..lbm.refine3d import RefinedSolver3D, fine_body_mask, refinement_box
+
+        box = refinement_box(solid, D)
+        fine = fine_body_mask(geom, (nz, ny, nx), box)
+        return (RefinedSolver3D(nz, ny, nx, solid, box, fine, **kw),
+                case["label"] + " · refined ×2 near the body")
+    return Solver3D(Nz=nz, Ny=ny, Nx=nx, solid=solid, **kw), case["label"]
 
 
 #: The pre-run stability check warns above this relaxation rate: the grid
@@ -452,26 +470,41 @@ def _is_number(v: Any) -> bool:
         return False
 
 
-def _mesh_blockage(solid: np.ndarray, size: float) -> Dict[str, Any]:
-    """
-    Blockage of an uploaded part, by frontal area.
+def _blockage_check(p: Dict[str, Any], mode: str, shape: str,
+                    solid: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """The budget's blockage line, measured on the voxels when there are any (an uploaded mesh)."""
+    from ..benchmarks import _blockage_component
 
-    The other shapes are graded on their extent across the tunnel, which
-    wildly overstates it for a slender part: an aircraft whose span is half
-    the tunnel's height may block 3% of it.  The thresholds are the extent
-    ones' equivalents for a sphere (10% and 20% across are 0.8% and 3.1% of
-    the area), so a compact part scores as a sphere would.
-    """
-    from ..forces3d import projected_frontal_area
+    comp = _blockage_component(mode, shape, dict(p), solid)
+    return {"status": comp["status"], "message": comp["message"],
+            "short": _short_label("blockage", comp["value"], mode, shape, _f(p, "re", 100.0))}
 
-    nz, ny, _ = solid.shape
-    area = projected_frontal_area(solid) / float(ny * nz)
-    across = size / float(min(ny, nz))
-    status = "pass" if area < 0.008 else "warn" if area < 0.031 else "fail"
-    return {"status": status, "short": f"blockage {area * 100:.1f}% by area",
-            "message": f"The part blocks {area * 100:.1f}% of the tunnel's cross-section by frontal area, "
-                       f"and spans {across * 100:.0f}% of its height or width. Confinement raises the drag: "
-                       "above ~3% of the area expect it by 10% or more."}
+
+def _free_air(p: Dict[str, Any], mode: str, solid: Optional[np.ndarray], cd: Optional[float],
+              sem95: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """
+    Cd corrected to free air with the blockage model, and its uncertainty:
+    the correction's own, with the statistical one added in quadrature.
+    """
+    from ..blockage import blockage_correction, blockage_of_case, free_air_cd
+
+    if cd is None:
+        return None
+    shape = p.get("shape", "cylinder" if mode == "2d" else "sphere")
+    bl = blockage_of_case(mode, shape, p) if shape != "mesh" else None
+    if bl is None and solid is not None:
+        bl = blockage_of_case(mode, shape, p, np.asarray(solid, dtype=bool))
+    if bl is None:
+        return None
+    try:
+        corr = blockage_correction(bl["law"], _f(p, "re", 100.0), bl["b"], shape, p)
+    except ValueError:
+        return None
+    cd_free, d_corr = free_air_cd(cd, corr)
+    d_stat = (sem95 or 0.0) / corr["factor"]
+    return {"cd": _num(cd_free), "uncertainty": _num(float(np.hypot(d_corr, d_stat))),
+            "from_correction": _num(d_corr), "K": _num(corr["K"], 4), "dK": _num(corr["dK"], 4),
+            "b": _num(bl["b"], 4), "basis": corr["basis"]}
 
 
 #: A part "keeps its shape" on the grid when this much of its silhouette,
@@ -587,6 +620,31 @@ def _mesh_check(p: Dict[str, Any], case: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def _refinement_check(p: Dict[str, Any], case: Dict[str, Any], solid: Optional[np.ndarray] = None,
+                      solver=None) -> Dict[str, Any]:
+    """Where the refined block goes and what it costs -- or why it cannot go anywhere."""
+    from ..lbm.refine3d import refinement_box
+
+    if solver is not None and hasattr(solver, "box"):
+        box = solver.box
+    else:
+        try:
+            box = refinement_box(_solid_for(p, case) if solid is None else solid, case["D"])
+        except ValueError as exc:
+            return {"status": "fail", "short": "refinement does not fit", "message": str(exc)}
+    z0, z1, y0, y1, x0, x1 = box
+    coarse = float(np.prod(case["grid"]))
+    fine = 8.0 * (z1 - z0) * (y1 - y0) * (x1 - x0)
+    work = (coarse + 2.0 * fine) / coarse
+    d = 2.0 * case["D"]
+    return {"status": "pass",
+            "short": f"refined 2× near the body · {d:.0f} cells across · ~{work:.1f}× the work",
+            "message": f"A {x1 - x0}×{y1 - y0}×{z1 - z0}-cell block around the body (x × y × z, tunnel cells) "
+                       f"runs at twice the resolution, so the body is {d:.0f} fine cells across and the "
+                       f"forces come from there. One step costs about {work:.1f}× an unrefined one; refining "
+                       "the whole tunnel would cost 16×."}
+
+
 def _preflight(p: Dict[str, Any]) -> Dict[str, Any]:
     """
     What can be said about a case before it runs: the checks that depend only
@@ -616,11 +674,13 @@ def _preflight(p: Dict[str, Any]) -> Dict[str, Any]:
                                                       _f(p, "re", 100.0))}
     except Exception as exc:                 # a half-typed form must not break the page
         checks["budget"] = {"status": "warn", "short": "checks unavailable", "message": str(exc)}
+    if case is not None and mode == "3d" and _on(p, "refine"):
+        checks["refinement"] = _refinement_check(p, case)
     if case is not None and shape == "mesh":
         checks["mesh"] = _mesh_check(p, case)
         solid = _solid_for(p, case)
         if solid.any():
-            checks["blockage"] = _mesh_blockage(solid, case["D"])
+            checks["blockage"] = _blockage_check(p, mode, shape, solid)
     out: Dict[str, Any] = {"uncertainty": checks, "error": error}
     try:
         out["reference"] = _reference(p, mode, None)
@@ -674,11 +734,14 @@ def _series_payload(job: "Job", start: int) -> bytes:
     return _pack({"from": start, "total": int(cd.size), "names": ["cd", "cl"]}, cd[start:], cl[start:])
 
 
-def _geometry_payload(solid: np.ndarray) -> bytes:
+def _geometry_payload(solid: np.ndarray, refined=None) -> bytes:
+    """The body as bytes, and the refined block (z0, z1, y0, y1, x0, x1) when there is one."""
     if solid.ndim == 2:
         solid = solid[None]
-    return _pack({"shape": list(solid.shape), "names": ["solid"]},
-                 solid.astype(np.uint8))
+    header = {"shape": list(solid.shape), "names": ["solid"]}
+    if refined is not None:
+        header["refined"] = [int(v) for v in refined]
+    return _pack(header, solid.astype(np.uint8))
 
 
 #: Voxels sent to the browser's volume renderer per refresh; larger grids are
@@ -931,7 +994,8 @@ def _field_png(solver, mode: str, what: str = "speed", streamlines: bool = False
     return buf.getvalue()
 
 
-def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int) -> Dict[str, Any]:
+def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int,
+                 grid_study: Optional[Dict[str, List[float]]] = None) -> Dict[str, Any]:
     """The run's uncertainty budget, reduced to status + message per check."""
     shape = p.get("shape", "cylinder" if mode == "2d" else "sphere")
     result = {
@@ -939,6 +1003,8 @@ def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int) -> Dict[str,
         "Cl_history" if mode == "2d" else "Cly_history": _lift_history(solver),
         "analysis_window": window,
     }
+    if grid_study:
+        result["grid_study"] = grid_study
     try:
         rep = build_uncertainty_report(mode=mode, shape=shape, params=dict(p), result=result)
     except Exception as exc:                        # never let the budget sink a finished run
@@ -950,7 +1016,12 @@ def _uncertainty(p: Dict[str, Any], mode: str, solver, window: int) -> Dict[str,
         out[name] = {"status": comp["status"], "message": comp.get("message", ""),
                      "short": _short_label(name, comp.get("value"), mode, shape, _f(p, "re", 100.0))}
     if shape == "mesh" and np.asarray(solver.solid).any():
-        out["blockage"] = _mesh_blockage(np.asarray(solver.solid, dtype=bool), _f(p, "mesh_size", 16.0))
+        out["blockage"] = _blockage_check(p, mode, shape, np.asarray(solver.solid, dtype=bool))
+    if hasattr(solver, "box"):
+        try:
+            out["refinement"] = _refinement_check(p, _case(p), solver=solver)
+        except ValueError:
+            pass
     return out
 
 
@@ -961,14 +1032,19 @@ def _short_label(name: str, v: Any, mode: str, shape: str, re: float = 100.0) ->
             s = f"±{v['cd_relative_sem95']*100:.1f}% stat. · {v['n_eff']:.0f} indep. samples"
             return s + (" · still drifting" if v.get("stationary") is False else "")
         if name == "blockage":
-            s = f"blockage {v*100:.0f}%"
-            if mode == "3d" and shape == "sphere":
-                from ..benchmarks import sphere_confinement_factor
-                s += f" · ~+{(sphere_confinement_factor(v, re)-1)*100:.0f}% on Cd"
+            if not isinstance(v, dict):
+                return f"blockage {v * 100:.0f}%"
+            s = (f"blockage {v['area_ratio'] * 100:.1f}% by area" if v.get("law") == "3d"
+                 else f"blockage {v['b'] * 100:.0f}%")
+            if v.get("K") is not None:
+                s += f" · +{v['K'] * 100:.0f}% on Cd"
             return s
         if name == "domain_length":
             return f"{v['upstream_D']:.1f}D upstream · {v['downstream_D']:.1f}D downstream"
         if name == "discretization":
+            if isinstance(v, dict) and v.get("gci") is not None:
+                s = f"grid study · GCI {v['gci'] * 100:.1f}%"
+                return s + (f" · p = {v['p_observed']:.1f}" if v.get("p_observed") is not None else "")
             if isinstance(v, dict) and "cells_across_body" in v:
                 return (f"{v['cells_across_body']:.0f} cells across · "
                         f"boundary layer ≈ {v['cells_across_boundary_layer']:.1f} cells")
@@ -990,22 +1066,22 @@ def _reference(p: Dict[str, Any], mode: str, cd: Optional[float]) -> Optional[Di
     never cover a systematic bias.  This states the expected value for the run
     as configured, so the two can be compared honestly.
     """
+    from ..benchmarks import free_air_reference
+    from ..blockage import blockage_correction, blockage_of_case
+
     shape = p.get("shape", "cylinder" if mode == "2d" else "sphere")
     re = _f(p, "re", 100.0)
-    d = reference_length_cells(mode, shape, p)
-    if mode == "3d":
-        span = min(_f(p, "ny", 48.0), _f(p, "nz", 48.0))
-        blockage = d / max(span, 1.0)
-    else:
-        blockage = d / max(_f(p, "ny", 200.0), 1.0)
-    band = literature_cd_range(mode, shape, re, blockage if mode == "3d" else None)
+    bl = blockage_of_case(mode, shape, p)
+    blockage = bl["b"] if bl else None
+    band = literature_cd_range(mode, shape, re, blockage)
     if band is None:
         return None
     lo, hi, note = band
     out = {"band": [_num(lo, 3), _num(hi, 3)], "note": note, "blockage": _num(blockage, 3)}
-    if mode == "3d" and shape == "sphere":
-        sn, conf, _ = sphere_expected_cd(re, blockage)
-        out.update({"unconfined": _num(sn, 3), "expected": _num(conf, 3)})
+    ref = free_air_reference(mode, shape, re)
+    if ref is not None and bl is not None:
+        factor = blockage_correction(bl["law"], re, bl["b"], shape)["factor"]
+        out.update({"unconfined": _num(ref[0], 3), "expected": _num(ref[0] * factor, 3)})
     if cd is not None:
         out["status"] = "pass" if lo <= cd <= hi else "fail"
     return out
@@ -1039,6 +1115,151 @@ def _num(x, nd: int = 5) -> Optional[float]:
 # The worker
 # ---------------------------------------------------------------------------
 
+def _start_view(job: Job, solver, mode: str) -> None:
+    """Point the job's live view at a solver that has not run yet: its body, a first field, no chart."""
+    job.history = []
+    job.series = (np.zeros(0, np.float32), np.zeros(0, np.float32))
+    job.frames = []
+    job.geometry = _geometry_payload(solver.solid, getattr(solver, "box", None))
+    header, *volumes = _field_volumes(solver, mode)
+    job.field_bytes = _pack(header, *volumes)
+    job.field_step = 0
+    _record_frame(job, 0, header, volumes[0], volumes[1])
+
+
+def _setup_info(p: Dict[str, Any], solver, label: str) -> Dict[str, Any]:
+    nu = base_nu_from_omega(solver.omega)
+    info = {
+        "label": label,
+        "omega": round(float(solver.omega), 5),
+        "nu": round(float(nu), 6),
+        "tau": round(1.0 / float(solver.omega), 4),
+        "grid": (list(solver.solid.shape)),
+        # the backend that was actually resolved ("auto" is not an answer)
+        "backend": getattr(solver, "backend", p.get("backend", "auto")),
+        "cells": int(np.prod(solver.solid.shape)),
+        "solid_cells": int(solver.solid.sum()),
+        # frontal area the coefficients are normalised by; 3D only
+        "ref_area": _num(getattr(solver, "ref_area", None), 2),
+    }
+    if hasattr(solver, "box"):                       # refined near the body
+        cells = solver.cells
+        info["refined"] = {"box": [int(v) for v in solver.box], "fine_cells": cells["fine"],
+                           "omega_fine": _num(solver.omega_fine),
+                           "work": _num(cells["updates_per_step"] / cells["coarse"], 2),
+                           "work_uniform_fine": _num(cells["uniform_fine_updates_per_step"] / cells["coarse"], 2)}
+    return info
+
+
+def _work_per_step(solver) -> float:
+    """Cell updates one step of this solver costs."""
+    cells = getattr(solver, "cells", None)
+    return float(cells["updates_per_step"]) if isinstance(cells, dict) else float(np.prod(solver.solid.shape))
+
+
+def _simulate(job: Job, p: Dict[str, Any], mode: str, solver, *, steps: int,
+              work_before: float = 0.0, work_unit: Optional[float] = None, level: str = "") -> bool:
+    """
+    Run ``solver`` for ``steps`` in chunks, streaming the chart, the viewer and
+    the figures to ``job``.  Returns False if the user stopped it.
+
+    ``job.step`` counts this run's steps, or for a study, work: so its
+    progress bar covers all of its levels, ``work_before`` cell updates are
+    already done and ``work_unit`` of them make one step on the bar.
+    """
+    chunk = max(steps // 60, 50)
+    per_step = _work_per_step(solver)
+    if work_unit is None:
+        work_unit = per_step
+    done = 0
+    t0 = time.time()
+    while done < steps:
+        if job._cancel.is_set():
+            return False
+        n = min(chunk, steps - done)
+        solver.run(steps=n, check_every=10 ** 9, verbose=False)
+        done += n
+        job.step = int(round((work_before + done * per_step) / work_unit))
+
+        cd_hist = list(getattr(solver, "Cd_history", []))
+        cl_hist = _lift_history(solver)
+        cd = float(cd_hist[-1]) if cd_hist else float("nan")
+        cl = float(cl_hist[-1]) if cl_hist else float("nan")
+        # A blown-up run can stay finite for a while (Cd ~ 1e40) before
+        # it reaches NaN; no physical drag coefficient is anywhere near 1e4.
+        if not np.isfinite(cd) or abs(cd) > 1e4:
+            raise RuntimeError(
+                f"{level + ': ' if level else ''}the solution diverged at step {done} — lower Re or "
+                f"u0, raise the grid resolution (more cells across the body), or try another "
+                f"collision operator"
+            )
+        job.history.append({"step": done, "cd": _num(cd), "cl": _num(cl)})
+        job.series = _series(cd_hist, cl_hist)
+        rate = done / max(time.time() - t0, 1e-9)
+        mlups = rate * per_step / 1e6
+        job.message = (f"{level + ' · ' if level else ''}step {done:,} of {steps:,} · {rate:,.0f} steps/s · "
+                       f"{mlups:,.1f} MLUPS on {getattr(solver, 'backend', '?')}")
+        try:
+            header, *volumes = _field_volumes(solver, mode)
+            job.field_bytes = _pack(header, *volumes)
+            job.field_step = done
+            _record_frame(job, done, header, volumes[0], volumes[1])
+        except Exception:
+            pass
+        if len(job.history) % 3 == 1:
+            try:
+                for what in ("speed", "vorticity", "pressure"):
+                    job.figures[what] = _field_png(solver, mode, what)
+                job.figure_step = done
+            except Exception:
+                pass
+    return True
+
+
+def _coefficients(solver) -> Tuple[Optional[Dict[str, Any]], int]:
+    """The run's means over the settled tail, and the length of that tail."""
+    cd_hist = np.asarray(getattr(solver, "Cd_history", []), dtype=float)
+    cl_hist = np.asarray(_lift_history(solver), dtype=float)
+    if not cd_hist.size:
+        return None, 0
+    n = cd_hist.size
+    window = n - n // 2                        # second half: first half is start-up
+    st = mean_uncertainty(cd_hist[-window:])
+    sl = mean_uncertainty(cl_hist[-window:]) if cl_hist.size else {}
+    return {
+        "cd": _num(st["mean"]),
+        # sigma is the size of the *fluctuation*, not an uncertainty; the
+        # page used to print it as "±", which read as an error bar
+        "cd_std": _num(st["sigma"]),
+        "cd_sem95": _num(st["sem95"]),
+        "cd_n_eff": _num(st["n_eff"], 1),
+        "cd_stationary": st["stationary"],
+        "cl": _num(sl.get("mean")),
+        "cl_std": _num(sl.get("sigma")),
+        "cl_sem95": _num(sl.get("sem95")),
+        "note": "averaged over the second half of the run",
+    }, window
+
+
+def _final_view(job: Job, solver, mode: str, p: Dict[str, Any]) -> None:
+    """The run's last field, with streamlines on the figures."""
+    for what in ("speed", "vorticity", "pressure"):
+        try:
+            job.figures[what] = _field_png(solver, mode, what, streamlines=True)
+        except Exception:
+            pass
+    job.figure_step = job.step
+    try:
+        header, *volumes = _field_volumes(solver, mode)
+        job.field_bytes = _pack(header, *volumes)
+        job.field_step = job.step
+        if not job.frames or job.frames[-1][0] != job.step:
+            _record_frame(job, job.step, header, volumes[0], volumes[1])
+    except Exception:
+        pass
+    job.preview_png = job.figures.get(p.get("field", "speed")) or job.preview_png
+
+
 def _run_job(job: Job) -> None:
     p = job.params
     mode = p.get("mode", "2d")
@@ -1046,118 +1267,231 @@ def _run_job(job: Job) -> None:
         job.state = "running"
         job.message = "building the case"
         solver, label = _build_solver(p)
-        nu = base_nu_from_omega(solver.omega)
-        job.result["setup"] = {
-            "label": label,
-            "omega": round(float(solver.omega), 5),
-            "nu": round(float(nu), 6),
-            "tau": round(1.0 / float(solver.omega), 4),
-            "grid": (list(solver.solid.shape)),
-            # the backend that was actually resolved ("auto" is not an answer)
-            "backend": getattr(solver, "backend", p.get("backend", "auto")),
-            "cells": int(np.prod(solver.solid.shape)),
-            "solid_cells": int(solver.solid.sum()),
-            # frontal area the coefficients are normalised by; 3D only
-            "ref_area": _num(getattr(solver, "ref_area", None), 2),
-        }
-
-        job.geometry = _geometry_payload(solver.solid)
-        header, *volumes = _field_volumes(solver, mode)
-        job.field_bytes = _pack(header, *volumes)
-        job.field_step = 0
-        _record_frame(job, 0, header, volumes[0], volumes[1])
-
-        total = job.total = max(_i(p, "steps", 3000), 1)
-        chunk = max(total // 60, 50)
-        done = 0
-        t0 = time.time()
-        while done < total:
-            if job._cancel.is_set():
-                job.state = "stopped"
-                job.message = f"stopped at step {done}"
-                break
-            n = min(chunk, total - done)
-            solver.run(steps=n, check_every=10 ** 9, verbose=False)
-            done += n
-            job.step = done
-
-            cd_hist = list(getattr(solver, "Cd_history", []))
-            cl_hist = _lift_history(solver)
-            cd = float(cd_hist[-1]) if cd_hist else float("nan")
-            cl = float(cl_hist[-1]) if cl_hist else float("nan")
-            # A blown-up run can stay finite for a while (Cd ~ 1e40) before
-            # it reaches NaN; no physical drag coefficient is anywhere near 1e4.
-            if not np.isfinite(cd) or abs(cd) > 1e4:
-                raise RuntimeError(
-                    f"the solution diverged at step {done} — lower Re or u0, raise the "
-                    f"grid resolution (more cells across the body), or try another "
-                    f"collision operator"
-                )
-            job.history.append({"step": done, "cd": _num(cd), "cl": _num(cl)})
-            job.series = _series(cd_hist, cl_hist)
-            rate = done / max(time.time() - t0, 1e-9)
-            mlups = rate * float(np.prod(solver.solid.shape)) / 1e6
-            job.message = (f"step {done:,} of {total:,} · {rate:,.0f} steps/s · "
-                           f"{mlups:,.1f} MLUPS on {getattr(solver, 'backend', '?')}")
-            try:
-                header, *volumes = _field_volumes(solver, mode)
-                job.field_bytes = _pack(header, *volumes)
-                job.field_step = done
-                _record_frame(job, done, header, volumes[0], volumes[1])
-            except Exception:
-                pass
-            if len(job.history) % 3 == 1:
-                try:
-                    for what in ("speed", "vorticity", "pressure"):
-                        job.figures[what] = _field_png(solver, mode, what)
-                    job.figure_step = done
-                except Exception:
-                    pass
-
-        if job.state != "stopped":
+        job.result["setup"] = _setup_info(p, solver, label)
+        _start_view(job, solver, mode)
+        steps = job.total = max(_i(p, "steps", 3000), 1)
+        if not _simulate(job, p, mode, solver, steps=steps):
+            job.state = "stopped"
+            job.message = f"stopped at step {job.step}"
+        else:
             job.state = "done"
             job.message = "complete"
+        job.result["steps_run"] = len(getattr(solver, "Cd_history", []))
 
-        # final numbers over the settled tail
-        cd_hist = np.asarray(getattr(solver, "Cd_history", []), dtype=float)
-        cl_hist = np.asarray(_lift_history(solver), dtype=float)
-        if cd_hist.size:
-            n = cd_hist.size
-            window = n - n // 2                        # second half: first half is start-up
-            st = mean_uncertainty(cd_hist[-window:])
-            sl = mean_uncertainty(cl_hist[-window:]) if cl_hist.size else {}
-            job.result["coefficients"] = {
-                "cd": _num(st["mean"]),
-                # sigma is the size of the *fluctuation*, not an uncertainty; the
-                # page used to print it as "±", which read as an error bar
-                "cd_std": _num(st["sigma"]),
-                "cd_sem95": _num(st["sem95"]),
-                "cd_n_eff": _num(st["n_eff"], 1),
-                "cd_stationary": st["stationary"],
-                "cl": _num(sl.get("mean")),
-                "cl_std": _num(sl.get("sigma")),
-                "cl_sem95": _num(sl.get("sem95")),
-                "note": "averaged over the second half of the run",
-            }
+        coef, window = _coefficients(solver)
+        if coef is not None:
+            job.result["coefficients"] = coef
+            job.result["free_air"] = _free_air(p, mode, solver.solid, coef["cd"], coef["cd_sem95"])
             job.result["uncertainty"] = _uncertainty(p, mode, solver, window)
-            job.result["reference"] = _reference(p, mode, job.result["coefficients"]["cd"])
-        for what in ("speed", "vorticity", "pressure"):
-            try:
-                job.figures[what] = _field_png(solver, mode, what, streamlines=True)
-            except Exception:
-                pass
-        job.figure_step = job.step
-        try:
-            header, *volumes = _field_volumes(solver, mode)
-            job.field_bytes = _pack(header, *volumes)
-            job.field_step = job.step
-            if not job.frames or job.frames[-1][0] != job.step:
-                _record_frame(job, job.step, header, volumes[0], volumes[1])
-        except Exception:
-            pass
-        job.preview_png = job.figures.get(p.get("field", "speed")) or job.preview_png
+            job.result["reference"] = _reference(p, mode, coef["cd"])
+        _final_view(job, solver, mode, p)
 
     except Exception as exc:                       # surfaced verbatim in the UI
+        job.state = "error"
+        job.error = str(exc) or exc.__class__.__name__
+        job.message = "failed"
+        traceback.print_exc()
+    finally:
+        job.finished = time.time()
+
+
+#: A grid study refines by this ratio between levels: sqrt(2) is the usual
+#: choice in 3D -- above the 1.3 the GCI procedure asks for, and each finer
+#: level costs only 4x (2.8x in 2D) rather than the 16x of doubling.
+STUDY_RATIO = float(np.sqrt(2.0))
+#: The levels, as factors on the case's cells: "coarser" keeps the case as
+#: the finest level and adds two coarser (about 1.3x the case's own cost);
+#: "finer" brackets it, one coarser and one finer (about 5x in 3D).
+STUDY_LEVELS = {"coarser": (-2, -1, 0), "finer": (-1, 0, 1)}
+_LENGTH_KEYS = ("radius", "width", "height", "depth", "length", "mesh_size")
+
+
+def _scaled_case(p: Dict[str, Any], factor: float) -> Dict[str, Any]:
+    """
+    The same case on a grid ``factor`` times finer: every length in cells
+    scales -- the tunnel, the body, the steps (the same flow time) -- and Re
+    and u0 do not.  Body sizes keep their fraction; tunnel cells round.
+    """
+    mode = p.get("mode", "2d")
+    defaults = _FORM_DEFAULTS[mode if mode in _FORM_DEFAULTS else "2d"]
+    q = dict(p)
+    for k in ("nx", "ny", "nz") if mode == "3d" else ("nx", "ny"):
+        q[k] = str(max(int(round(_f(p, k, defaults.get(k, 48)) * factor)), 8))
+    for k in _LENGTH_KEYS:
+        if k in p and _is_number(p[k]):
+            q[k] = f"{float(p[k]) * factor:.6g}"
+    q["steps"] = str(max(int(round(_i(p, "steps", 3000) * factor)), 50))
+    return q
+
+
+def _widened_case(p: Dict[str, Any], factor: float) -> Dict[str, Any]:
+    """
+    The same case in a tunnel ``factor`` times as high and wide: the body,
+    the grid's resolution, the tunnel's length and the steps all stay.
+    """
+    mode = p.get("mode", "2d")
+    defaults = _FORM_DEFAULTS[mode if mode in _FORM_DEFAULTS else "2d"]
+    q = dict(p)
+    for k in ("ny", "nz") if mode == "3d" else ("ny",):
+        n = int(round(_f(p, k, defaults.get(k, 48))))
+        # keep the parity, so the body -- centred at n / 2 -- lands on the
+        # cells exactly as it did: a half-cell shift changes its staircase,
+        # and with it the drag, by as much as the blockage does
+        q[k] = str(max(2 * int(round(n * factor / 2.0 - (n % 2) / 2.0)) + n % 2, 8))
+    return q
+
+
+def _study_plan(p: Dict[str, Any], kind: str) -> List[Tuple[int, Dict[str, Any]]]:
+    """The study's levels, as (exponent of STUDY_RATIO, case); exponent 0 is the case as set."""
+    if kind == "blockage":
+        return [(e, _widened_case(p, STUDY_RATIO ** e)) for e in (0, 1, 2)]
+    exps = STUDY_LEVELS.get(p.get("study_levels", "coarser"), STUDY_LEVELS["coarser"])
+    return [(e, _scaled_case(p, STUDY_RATIO ** e)) for e in exps]
+
+
+def _history_of(solver) -> Any:
+    """What the uncertainty budget reads from a solver, without keeping its fields alive."""
+    from types import SimpleNamespace
+
+    snap = SimpleNamespace(Cd_history=list(getattr(solver, "Cd_history", [])),
+                           Cl_history=_lift_history(solver), solid=np.asarray(solver.solid, dtype=bool))
+    if hasattr(solver, "box"):
+        snap.box = solver.box
+    return snap
+
+
+def _blockage_study_check(analysis: Dict[str, Any], levels: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The budget's blockage line, measured rather than modelled."""
+    cd0, band = analysis.get("extrapolated"), analysis.get("gci")
+    if cd0 is None or band is None:
+        return {"status": "fail", "short": "blockage study inconclusive", "message": analysis["message"]}
+    status = "pass" if band < 0.02 else "warn" if band < 0.06 else "fail"
+    return {"status": status, "short": f"blockage study · free air {cd0:.3f} ± {band * 100:.1f}%",
+            "message": analysis["message"]}
+
+
+def _run_study(job: Job) -> None:
+    """
+    A study: the case run several times over, one after the other, varying
+    one thing -- the grid's resolution (``study`` "grid": the Grid
+    Convergence Index, see benchmarks.grid_convergence_index) or the
+    tunnel's width (``study`` "blockage": Cd extrapolated to zero blockage,
+    by the same Richardson procedure in the blockage instead of the cell size).
+    """
+    from ..blockage import blockage_correction, blockage_of_case, free_air_cd
+
+    p = job.params
+    mode = p.get("mode", "2d")
+    shape = p.get("shape", "cylinder" if mode == "2d" else "sphere")
+    kind = "blockage" if p.get("study") == "blockage" else "grid"
+    levels: List[Dict[str, Any]] = []
+    try:
+        job.state = "running"
+        job.message = "building the levels"
+        cases = []
+        for e, q in _study_plan(p, kind):
+            case = _case(q)                         # every level must be runnable before any runs
+            # the analytic size where there is one: the voxels' frontal size
+            # wobbles by a cell between tunnels
+            bl = (blockage_of_case(mode, shape, q) or blockage_of_case(mode, shape, q, _solid_for(q, case)))
+            cases.append((e, q, case, bl["b"]))
+            if e == 0:
+                law = bl["law"]
+        unit = float(np.prod(_case(p)["grid"]))
+        work = [float(np.prod(c["grid"])) * (2.0 if _on(q, "refine") and mode == "3d" else 1.0)
+                * _i(q, "steps", 3000) for _, q, c, _ in cases]
+        job.total = int(round(sum(work) / unit))
+        done_work = 0.0
+        job.result["study"] = {
+            "kind": kind, "ratio": _num(STUDY_RATIO, 4),
+            "placement": p.get("study_levels", "coarser") if kind == "grid" else "wider",
+            "levels": [],
+            "plan": [{"cells_across": _num(c["D"], 4), "blockage": _num(b, 6), "grid": list(c["grid"]),
+                      "steps": _i(q, "steps", 3000), "case": e == 0} for e, q, c, b in cases]}
+        stopped, keep = False, None
+        for i, (e, q, case, b) in enumerate(cases):
+            name = f"level {i + 1} of {len(cases)}"
+            job.message = f"{name} · building the case"
+            solver, label = _build_solver(q)
+            job.result["setup"] = _setup_info(q, solver, label)
+            job.level = i
+            _start_view(job, solver, mode)
+            t0 = time.time()
+            steps = max(_i(q, "steps", 3000), 1)
+            what = f"{case['D']:.3g} cells across" if kind == "grid" else f"blockage {b * 100:.0f}%"
+            ok = _simulate(job, q, mode, solver, steps=steps, work_before=done_work, work_unit=unit,
+                           level=f"{name} ({what})")
+            done_work += work[i]
+            coef, window = _coefficients(solver)
+            if coef is not None and ok:
+                levels.append({"factor": _num(STUDY_RATIO ** e, 4), "cells_across": _num(case["D"], 4),
+                               "blockage": _num(b, 6), "grid": list(case["grid"]), "steps": steps,
+                               "cd": coef["cd"], "cd_sem95": coef["cd_sem95"], "cl": coef["cl"],
+                               "case": e == 0, "secs": round(time.time() - t0, 1)})
+                job.result["study"]["levels"] = levels
+                # the budget describes the finest grid of a grid study, and the
+                # tunnel as set of a blockage study
+                if kind == "grid" or e == 0:
+                    keep = (_history_of(solver), q, coef, window)
+            last = (solver, q)
+            if not ok:
+                stopped = True
+                break
+
+        solver, q_last = last
+        analysis = None
+        if len(levels) >= 2:
+            if kind == "grid":
+                analysis = grid_convergence_index([lv["cells_across"] for lv in levels],
+                                                  [lv["cd"] for lv in levels])
+                # the best estimate there is: at zero cell size, and in free air
+                ext = analysis.get("extrapolated")
+                fa = (_free_air(q_last, mode, keep[0].solid if keep else None, ext)
+                      if ext is not None and analysis.get("convergence") != "divergent" else None)
+                if fa is not None:
+                    grid_part = (analysis.get("gci") or 0.0) * ext / (1.0 + fa["K"])
+                    analysis["free_air_extrapolated"] = {
+                        "cd": fa["cd"], "K": fa["K"],
+                        "uncertainty": _num(float(np.hypot(grid_part, fa["from_correction"] or 0.0)))}
+            else:
+                analysis = grid_convergence_index([1.0 / lv["blockage"] for lv in levels],
+                                                  [lv["cd"] for lv in levels])
+                bs = " → ".join(f"{lv['blockage'] * 100:.0f}%" for lv in levels)
+                cd0 = analysis.get("extrapolated")
+                msg = f"{len(levels)} tunnels (blockage {bs}): "
+                msg += (f"Cd at zero blockage {cd0:.4g}, ± {analysis['gci'] * 100:.1f}% from the extrapolation"
+                        if cd0 is not None else "the drag does not fall steadily as the tunnel widens, "
+                        "so it cannot be extrapolated: " + analysis["convergence"])
+                if analysis.get("p_observed") is not None:
+                    msg += f" (Cd - Cd_free goes as blockage^{analysis['p_observed']:.2f})"
+                analysis["message"] = msg + "."
+                own = next((lv for lv in levels if lv["case"]), None)
+                if own is not None:
+                    try:
+                        corr = blockage_correction(law, _f(p, "re", 100.0), own["blockage"], shape, p)
+                        analysis["model_free_air"] = _num(free_air_cd(own["cd"], corr)[0])
+                    except ValueError:
+                        pass
+        job.result["study"]["analysis"] = analysis
+        if keep is not None:
+            hist, q, coef, window = keep
+            note = ("the finest grid of the study" if kind == "grid" else "the tunnel as set")
+            job.result["coefficients"] = dict(coef, note=note + ", averaged over the second half of its run")
+            if kind == "grid":
+                job.result["free_air"] = _free_air(q, mode, hist.solid, coef["cd"], coef["cd_sem95"])
+            job.result["uncertainty"] = _uncertainty(
+                q, mode, hist, window,
+                grid_study={"cells": [lv["cells_across"] for lv in levels],
+                            "values": [lv["cd"] for lv in levels]} if analysis and kind == "grid" else None)
+            if analysis and kind == "blockage":
+                job.result["uncertainty"]["blockage"] = _blockage_study_check(analysis, levels)
+            best = analysis.get("extrapolated") if analysis and kind == "grid" else None
+            job.result["reference"] = _reference(q, mode, best if best is not None else coef["cd"])
+        _final_view(job, solver, mode, q_last)
+        job.state = "stopped" if stopped else "done"
+        job.message = (f"stopped: {len(levels)} of {len(cases)} levels ran" if stopped
+                       else f"{kind} study complete")
+    except Exception as exc:
         job.state = "error"
         job.error = str(exc) or exc.__class__.__name__
         job.message = "failed"
@@ -1281,6 +1615,17 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_run_job, args=(job,), daemon=True).start()
             return self._json({"id": job.id})
 
+        if u.path == "/api/study":
+            job = Job(id=uuid.uuid4().hex[:12], params=payload, kind="study")
+            with _JOBS_LOCK:
+                JOBS[job.id] = job
+                for old in sorted(JOBS.values(), key=lambda j: j.started)[:-12]:
+                    JOBS.pop(old.id, None)
+                for old in sorted(JOBS.values(), key=lambda j: j.started)[:-REPLAY_RUNS_KEPT]:
+                    old.frames = []
+            threading.Thread(target=_run_study, args=(job,), daemon=True).start()
+            return self._json({"id": job.id})
+
         if u.path == "/api/preview":
             p = payload if isinstance(payload, dict) else {}
             try:
@@ -1288,7 +1633,14 @@ class Handler(BaseHTTPRequestHandler):
                 solid = _solid_for(p, case)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 400)
-            return self._send(200, _geometry_payload(solid), "application/octet-stream")
+            box = None
+            if case["mode"] == "3d" and _on(p, "refine") and solid.any():
+                from ..lbm.refine3d import refinement_box
+                try:
+                    box = refinement_box(solid, case["D"])
+                except ValueError:
+                    pass                          # the checks say why
+            return self._send(200, _geometry_payload(solid, box), "application/octet-stream")
 
         if u.path == "/api/preflight":
             return self._json(_preflight(payload if isinstance(payload, dict) else {}))

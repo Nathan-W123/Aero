@@ -161,7 +161,7 @@ def test_build_uncertainty_report_has_expected_components():
         "convergence",
         "bc_sensitivity",
     }
-    assert report.components["blockage"]["value"] > 0.0
+    assert report.components["blockage"]["value"]["b"] > 0.0
 
 
 def test_validate_scalar_diffusion_profile_linear_field_passes():
@@ -228,12 +228,10 @@ def test_the_old_d_squared_number_now_fails_the_sharp_band():
 
 def test_sphere_confinement_weakens_with_re():
     """Measured: blockage costs a sphere roughly half as much drag at Re=100 as at Re=20."""
-    from aero.benchmarks import sphere_confinement_factor, sphere_confinement_slope
-    assert sphere_confinement_slope(20.0) == pytest.approx(1.00)
-    assert sphere_confinement_slope(100.0) == pytest.approx(0.58)
-    assert sphere_confinement_slope(20.0) > sphere_confinement_slope(45.0) > sphere_confinement_slope(100.0)
-    assert sphere_confinement_slope(5.0) == sphere_confinement_slope(20.0)       # held outside
-    assert sphere_confinement_slope(300.0) == sphere_confinement_slope(100.0)
+    from aero.benchmarks import sphere_confinement_factor
+    k = lambda re: sphere_confinement_factor(0.2, re) - 1.0
+    assert k(20.0) > k(45.0) > k(100.0) > 0.0
+    assert k(5.0) == k(20.0)                       # held outside the calibration
     assert sphere_confinement_factor(None, 100.0) == 1.0
 
 
@@ -363,4 +361,72 @@ def test_blockage_message_quantifies_the_sphere_bias():
         result={"Cd_history": [1.0] * 100},
     )
     b = rep.components["blockage"]
-    assert b["status"] == "fail" and "raise a sphere's Cd" in b["message"]
+    assert b["status"] in ("warn", "fail") and "raise Cd by about" in b["message"]
+    assert b["value"]["K"] > 0.1                   # 29% across: well over 10% on Cd
+
+
+# ---------------------------------------------------------------------------
+# Grid Convergence Index
+# ---------------------------------------------------------------------------
+
+def test_gci_reproduces_the_celik_worked_example():
+    """Celik et al. (2008), Table 1, first column: unequal ratios 1.5 and 1.33."""
+    import math
+    from aero.benchmarks import grid_convergence_index
+
+    cells = [math.sqrt(4500), math.sqrt(8000), math.sqrt(18000)]      # 2D cell counts -> cells across
+    r = grid_convergence_index(cells, [5.863, 5.972, 6.063])
+    assert r["convergence"] == "monotone"
+    assert r["p_observed"] == pytest.approx(1.53, abs=0.005)
+    assert r["extrapolated"] == pytest.approx(6.1685, abs=5e-4)
+    assert r["gci"] == pytest.approx(0.022, abs=5e-4)
+    assert r["status"] == "pass"
+
+
+def test_gci_takes_the_levels_in_any_order():
+    from aero.benchmarks import grid_convergence_index
+
+    a = grid_convergence_index([10, 14.14, 20], [1.40, 1.30, 1.25])
+    b = grid_convergence_index([20, 10, 14.14], [1.25, 1.40, 1.30])
+    assert a["gci"] == pytest.approx(b["gci"]) and a["extrapolated"] == pytest.approx(b["extrapolated"])
+
+
+def test_gci_with_two_levels_assumes_first_order_and_a_safety_factor_of_three():
+    from aero.benchmarks import grid_convergence_index
+
+    r = grid_convergence_index([14, 20], [1.30, 1.25])
+    assert r["convergence"] == "two-level" and r["p_used"] == 1.0 and r["safety_factor"] == 3.0
+    assert r["gci"] == pytest.approx(3 * 0.05 / 1.25 / (20 / 14 - 1))
+
+
+def test_gci_flags_oscillation_and_divergence():
+    from aero.benchmarks import grid_convergence_index
+
+    osc = grid_convergence_index([10, 14, 20], [1.30, 1.20, 1.24])
+    assert osc["convergence"] == "oscillatory" and osc["extrapolated"] is None
+    assert osc["gci"] == pytest.approx(0.5 * 0.10 / 1.24)
+    div = grid_convergence_index([10, 14, 20], [1.30, 1.29, 1.10])
+    assert div["convergence"] == "divergent" and div["status"] == "fail"
+
+
+def test_gci_caps_an_implausible_order():
+    """Two nearly equal coarse values make p huge; the band must not shrink to nothing."""
+    from aero.benchmarks import grid_convergence_index
+
+    r = grid_convergence_index([10, 14.14, 20], [1.3001, 1.3000, 1.2000])
+    assert r["convergence"] == "divergent"
+    r = grid_convergence_index([10, 14.14, 20], [1.50, 1.30, 1.29])
+    assert r["p_observed"] > 3.0 and r["p_used"] == 2.0 and r["safety_factor"] == 3.0
+    # beyond any order a scheme has: reported as unmeasurable, first order assumed
+    r = grid_convergence_index([10, 14.14, 20], [1.50, 1.30, 1.2999])
+    assert r["p_observed"] is None and r["p_used"] == 1.0 and r["safety_factor"] == 3.0
+
+
+def test_the_budget_uses_a_measured_grid_study():
+    from aero.benchmarks import build_uncertainty_report
+
+    rep = build_uncertainty_report(
+        mode="3d", shape="sphere", params={"radius": "7", "ny": "48", "nz": "48", "nx": "96", "re": "100"},
+        result={"grid_study": {"cells": [9.9, 14, 19.8], "values": [1.42, 1.36, 1.33]}})
+    d = rep.components["discretization"]
+    assert d["value"]["convergence"] == "monotone" and "GCI" in d["message"]

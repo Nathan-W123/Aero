@@ -563,6 +563,7 @@ def main() -> int:
         params=vars(args),
         cd=result.get("Cd_mean"),
         grid_cd_values=result.get("grid_cd_values"),
+        blockage=derive_params(args)["blockage"],
     )
     uncertainty = build_uncertainty_report(
         mode="2d",

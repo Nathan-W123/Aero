@@ -64,47 +64,46 @@ def schiller_naumann_cd(re: float) -> float:
     return (24.0 / re) * (1.0 + 0.15 * (re ** 0.687))
 
 
-#: Drag inflation per unit blockage (b = D / tunnel span) for a sphere in this
-#: tunnel -- slip walls in y, periodic in z, so effectively a square array of
-#: spheres -- as (Re, slope) points of Cd(b) = Cd(0) * (1 + slope * b).  Both
-#: were measured with r = 7 (14 cells across the sphere):
-#:
-#:   Re=20   +32.0 / +15.2 / +12.9% over Schiller-Naumann at 29.2 / 14.6 / 9.7%
-#:           blockage (tunnel length grown with the span; Cd on the voxel
-#:           frontal area).  Straight line: intercept +1.9%, slope 1.02 --
-#:           1.00 per unit blockage relative to the intercept.
-#:   Re=100  1.3607 at 29.2% and 1.2629 at 14.6% (tunnel length fixed at 96;
-#:           Cd on pi r^2): slope 0.58, intercept 1.165.  The same case with
-#:           the sphere 21 cells across reads 1.3177; Richardson-extrapolating
-#:           14 -> 21 cells (order 1 to 2) and removing the walls leaves
-#:           1.055-1.099 against Schiller-Naumann's 1.092.
-#:
-#: Confinement weakens as Re rises -- a thinner viscous region reaches the
-#: walls less -- so using the Re=20 slope at Re=100 overstated it almost 2x.
-#: Between the points the slope is interpolated in log Re; outside them it
-#: is held at the nearest one.  A calibration, not a law: the bands below keep
-#: a +/-15% allowance around it.
-SPHERE_CONFINEMENT_SLOPES: Tuple[Tuple[float, float], ...] = ((20.0, 1.00), (100.0, 0.58))
+#: Unconfined drag of a 2D circular cylinder, from numerical solutions:
+#: Dennis & Chang (1970) for the steady wake to Re 40, and above the onset of
+#: shedding the time mean of Henderson (1995) and Park, Kwon & Choi (1998).
+#: Interpolated in log Re; outside the table there is no reference.
+CYLINDER_2D_CD: Tuple[Tuple[float, float], ...] = (
+    (10.0, 2.846), (20.0, 2.045), (40.0, 1.522), (100.0, 1.34), (200.0, 1.34))
 
 
-def sphere_confinement_slope(re: float) -> float:
-    """Drag inflation per unit blockage at this Re (see SPHERE_CONFINEMENT_SLOPES)."""
-    pts = SPHERE_CONFINEMENT_SLOPES
+def cylinder_2d_cd(re: float) -> Optional[float]:
+    """Unconfined Cd of a 2D circular cylinder at Re in [10, 200], else None."""
+    pts = CYLINDER_2D_CD
     re = float(re)
-    if re <= pts[0][0]:
-        return pts[0][1]
-    for (re0, k0), (re1, k1) in zip(pts, pts[1:]):
-        if re <= re1:
-            t = (math.log(re) - math.log(re0)) / (math.log(re1) - math.log(re0))
-            return k0 + t * (k1 - k0)
+    if not pts[0][0] <= re <= pts[-1][0]:
+        return None
+    for (r0, c0), (r1, c1) in zip(pts, pts[1:]):
+        if re <= r1:
+            t = (math.log(re) - math.log(r0)) / (math.log(r1) - math.log(r0))
+            return math.exp(math.log(c0) + t * (math.log(c1) - math.log(c0)))
     return pts[-1][1]
 
 
+def free_air_reference(mode: str, shape: str, re: float) -> Optional[Tuple[float, str]]:
+    """(unconfined Cd, where it comes from) for the bodies there is a reference for."""
+    mode, shape = str(mode).lower(), str(shape).lower()
+    if mode == "3d" and shape == "sphere" and float(re) <= 800.0:
+        return schiller_naumann_cd(re), "Schiller-Naumann"
+    if mode == "2d" and shape == "cylinder":
+        cd = cylinder_2d_cd(re)
+        if cd is not None:
+            return cd, "2D cylinder, Dennis & Chang / Henderson"
+    return None
+
+
 def sphere_confinement_factor(blockage: Optional[float], re: float) -> float:
-    """Multiplier on the unconfined sphere Cd for a given frontal blockage at Re."""
+    """Multiplier on the unconfined sphere Cd for a blockage D / span at Re (see aero.blockage)."""
+    from .blockage import blockage_correction
+
     if blockage is None:
         return 1.0
-    return 1.0 + sphere_confinement_slope(re) * max(float(blockage), 0.0)
+    return blockage_correction("3d", re, max(float(blockage), 0.0), "sphere")["factor"]
 
 
 def sphere_expected_cd(re: float, blockage: Optional[float] = None) -> Tuple[float, float, str]:
@@ -132,28 +131,32 @@ def literature_cd_range(
     """
     Return (cd_min, cd_max, reference_note) if a literature band exists.
 
-    For the sphere the band is the confinement-corrected Schiller-Naumann value
-    +/-15% when the blockage is known, and a wide envelope (covering blockage
-    up to ~45%) when it is not.  Before the frontal-area fix the sphere bands
-    were tuned around coefficients that read pi/4 low, which is why they
-    looked so generous.
+    Where there is an unconfined reference (a sphere, a 2D circular
+    cylinder) the band is that value raised by the tunnel's blockage
+    (aero.blockage) +/-15% when the blockage is known, and a wide envelope
+    covering heavy blockage when it is not.  Before the frontal-area fix the
+    sphere bands were tuned around coefficients that read pi/4 low, which is
+    why they looked so generous.
     """
+    from .blockage import blockage_correction
+
     shape = shape.lower()
     mode = mode.lower()
     re = float(re)
 
-    if mode == "2d" and shape == "cylinder" and abs(re - 100.0) < 5.0:
-        return (
-            1.2,
-            2.2,
-            "2D cylinder Re≈100 with ~20% blockage (Tritton/Fornberg + confinement)",
-        )
-
-    if mode == "3d" and shape == "sphere" and re <= 300.0:
-        sn, conf, note = sphere_expected_cd(re, blockage)
+    ref = free_air_reference(mode, shape, re)
+    if ref is not None:
+        cd_free, source = ref
         if blockage is None:
-            return (sn * 0.85, sn * 1.6, note + "; band spans blockage up to ~45%")
-        return (conf * 0.85, conf * 1.15, note)
+            hi = 1.6 if mode == "3d" else 2.0
+            return (cd_free * 0.85, cd_free * hi,
+                    f"{source} Cd={cd_free:.2f} at Re={re:g} (unconfined; blockage unknown); "
+                    f"band spans blockage up to ~{45 if mode == '3d' else 30}%")
+        factor = blockage_correction(mode, re, max(float(blockage), 0.0), shape)["factor"]
+        conf = cd_free * factor
+        return (conf * 0.85, conf * 1.15,
+                f"{source} Cd={cd_free:.2f} at Re={re:g}, x{factor:.2f} for {blockage * 100:.0f}% "
+                f"blockage -> expect ~{conf:.2f}")
 
     if mode == "3d" and shape == "box" and re <= 150.0:
         return (0.8, 3.5, "Box Re≤150 — qualitative band (geometry-dependent)")
@@ -282,6 +285,132 @@ def grid_study(
         status=status,
         message=message,
     )
+
+
+#: The finest grid's Grid Convergence Index below which a grid study passes,
+#: and below which it only warns.
+GCI_PASS = 0.05
+GCI_WARN = 0.15
+#: Order assumed when a study cannot measure one (two levels): halfway
+#: bounce-back on a voxel staircase converges at first order at the wall.
+GCI_ASSUMED_ORDER = 1.0
+
+
+def _observed_order(r21: float, r32: float, e21: float, e32: float) -> Optional[float]:
+    """
+    Observed order of convergence for unequal refinement ratios (Celik et al.
+    2008, eqs. 3-4): the fixed point of ``p = |ln|e32/e21| + q(p)| / ln r21``
+    with ``q(p) = ln((r21^p - s) / (r32^p - s))``, ``s = sign(e32/e21)``.
+    """
+    s = 1.0 if e32 / e21 > 0 else -1.0
+    base = math.log(abs(e32 / e21))
+    p = abs(base) / math.log(r21)
+    for _ in range(200):
+        a, b = r21 ** p - s, r32 ** p - s
+        if a <= 0.0 or b <= 0.0:
+            return None
+        nxt = abs(base + math.log(a / b)) / math.log(r21)
+        if abs(nxt - p) < 1e-10:
+            return nxt
+        p = nxt
+        if p > 20.0:
+            return None
+    return p
+
+
+def grid_convergence_index(cells: List[float], values: List[float], *,
+                           p_max: float = 2.0) -> Dict[str, Any]:
+    """
+    Discretisation uncertainty from a grid study: the Grid Convergence Index
+    of Roache, by the procedure of Celik et al. (2008), ASME J. Fluids Eng.
+    130, 078001 -- the one most journals ask for.
+
+    ``cells`` measures each level's resolution (cells across the body) and
+    ``values`` holds the result there (Cd), in any order; the refinement
+    ratios need not be equal.  With three or more levels the three finest
+    give the observed order of convergence ``p`` and a Richardson
+    extrapolation; with two, ``p`` is assumed (:data:`GCI_ASSUMED_ORDER`).
+
+    The uncertainty band is ``GCI = Fs |phi1 - phi2| / |phi1| / (r21^p - 1)``
+    on the finest grid, with the safety factor ``Fs = 1.25`` when the observed
+    order is believable (0.5-3) and 3 otherwise or when it is assumed;
+    ``p`` is capped at ``p_max``, the scheme's formal order, so a lucky
+    near-cancellation cannot claim faster convergence than the method has.
+    Oscillatory convergence has no extrapolation; its uncertainty is half
+    the range of the values (Stern et al. 2001).  Divergence -- the finer
+    step changing the result more than the coarser one -- fails: the grids
+    are not yet in the asymptotic range.
+    """
+    pairs = sorted((float(c), float(v)) for c, v in zip(cells, values))
+    out: Dict[str, Any] = {"levels": [{"cells": c, "value": v} for c, v in pairs]}
+    if len(pairs) < 2:
+        out.update(status="n/a", message="A grid study needs at least two levels.")
+        return out
+    (n1, phi1), (n2, phi2) = pairs[-1], pairs[-2]
+    r21 = n1 / n2
+    e21 = phi2 - phi1
+    scale = max(abs(phi1), 1e-12)
+    out.update(fine_value=phi1, p_observed=None, extrapolated=None)
+
+    if len(pairs) >= 3:
+        n3, phi3 = pairs[-3]
+        r32 = n2 / n3
+        e32 = phi3 - phi2
+        out["ratios"] = [r32, r21]
+        if abs(e21) <= 1e-9 * scale:
+            kind = "converged"
+        elif abs(e32) <= 1e-12 * scale:
+            kind = "divergent"
+        else:
+            R = e21 / e32
+            out["convergence_ratio"] = R
+            kind = ("monotone" if 0.0 < R < 1.0 else "oscillatory" if -1.0 < R < 0.0 else "divergent")
+    else:
+        out["ratios"] = [r21]
+        kind = "converged" if abs(e21) <= 1e-9 * scale else "two-level"
+
+    p_used, fs, gci = None, None, None
+    if kind == "converged":
+        gci = 0.0
+        out["extrapolated"] = phi1
+    elif kind == "monotone":
+        p = _observed_order(r21, r32, e21, e32)
+        out["p_observed"] = p
+        if p is not None and 0.5 <= p <= 3.0:
+            p_used, fs = min(p, p_max), 1.25
+        else:
+            p_used, fs = (min(max(p, 0.5), p_max) if p is not None else GCI_ASSUMED_ORDER), 3.0
+    elif kind == "two-level":
+        p_used, fs = GCI_ASSUMED_ORDER, 3.0
+    if p_used is not None:
+        denom = r21 ** p_used - 1.0
+        gci = fs * abs(e21) / scale / denom
+        out["extrapolated"] = phi1 - e21 / denom
+    elif kind == "oscillatory":
+        vals = [v for _, v in pairs[-3:]]
+        gci = 0.5 * (max(vals) - min(vals)) / scale
+    elif kind == "divergent":
+        gci = 3.0 * abs(e21) / scale / (r21 - 1.0)
+    out.update(convergence=kind, p_used=p_used, safety_factor=fs, gci=gci, uncertainty=gci * abs(phi1))
+
+    status = ("fail" if kind == "divergent" else
+              "pass" if gci < GCI_PASS else "warn" if gci < GCI_WARN else "fail")
+    levels = " → ".join(f"{c:.3g}" for c, _ in pairs)
+    what = {
+        "converged": "the value does not change with the grid",
+        "monotone": (f"monotone convergence, observed order p = {out['p_observed']:.2f}"
+                     if out["p_observed"] is not None else "monotone convergence, order not measurable"),
+        "oscillatory": "oscillatory convergence, so no extrapolation: the band is half the range",
+        "divergent": "the finer step changed the result more than the coarser one: the grids are not "
+                     "yet in the asymptotic range -- refine further",
+        "two-level": f"two levels, so the order is assumed (p = {GCI_ASSUMED_ORDER:g}, safety factor 3)",
+    }[kind]
+    msg = f"{len(pairs)} grids ({levels} cells across the body): {what}."
+    if out["extrapolated"] is not None and kind != "converged":
+        msg += f" Extrapolated to zero cell size: {out['extrapolated']:.4g}."
+    msg += f" GCI on the finest grid {gci * 100:.1f}%."
+    out.update(status=status, message=msg)
+    return out
 
 
 #: Reynolds number at which the wake stops being steady, by body.  47 is the
@@ -647,33 +776,47 @@ def _json_ready_report(value: Any) -> Optional[Dict[str, Any]]:
     return value
 
 
-def _blockage_component(mode: str, shape: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    d = reference_length_cells(mode, shape, params)
-    ny = max(float(params.get("ny", 1) or 1), 1.0)
-    if mode == "3d":
-        nz = max(float(params.get("nz", ny) or ny), 1.0)
-        ratio_y = d / ny
-        ratio_z = d / nz
-        ratio = max(ratio_y, ratio_z)
-        detail = f"Cross-stream blockage y={ratio_y*100:.1f}%, z={ratio_z*100:.1f}%."
-    else:
+#: The blockage check passes while the correction's own uncertainty stays
+#: under this fraction of Cd, and only warns up to the second.
+BLOCKAGE_PASS = 0.01
+BLOCKAGE_WARN = 0.05
+
+
+def _blockage_component(mode: str, shape: str, params: Dict[str, Any],
+                        solid: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """
+    How much the tunnel's walls raise Cd here, and how sure that is
+    (aero.blockage).  Graded on what the correction leaves uncertain, not on
+    the correction's size: a large but well-known one costs little.
+    """
+    from .blockage import blockage_correction, blockage_of_case
+
+    re = max(float(params.get("re", 100.0) or 100.0), 1e-6)
+    bl = blockage_of_case(mode, shape, params, solid)
+    if bl is None:                       # no formula for the body and no voxels to measure
+        d = reference_length_cells(mode, shape, params)
+        ny = max(float(params.get("ny", 1) or 1), 1.0)
         ratio = d / ny
-        detail = f"Blockage ratio D/Ny={ratio*100:.1f}%."
-    if ratio < 0.10:
-        status = "pass"
-    elif ratio < 0.20:
-        status = "warn"
+        return {"status": "pass" if ratio < 0.10 else "warn" if ratio < 0.20 else "fail",
+                "value": {"b": ratio}, "message": f"Blockage ratio D/Ny={ratio*100:.1f}%."}
+    corr = blockage_correction(bl["law"], re, bl["b"], shape, params)
+    K, dK = corr["K"], corr["dK"]
+    status = "pass" if dK < BLOCKAGE_PASS else "warn" if dK < BLOCKAGE_WARN else "fail"
+    if bl["law"] == "3d":
+        ny = max(float(params.get("ny", 48) or 48), 1.0)
+        nz = max(float(params.get("nz", ny) or ny), 1.0)
+        across = reference_length_cells(mode, shape, params) / min(ny, nz)
+        area = (f"{bl['area_ratio'] * 100:.1f}% of the cross-section by frontal area (as a disc, "
+                f"{bl['b'] * 100:.0f}% of the tunnel across), and spans {across * 100:.0f}% of its "
+                "height or width")
     else:
-        status = "fail"
-    if mode == "3d" and str(shape).lower() == "sphere":
-        re = max(float(params.get("re", 100.0) or 100.0), 1e-6)
-        detail += (f" Expected to raise a sphere's Cd by ~{(sphere_confinement_factor(ratio, re)-1)*100:.0f}%"
-                   " (measured blockage sweep).")
-    return {
-        "status": status,
-        "value": float(ratio),
-        "message": detail,
-    }
+        area = f"{bl['b'] * 100:.1f}% of the tunnel's height"
+    message = (f"The body blocks {area}. The walls raise Cd by about {K * 100:.0f}% ± {dK * 100:.0f}% "
+               f"here ({corr['basis']}); the results correct for it (Cd free air), and a blockage "
+               "study measures it instead.")
+    return {"status": status, "value": {"b": bl["b"], "area_ratio": bl["area_ratio"], "K": K, "dK": dK,
+                                        "law": bl["law"]},
+            "message": message}
 
 
 def _domain_length_component(mode: str, shape: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -865,6 +1008,10 @@ def _resolution_estimate(mode: str, shape: str, params: Dict[str, Any]) -> Dict[
     one cell thick.
     """
     d = reference_length_cells(mode, shape, params)
+    refined = mode == "3d" and any(str(params.get(k, "")).lower() in ("true", "1", "yes", "on")
+                                   for k in ("refine", "refine_body"))
+    if refined:                             # the body sits in a block at twice the resolution
+        d *= 2.0
     re = max(float(params.get("re", 100.0) or 100.0), 1e-6)
     bl = d / np.sqrt(re)
     if d >= 30 and bl >= 3:
@@ -873,8 +1020,9 @@ def _resolution_estimate(mode: str, shape: str, params: Dict[str, Any]) -> Dict[
         status = "warn"
     else:
         status = "fail"
-    message = (f"No grid study; estimate only: {d:.0f} cells across the body, "
-               f"boundary layer ≈ D/√Re = {bl:.1f} cells. Run Grid Study to measure.")
+    message = (f"No grid study; estimate only: {d:.0f} cells across the body"
+               + (" (refined 2× around it)" if refined else "")
+               + f", boundary layer ≈ D/√Re = {bl:.1f} cells. Run Grid Study to measure.")
     if mode == "3d" and str(shape).lower() == "sphere" and status != "pass":
         message += (" For scale: at Re=100 a 14-cell sphere measured 6-10% high"
                     " (14 -> 21 cells lowered Cd 3.2%).")
@@ -889,6 +1037,10 @@ def _discretization_component(
     result: Dict[str, Any], mode: Optional[str] = None,
     shape: Optional[str] = None, params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    study = result.get("grid_study")
+    if study and len(study.get("cells") or []) >= 2:
+        rep = grid_convergence_index(study["cells"], study["values"])
+        return {"status": rep["status"], "value": rep, "message": rep["message"]}
     grid_cd_values = result.get("grid_cd_values")
     if not grid_cd_values:
         if mode and shape and params:

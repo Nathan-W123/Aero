@@ -225,6 +225,12 @@ figure .empty{color:var(--faint)}
         <button class="rbtn big" id="stopBtn" disabled title="Stop the solver; what it has computed so far is kept">
           <svg viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="gStop" x2="0" y2="1"><stop offset="0" stop-color="#f27a6c"/><stop offset="1" stop-color="#b8261b"/></linearGradient></defs><circle cx="16" cy="16" r="13.5" fill="url(#gStop)" stroke="#8a1c14"/><rect x="11" y="11" width="10" height="10" rx="1.2" fill="#fff"/></svg>
           <span>Stop</span></button>
+        <button class="rbtn big" id="studyBtn" title="Run the case at three resolutions, one after another, and measure how much the drag still depends on the grid (the levels are set under Grid study)">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke-linejoin="round"><rect x="3.5" y="3.5" width="25" height="25" rx="1.5" fill="#eef4fc" stroke="#3d5a80"/><path d="M11.8 3.5v25M20.2 3.5v25M3.5 11.8h25M3.5 20.2h25" stroke="#9db7d8"/><rect x="11.8" y="11.8" width="16.7" height="16.7" fill="#d6e6f9" stroke="#2b62b0"/><path d="M16 11.8v16.7M24.3 11.8v16.7M11.8 16h16.7M11.8 24.3h16.7" stroke="#6f9fd8" stroke-width=".8"/><rect x="20.2" y="20.2" width="8.3" height="8.3" fill="#2b62b0" stroke="#1d4f91"/></g></svg>
+          <span>Grid study</span></button>
+        <button class="rbtn big" id="blockStudyBtn" title="Run the case in the tunnel as set and in two wider ones (√2 and 2× the height and width), and extrapolate the drag to zero blockage: the free-air drag, measured for this body">
+          <svg viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke-linejoin="round"><rect x="2.5" y="2.5" width="27" height="27" rx="1.5" fill="#eef4fc" stroke="#9db7d8" stroke-dasharray="2.2 1.4"/><rect x="7" y="7" width="18" height="18" rx="1.2" fill="#e3edfa" stroke="#7fa3cf"/><rect x="11" y="11" width="10" height="10" rx="1" fill="#d6e6f9" stroke="#2b62b0"/><circle cx="16" cy="16" r="3.2" fill="#8b98aa" stroke="#3d4b5f"/></g></svg>
+          <span>Blockage study</span></button>
       </div>
       <div class="rlabel">Simulation</div>
     </div>
@@ -315,12 +321,18 @@ figure .empty{color:var(--faint)}
             <label for="collision">Collision</label><div class="pv"><select id="collision"></select></div></div>
           <div class="prow" id="latticeRow" hidden data-desc="D3Q19 is the usual choice; D3Q27 is more isotropic, at about 40% more work per cell.">
             <label for="lattice">Lattice</label><div class="pv"><select id="lattice"></select></div></div>
+          <div class="prow" id="refineRow" hidden data-desc="Runs a box around the body -- half a body length upstream and to the sides, one and a half into the wake -- at twice the resolution, two fine steps to each tunnel step. The body is drawn again at the finer cells and the forces come from there. It costs what the box's cells do: about 3-5× the work in a crowded tunnel, against 16× for refining the whole tunnel.">
+            <label for="refine">Refine near body</label><div class="pv"><input type="checkbox" id="refine"><span class="u">2× finer</span></div></div>
           <div class="prow" data-desc="numba compiles the kernels for this CPU; numpy is the portable fallback; auto picks the fastest one available.">
             <label for="backend">Backend</label><div class="pv"><select id="backend"></select></div></div>
           <div class="prow" data-desc="Time steps to run. The free stream crosses the tunnel in about Nx / u₀ steps, and the averages come from the second half of the run.">
             <label for="steps">Steps</label><div class="pv"><input id="steps" type="number" value="3000" min="50" step="500"></div></div>
           <div class="prow" data-desc="Smagorinsky subgrid model: adds eddy viscosity where the resolved shear is strong. For under-resolved, high-Re runs.">
             <label for="les">Smagorinsky LES</label><div class="pv"><input type="checkbox" id="les"></div></div>
+        </details>
+        <details><summary>Grid study</summary>
+          <div class="prow" data-desc="Which grids the Grid study runs, a ratio of √2 apart. 'this + 2 coarser' keeps your grid as the finest and costs about 1.3× a run; 'coarser, this, finer' also runs a grid finer than yours (about 5× a run in 3D) and so says more about yours.">
+            <label for="study_levels">Levels</label><div class="pv"><select id="study_levels"><option value="coarser">this grid + 2 coarser</option><option value="finer">coarser, this, finer</option></select></div></div>
         </details>
         <details open><summary>Boundaries</summary>
           <div class="prow" data-desc="The tunnel's side walls. slip: frictionless, so no boundary layers grow on them; noslip: solid walls with boundary layers.">
@@ -410,7 +422,7 @@ figure .empty{color:var(--faint)}
 <script>
 const $ = s => document.querySelector(s);
 let schema = null, jobId = null, poll = null, lastStatus = null;
-let lastState = "", figStamp = -1, fieldStamp = -1, formSynced = false, geomLoaded = false;
+let lastState = "", figStamp = -1, fieldStamp = -1, formSynced = false, geomLoaded = false, viewLevel = 0;
 
 // ---------------------------------------------------------------- form ----
 const DIMS = {
@@ -518,6 +530,7 @@ function syncShape(){
   const mode = $("#mode").value;
   fill($("#shape"), mode === "2d" ? schema.shapes_2d : schema.shapes_3d);
   $("#latticeRow").hidden = mode !== "3d";
+  $("#refineRow").hidden = mode !== "3d";
   inputs($("#gridRow"), GRIDS[mode]);
   // A sphere's wake is steady until Re ≈ 210 and sheds only above ≈ 270, so a
   // perturbation tuned for the 2D cylinder (onset 47) just forces noise into Cd.
@@ -545,9 +558,9 @@ function params(){
   return p;
 }
 function attach(id){
-  jobId = id; location.hash = id;
+  jobId = id; location.hash = id; viewLevel = 0;
   geomLoaded = false; fieldStamp = -1; figStamp = -1; tunnel.reset(); resetChart(); drawChart();
-  $("#runBtn").disabled = true; $("#stopBtn").disabled = false;
+  $("#runBtn").disabled = $("#studyBtn").disabled = $("#blockStudyBtn").disabled = true; $("#stopBtn").disabled = false;
   clearInterval(poll); poll = setInterval(tick, 700); tick();
 }
 async function boot(){
@@ -571,6 +584,17 @@ $("#runBtn").addEventListener("click", async () => {
   const r = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(params())});
   attach((await r.json()).id);
 });
+async function startStudy(kind){
+  $("#errBox").hidden = true;
+  renderStudy({kind}, "starting…");
+  for(const k of ["speed","vorticity","pressure"]) $("#fig_"+k).innerHTML = '<span class="empty">rendering…</span>';
+  formSynced = true;
+  const r = await fetch("/api/study", {method:"POST", headers:{"Content-Type":"application/json"},
+                                       body: JSON.stringify({...params(), study: kind})});
+  attach((await r.json()).id);
+}
+$("#studyBtn").addEventListener("click", () => startStudy("grid"));
+$("#blockStudyBtn").addEventListener("click", () => startStudy("blockage"));
 $("#stopBtn").addEventListener("click", async () => {
   if(jobId) await fetch("/api/stop", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({id: jobId})});
 });
@@ -650,10 +674,18 @@ async function tick(){
   }
   if(j.state === "error"){ $("#errBox").hidden = false; $("#errBox").textContent = j.error || "the run failed"; }
 
+  // a grid study runs its levels one after another: each starts the chart
+  // and the viewer afresh
+  if((j.level || 0) !== viewLevel){
+    viewLevel = j.level || 0;
+    geomLoaded = false; fieldStamp = -1; tunnel.reset(); resetChart();
+  }
   await pullSeries(jobId);
-  drawChart(j.history, j.result.coefficients || null);
-  renderStats(j.result.coefficients, {running: "averaged when the run ends", queued: "starting…",
-    error: "none: the run failed"}[j.state] || "none");
+  drawChart(j.history, j.state === "running" ? null : (j.result.coefficients || null));
+  if(j.kind === "study") renderStudy(j.result.study || {}, {running: "running", queued: "starting…",
+    error: "the study failed", stopped: "stopped"}[j.state] || "", j.level || 0);
+  else renderStats(j.result.coefficients, {running: "averaged when the run ends", queued: "starting…",
+    error: "none: the run failed"}[j.state] || "none", j.result.free_air);
 
   // the run's own checks once it has them; until then the pre-run ones stand
   if(j.result.uncertainty || j.result.reference) renderChecks(j.result, "Checks");
@@ -681,31 +713,72 @@ async function tick(){
   if(["done","error","stopped"].includes(j.state)){
     clearInterval(poll); poll = null;
     tunnel.runDone();
-    $("#runBtn").disabled = false; $("#stopBtn").disabled = true;
+    $("#runBtn").disabled = $("#studyBtn").disabled = $("#blockStudyBtn").disabled = false; $("#stopBtn").disabled = true;
   }
 }
 
 // The coefficients block keeps its rows at all times -- "—" until there are
 // values, the header saying why -- so the strip does not change shape.
-function renderStats(c, note){
+function renderStats(c, note, fa){
   const f4 = v => (v === null || v === undefined) ? "—" : v.toFixed(4);
   const pm = (v, e) => c ? `${f4(v)}<small>± ${f4(e)}</small>` : "—";
+  const pct = v => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(0)}%`;
   // (the label's text sits in its own span: a flex item trims the space after <sub>)
   const row = (k, v, tip) => `<div class="prow"${tip ? ` title="${esc(tip)}"` : ""}><span class="pl"><span>${k}</span></span><span class="pv num">${v}</span></div>`;
   $("#stats").innerHTML = `<div class="pcat">Coefficients · ${c ? "mean ± 95%" : `<span class="note">${note}</span>`}</div>`
     + row("C<sub>d</sub>", pm(c && c.cd, c && c.cd_sem95), c &&
           `± is the 95% statistical uncertainty of the mean, from ${c.cd_n_eff ?? "?"} effective independent samples. It does not include systematic errors such as blockage or resolution — see the checks.`)
     + row("C<sub>d</sub> fluctuation σ", c ? f4(c.cd_std) : "—", c && "Standard deviation of the per-step drag signal: how much it fluctuates, not how uncertain the mean is.")
-    + row("C<sub>l</sub>", pm(c && c.cl, c && c.cl_sem95));
+    + row("C<sub>l</sub>", pm(c && c.cl, c && c.cl_sem95))
+    + row("C<sub>d</sub> free air", c && fa ? `${f4(fa.cd)}<small>± ${f4(fa.uncertainty)}</small>` : "—", c && fa &&
+          `The drag with the tunnel's blockage taken out: Cd / (1 + K), where the walls raise it by K = ${pct(fa.K)} ± ${(fa.dK * 100).toFixed(0)}% here (${fa.basis}). The ± combines that with the statistical uncertainty. A Blockage study measures it instead.`);
 }
 renderStats(null, "no run yet");
+
+// A study's levels as they finish, then what they add up to.  A grid study:
+// the drag extrapolated to zero cell size and the Grid Convergence Index,
+// the band the finest grid's drag lies in from its resolution alone.  A
+// blockage study: the drag extrapolated to zero blockage, against what the
+// blockage model predicted for the tunnel as set.
+function renderStudy(st, note, level){
+  const plan = st.plan || [], done = st.levels || [], a = st.analysis, grid = st.kind !== "blockage";
+  const f4 = v => (v === null || v === undefined) ? "—" : v.toFixed(4);
+  const row = (k, v, tip) => `<div class="prow"${tip ? ` title="${esc(tip)}"` : ""}><span class="pl"><span>${k}</span></span><span class="pv num">${v}</span></div>`;
+  let html = `<div class="pcat">${grid ? "Grid study" : "Blockage study"}`
+    + (plan.length ? ` · ${plan.length} ${grid ? "grids" : "tunnels"}, ratio √2` : "")
+    + (a ? "" : ` · <span class="note">${note}</span>`) + `</div>`;
+  plan.forEach((lv, i) => {
+    const got = done[i];
+    const val = got ? f4(got.cd) : (i === level && note === "running" ? "running…" : "—");
+    const name = grid ? `D = ${(+lv.cells_across).toFixed(1)} cells` : `blockage ${(lv.blockage * 100).toFixed(0)}%`;
+    html += row(name + (lv.case ? " (yours)" : ""), got ? `${val}<small>± ${f4(got.cd_sem95)}</small>` : val,
+                `${lv.grid.join(" × ")} cells, ${lv.steps.toLocaleString()} steps` + (got ? `, ${got.secs} s` : ""));
+  });
+  if(!plan.length) html += row(grid ? "C<sub>d</sub> by grid" : "C<sub>d</sub> by tunnel", "—");
+  const ext = a && a.extrapolated != null && a.convergence !== "converged" ? f4(a.extrapolated) : "—";
+  if(grid){
+    html += row("C<sub>d</sub> at zero cell size", ext,
+                "Richardson extrapolation of the finest grids to zero cell size, at the observed order of convergence.");
+    html += row("Grid uncertainty (GCI)", a && a.gci != null ? `± ${(a.gci * 100).toFixed(1)}%` + (a.p_observed != null ? `<small>p = ${a.p_observed.toFixed(2)}</small>` : "") : "—",
+                a ? a.message : "The Grid Convergence Index: the band the finest grid's drag lies in, from its resolution alone (Roache; Celik et al. 2008).");
+    const fx = a && a.free_air_extrapolated;
+    html += row("C<sub>d</sub> free air, zero cell size", fx ? `${f4(fx.cd)}<small>± ${f4(fx.uncertainty)}</small>` : "—",
+                "The best estimate the study gives: the drag at zero cell size with the tunnel's blockage taken out (the blockage model). The ± combines the grid's uncertainty with the correction's.");
+  } else {
+    html += row("C<sub>d</sub> free air (measured)", a && a.gci != null && ext !== "—" ? `${ext}<small>± ${(a.gci * 100).toFixed(1)}%</small>` : ext,
+                a ? a.message : "The drag extrapolated to zero blockage from the three tunnels.");
+    html += row("C<sub>d</sub> free air (model)", a && a.model_free_air != null ? f4(a.model_free_air) : "—",
+                "What the blockage model makes of the tunnel as set, for comparison: the drag there divided by the confinement factor calibrated for this kind of body.");
+  }
+  $("#stats").innerHTML = html;
+}
 
 // -------------------------------------------------------------- checks ----
 // The uncertainty budget: a statistical ± can never cover a systematic bias,
 // so each systematic effect gets its own row, and the expected value for the
 // run *as configured* (confinement included) sits first.  Status is carried
 // by the icon's shape as well as its colour.
-const CHECK_ORDER = ["mesh", "statistical", "blockage", "domain_length", "discretization", "stability",
+const CHECK_ORDER = ["mesh", "statistical", "blockage", "domain_length", "discretization", "refinement", "stability",
                      "bc_sensitivity", "convergence", "budget"];
 const STATUS_ICON = {
   pass: '<svg viewBox="0 0 14 14" aria-label="pass"><circle cx="7" cy="7" r="6.5" fill="#2c8a3c"/><path d="M4 7.3l2 2 4-4.5" fill="none" stroke="#fff" stroke-width="1.6"/></svg>',
@@ -750,7 +823,7 @@ function preflightSoon(){ clearTimeout(preflightTimer); preflightTimer = setTime
 // The body in the tunnel as configured, drawn before anything runs, whenever
 // an edit changes the geometry (and no run is going).
 const GEOMETRY_KEYS = new Set(["mode", "shape", "radius", "width", "height", "depth", "length", "nx", "ny", "nz",
-                               "mesh_id", "mesh_size", "mesh_orient", "mesh_rot_x", "mesh_rot_y", "mesh_rot_z"]);
+                               "mesh_id", "mesh_size", "mesh_orient", "mesh_rot_x", "mesh_rot_y", "mesh_rot_z", "refine"]);
 let previewTimer = null, previewSeq = 0;
 function previewSoon(){ clearTimeout(previewTimer); previewTimer = setTimeout(preview, 350); }
 async function preview(){
@@ -1181,7 +1254,8 @@ const tunnel = (() => {
       uniform float uMix, uGainA, uGainB; uniform bool uReplay;
       uniform vec3 uEye, uRight, uUp, uFwd, uBox, uCell, uBgTop, uBgBottom, uLine;
       uniform float uTanHalf, uAspect, uDensity, uLo, uHi, uPixel, uFrac, uFrom;
-      uniform bool uHasSolid, uHasVol, uSmoke;
+      uniform bool uHasSolid, uHasVol, uSmoke, uHasRef;
+      uniform vec3 uRefLo, uRefHi, uRefLine;
       in vec2 vNdc; out vec4 outColor;
 
       vec2 hitBox(vec3 ro, vec3 rd){
@@ -1195,6 +1269,16 @@ const tunnel = (() => {
         vec3 n = 1.0 - smoothstep(0.3 * w, 1.25 * w, min(p, uBox - p));
         return max(max(min(n.x, n.y), min(n.x, n.z)), min(n.y, n.z));
       }
+      // the refined block, if any: the same edge test on its own box
+      vec2 hitRef(vec3 ro, vec3 rd){
+        vec3 inv = 1.0 / rd, a = (uRefLo - ro) * inv, b = (uRefHi - ro) * inv;
+        vec3 lo = min(a, b), hi = max(a, b);
+        return vec2(max(max(lo.x, lo.y), lo.z), min(min(hi.x, hi.y), hi.z));
+      }
+      float refEdge(vec3 p, float w){
+        vec3 n = 1.0 - smoothstep(0.3 * w, 1.25 * w, min(p - uRefLo, uRefHi - p));
+        return max(max(min(n.x, n.y), min(n.x, n.z)), min(n.y, n.z));
+      }
       void main(){
         vec3 rd = normalize(uFwd + vNdc.x * uTanHalf * uAspect * uRight + vNdc.y * uTanHalf * uUp);
         vec2 t = hitBox(uEye, rd);
@@ -1203,6 +1287,13 @@ const tunnel = (() => {
         t.x = max(t.x, 0.0);
         float px = 1.3 * uPixel;                      // ~ a pixel per unit distance
         bg = mix(bg, uLine, 0.55 * edge(uEye + rd * t.x, px * t.x) + 0.22 * edge(uEye + rd * t.y, px * t.y));
+        if(uHasRef){
+          vec2 r = hitRef(uEye, rd);
+          if(r.x < r.y && r.y > 0.0){
+            r.x = max(r.x, 0.0);
+            bg = mix(bg, uRefLine, min(0.7 * refEdge(uEye + rd * r.x, px * r.x) + 0.35 * refEdge(uEye + rd * r.y, px * r.y), 0.8));
+          }
+        }
         float dt = 0.5;                               // half a cell
         float tt = t.x + dt * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
         vec4 acc = vec4(0.0);
@@ -1307,7 +1398,7 @@ const tunnel = (() => {
     };
     [render, R] = program(RENDER_FS, ["uVol","uSolid","uVel","uDye","uLut","uEye","uRight","uUp","uFwd","uBox",
       "uCell","uBgTop","uBgBottom","uLine","uFrom","uTanHalf","uAspect","uDensity","uLo","uHi","uPixel","uHasSolid","uHasVol","uSmoke",
-      "uDyePrev","uFrac","uFrameA","uFrameB","uMix","uGainA","uGainB","uReplay"]);
+      "uDyePrev","uFrac","uFrameA","uFrameB","uMix","uGainA","uGainB","uReplay","uHasRef","uRefLo","uRefHi","uRefLine"]);
     [advect, A] = program(ADVECT_FS, ["uDye","uVel","uSolid","uNoise","uGrid","uBox","uZ","uStep","uVelScale",
       "uAdvanced","uSrcR","uRepeat","uSrcC","uFlat"]);
 
@@ -1344,6 +1435,7 @@ const tunnel = (() => {
     gl.uniform1i(R.uDye, 5); gl.uniform1i(R.uDyePrev, 6); gl.uniform1i(R.uFrameA, 8); gl.uniform1i(R.uFrameB, 9);
     gl.uniform3f(R.uBgTop, 1, 1, 1); gl.uniform3f(R.uBgBottom, 0.914, 0.933, 0.961);   // #fff -> #e9eef5
     gl.uniform3f(R.uLine, 0.30, 0.38, 0.50);
+    gl.uniform3f(R.uRefLine, 0.17, 0.38, 0.69);                                          // #2b62b0
     gl.useProgram(advect);
     gl.uniform1i(A.uDye, 5); gl.uniform1i(A.uVel, 3); gl.uniform1i(A.uSolid, 1); gl.uniform1i(A.uNoise, 4);
     fbo = gl.createFramebuffer();
@@ -1520,6 +1612,10 @@ const tunnel = (() => {
     gl.uniform1f(R.uLo, q.lo || 0); gl.uniform1f(R.uHi, q.hi || 1); gl.uniform1f(R.uFrom, q.from);
     gl.uniform1i(R.uHasSolid, hasSolid ? 1 : 0); gl.uniform1i(R.uHasVol, fld ? 1 : 0);
     gl.uniform1i(R.uSmoke, qty === "smoke" && dyeShape ? 1 : 0);
+    // the refined block, (z0, z1, y0, y1, x0, x1) in cells, drawn as an outline
+    const rb = geom && geom.header.refined;
+    gl.uniform1i(R.uHasRef, rb ? 1 : 0);
+    if(rb){ gl.uniform3f(R.uRefLo, rb[4], rb[2], rb[0]); gl.uniform3f(R.uRefHi, rb[5], rb[3], rb[1]); }
     const show = replaying();
     gl.uniform1i(R.uReplay, show ? 1 : 0);
     if(show){

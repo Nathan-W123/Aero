@@ -197,6 +197,25 @@ python3 webui.py          # then open http://localhost:8017
   and vorticity of the run as a time-lapse.
 - The convergence chart has Cd and Cl at every step: wheel to zoom, drag to
   pan, Shift-drag to zoom to a box, double-click for the whole run.
+- **Grid study** runs the case on three grids a ratio of √2 apart (your grid
+  and two coarser, or one coarser and one finer: Grid study → Levels) and
+  reports the observed order of convergence, Cd extrapolated to zero cell
+  size, and the Grid Convergence Index on the finest grid (Celik et al.
+  2008); the resolution check then shows the measured number instead of an
+  estimate.
+- **Blockage**: every result also gives **Cd free air**, the drag with the
+  tunnel's walls taken out by a confinement model calibrated with this solver
+  on cylinders (2D) and spheres (3D) across blockage and Reynolds number
+  (`aero/blockage.py`), with its own uncertainty, larger for shapes it was
+  not calibrated on.  **Blockage study** measures it for your body instead:
+  the case in the tunnel as set and two wider ones, extrapolated to zero
+  blockage.
+- **Refine near body** (3D) runs a box around the body -- half a body length
+  ahead and to the sides, one and a half into the wake -- at twice the
+  resolution, coupled to the tunnel grid; the body is voxelized again there
+  and the forces come from it.  It costs what the box's cells do (about 3-5×
+  a plain run in a crowded tunnel), against 16× for refining the whole
+  tunnel.  The view outlines the block in blue.
 - Export the view as PNG, the history as CSV, the results as JSON.
 
 ## Research notes
