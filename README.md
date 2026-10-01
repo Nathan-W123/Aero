@@ -204,18 +204,21 @@ python3 webui.py          # then open http://localhost:8017
   2008); the resolution check then shows the measured number instead of an
   estimate.
 - **Blockage**: every result also gives **Cd free air**, the drag with the
-  tunnel's walls taken out by a confinement model calibrated with this solver
-  on cylinders (2D) and spheres (3D) across blockage and Reynolds number
-  (`aero/blockage.py`), with its own uncertainty, larger for shapes it was
-  not calibrated on.  **Blockage study** measures it for your body instead:
-  the case in the tunnel as set and two wider ones, extrapolated to zero
+  tunnel's walls taken out by a confinement law measured with this solver
+  for circular and square cylinders (2D) and spheres and cubes (3D), at
+  5-30% blockage and Re 10-100 (`aero/blockage.py`), with its own
+  uncertainty -- larger for shapes it was not measured for, such as an
+  uploaded mesh.  **Blockage study** measures it for your body instead: the
+  case in the tunnel as set and two wider ones, extrapolated to zero
   blockage.
 - **Refine near body** (3D) runs a box around the body -- half a body length
   ahead and to the sides, one and a half into the wake -- at twice the
   resolution, coupled to the tunnel grid; the body is voxelized again there
-  and the forces come from it.  It costs what the box's cells do (about 3-5×
-  a plain run in a crowded tunnel), against 16× for refining the whole
-  tunnel.  The view outlines the block in blue.
+  and the forces come from it.  It costs what the box's cells do: a step
+  takes about 5-7× as long as a plain one in a crowded tunnel, against
+  20-30× for refining the whole tunnel.  On the default sphere it brings Cd
+  from 6.4% above the whole-tunnel-refined value to 0.3%.  The view outlines
+  the block in blue.
 - Export the view as PNG, the history as CSV, the results as JSON.
 
 ## Research notes

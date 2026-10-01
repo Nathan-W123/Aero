@@ -812,8 +812,8 @@ def _blockage_component(mode: str, shape: str, params: Dict[str, Any],
     else:
         area = f"{bl['b'] * 100:.1f}% of the tunnel's height"
     message = (f"The body blocks {area}. The walls raise Cd by about {K * 100:.0f}% ± {dK * 100:.0f}% "
-               f"here ({corr['basis']}); the results correct for it (Cd free air), and a blockage "
-               "study measures it instead.")
+               f"here ({corr['basis']}). The results correct for it (Cd free air); a blockage study "
+               "measures it for this body instead.")
     return {"status": status, "value": {"b": bl["b"], "area_ratio": bl["area_ratio"], "K": K, "dK": dK,
                                         "law": bl["law"]},
             "message": message}

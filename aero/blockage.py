@@ -23,24 +23,118 @@ The model
 tunnel's; in 3D the diameter of the disc with the body's frontal area over
 that of the disc with the tunnel's cross-section, ``sqrt(S / C)`` with the
 same constant, which for a sphere in a square tunnel is just ``D / span``.
-Writing it in frontal area is what lets one calibration serve every shape:
-a cube and a sphere of the same frontal area block the tunnel alike, where
-their extents across it do not.
 
-``k1`` and ``k2`` were measured with this solver (:data:`CALIBRATION`): the
-same body, at fixed resolution, in tunnels of four widths, fitted for
-``Cd_free`` together with the coefficients.  They depend on the Reynolds
-number, and are interpolated in ``log Re`` between the measured points and
-held at the nearest outside them.
+``k1`` and ``k2`` were measured with this solver (:data:`CALIBRATION`), per
+shape: the same body, at fixed resolution, in tunnels of three or four
+widths, fitted for ``Cd_free`` together with the coefficients (a negative
+``k1`` -- a law that would lower the drag a little at small blockage -- is
+dropped and the fit repeated).  They depend on the Reynolds number and are
+interpolated in ``log Re`` between the measured points, held at the
+nearest outside them.  A shape measured in only two tunnels takes its
+reference shape's law, scaled to fit its two points.
+
+What the measurements say: confinement is a far stronger effect in 2D than
+in 3D at the same ``b`` -- a row of cylinders chokes the flow between them,
+an array of spheres lets it round them -- and in 3D it grows as ``b^2``, so
+it is small below 15% and climbs fast above 25%.  An earlier calibration
+fitted a straight line in ``b`` through two or three points and put +10% on
+a sphere's drag at 10% blockage, where the measured law gives +2%.  The
+shapes differ: a square cylinder is confined about a third more than a
+circular one, and a cube about half as much again as a sphere of the same
+frontal area (1.5x at Re 20, 1.65x at Re 100) -- the sharp edges throw the
+separated flow wider.  That, not the fit, is what limits a correction for
+a shape nothing was measured for.
+
+Measured
+~~~~~~~~
+Cylinder and square 20 cells across in tunnels 30 D long (2D); sphere 10
+cells across and a cube of the same frontal area, in tunnels 16 D long
+(3D); BGK, u0 = 0.05, even cell counts across (an odd one puts the body
+half a cell off the grid's centre line, a different staircase, which moved
+the 10-cell sphere's drag 5% -- as much as the blockage did).  Cd is the
+mean once the run settles -- steady to 5e-4 per ten body passages, or for
+shedding the last 100-200 passages -- on the nominal size.  Cd_free is the
+fit's zero-blockage value, which carries the grid's own error: against the
+references it is a few percent high, as a body this coarse should be.
+The earlier sweeps of a 14-cell sphere in tunnels of other lengths agree
+with the sphere laws' ratios between blockages to 0.3-1.7%.  The sphere at
+Re 50 and the cube were run in two tunnels each, which fix one coefficient:
+the sphere's at Re 50 is in the table because interpolating between Re 20
+and 100 would have under-read it by a fifth.  A sphere at
+Re 200 was not measured: ten cells across it needs omega = 1.97, past what
+BGK holds, so above Re 100 the Re 100 law stands, with the extrapolation
+allowance on its uncertainty.
+
+.. measured-begin
+
+2D cylinder, Cd by blockage b:
+
+    =====  =======  =======  =======  =======
+       Re    0.050    0.100    0.200    0.303
+    =====  =======  =======  =======  =======
+       10   3.0735   3.3972   4.4586   6.2558
+       20   2.2073   2.4123   3.1002   4.2658
+       40   1.6494   1.7980   2.3045   3.1568
+      100   1.4514   1.5287   1.8618   2.5023
+    =====  =======  =======  =======  =======
+
+2D rectangle (a square), Cd by blockage b:
+
+    =====  =======  =======  =======  =======
+       Re    0.050    0.100    0.200    0.303
+    =====  =======  =======  =======  =======
+       20   2.4778   2.7648   3.7843   5.6964
+      100   1.5780   1.6971   2.1878   3.1628
+    =====  =======  =======  =======  =======
+
+3D box (a cube), Cd by blockage b:
+
+    =====  =======  =======
+       Re    0.154    0.299
+    =====  =======  =======
+       20   3.3294   3.9589
+      100   1.3807   1.5668
+    =====  =======  =======
+
+3D sphere, Cd by blockage b:
+
+    =====  =======  =======  =======  =======
+       Re    0.100    0.152    0.200    0.294
+    =====  =======  =======  =======  =======
+       20   2.8082   2.8559   2.9401   3.2346
+       50       --       --   1.7018   1.8463
+      100   1.1455   1.1533   1.1723   1.2546
+    =====  =======  =======  =======  =======
+
+Fits:
+
+    ============  =====  ======  ======  =======  ============  ========
+    shape            Re      k1      k2  Cd_free  reference     fit res.
+    ============  =====  ======  ======  =======  ============  ========
+    2d cylinder      10   0.485  10.743   2.9289  2.846  +2.9%     0.34%
+    2d cylinder      20   0.383   9.762   2.1180  2.045  +3.6%     0.27%
+    2d cylinder      40   0.375   9.570   1.5834  1.522  +4.0%     0.20%
+    2d cylinder     100   0.000   8.270   1.4137  1.340  +5.5%     1.05%
+    2d rectangle     20   0.000  14.923   2.3918            --     0.93%
+    2d rectangle    100   0.000  11.505   1.5227            --     1.63%
+    3d box           20   0.000   3.089   3.1022            --  2 tunnels
+    3d box          100   0.000   2.158   1.3135            --  2 tunnels
+    3d sphere        20   0.000   2.072   2.7336  2.610  +4.8%     0.68%
+    3d sphere        50   0.000   1.973   1.5773  1.538  +2.5%  2 tunnels
+    3d sphere       100   0.000   1.309   1.1227  1.092  +2.8%     0.79%
+    ============  =====  ======  ======  =======  ============  ========
+
+.. measured-end
 
 Uncertainty
 -----------
 The correction comes with its own uncertainty, a fraction of ``K``: what the
 fits and their form leave for a calibrated shape (:data:`CALIBRATED_SPREAD`);
-for any other -- an uploaded mesh, say -- the spread between the calibrated
-shapes' laws as well (:data:`UNCALIBRATED_SPREAD`); and more outside the
-calibrated Reynolds numbers and blockages.  The measured alternative is a
-blockage study -- the same case in wider tunnels, extrapolated to zero
+for any other -- an uploaded mesh, a finite 3D cylinder, a rectangle or box
+not proportioned like the square or cube -- more, plus the spread between
+the calibrated shapes' laws (:data:`UNCALIBRATED_SPREAD`); and more outside
+the calibrated Reynolds numbers and blockages.  The measured alternative is
+a blockage study -- the same case in wider tunnels, extrapolated to zero
 blockage -- which the web UI runs.
 """
 
@@ -51,22 +145,22 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-#: (Re, k1, k2) by mode and shape, from the calibration sweeps described in
-#: the module docstring and :data:`CALIBRATION_NOTES`.
+#: (Re, k1, k2) by mode and shape, from the sweeps in the module docstring.
 CALIBRATION: Dict[str, Dict[str, Tuple[Tuple[float, float, float], ...]]] = {
     "2d": {
-        "cylinder": ((10.0, 0.450, 10.87), (20.0, 0.348, 9.894), (40.0, 0.351, 9.661), (100.0, 0.0, 8.144)),
-        "rectangle": ((20.0, 1.881, 9.500),),
+        "cylinder": ((10.0, 0.485, 10.743), (20.0, 0.383, 9.762), (40.0, 0.375, 9.570), (100.0, 0.000, 8.270)),
+        "rectangle": ((20.0, 0.000, 14.923), (100.0, 0.000, 11.505)),
     },
     "3d": {
-        "sphere": ((20.0, 1.00, 0.0), (100.0, 0.58, 0.0)),
+        "box": ((20.0, 0.000, 3.089), (100.0, 0.000, 2.158)),
+        "sphere": ((20.0, 0.000, 2.072), (50.0, 0.000, 1.973), (100.0, 0.000, 1.309)),
     },
 }
 
 #: Relative uncertainty of K for a shape that was calibrated (what the fits
 #: and their form leave), and for one that was not -- an uploaded mesh, a
 #: finite 3D cylinder -- on top of how far the calibrated shapes differ.
-CALIBRATED_SPREAD = 0.12
+CALIBRATED_SPREAD = 0.15
 UNCALIBRATED_SPREAD = 0.25
 #: The extra allowance per factor of e outside the calibrated Reynolds numbers.
 RE_EXTRAPOLATION_SPREAD = 0.15
@@ -223,10 +317,10 @@ def blockage_correction(mode: str, re: float, b: float, shape: Optional[str] = N
     if shape in tables:
         K, k1, k2, outside = k_of(tables[shape])
         if _proportioned_like_calibration(shape, params):
-            spread, basis = CALIBRATED_SPREAD, f"calibrated on this shape ({shape})"
+            spread, basis = CALIBRATED_SPREAD, "measured for this shape"
         else:
             like = "a square" if shape == "rectangle" else "a cube"
-            spread, basis = UNCALIBRATED_SPREAD, f"calibrated on {like}; this {shape}'s proportions differ"
+            spread, basis = UNCALIBRATED_SPREAD, f"measured for {like}, and this {shape}'s proportions differ"
         dK = spread * K
     else:
         each = [k_of(t) for t in tables.values()]
@@ -237,13 +331,13 @@ def blockage_correction(mode: str, re: float, b: float, shape: Optional[str] = N
         outside = max(e[3] for e in each)
         spread = UNCALIBRATED_SPREAD
         names = " and ".join(sorted(tables))
-        basis = (f"not calibrated on this shape: the mean of the {names} laws" if len(tables) > 1
-                 else f"not calibrated on this shape: the {names} law")
+        basis = (f"not measured for this shape: the mean of the {names} laws, and their spread"
+                 if len(tables) > 1 else f"not measured for this shape: the {names} law")
         dK = spread * K + 0.5 * (max(Ks) - min(Ks))
     extra = 0.0
     if outside > 0:
         extra += RE_EXTRAPOLATION_SPREAD * outside
-        basis += f"; Re {re:g} is outside the calibrated range"
+        basis += f"; Re {re:g} is outside the range measured"
     if b > B_MAX[mode]:
         extra += BEYOND_SPREAD * (b / B_MAX[mode] - 1.0)
         basis += f"; blockage beyond the {B_MAX[mode]:.0%} measured"

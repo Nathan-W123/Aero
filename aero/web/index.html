@@ -321,7 +321,7 @@ figure .empty{color:var(--faint)}
             <label for="collision">Collision</label><div class="pv"><select id="collision"></select></div></div>
           <div class="prow" id="latticeRow" hidden data-desc="D3Q19 is the usual choice; D3Q27 is more isotropic, at about 40% more work per cell.">
             <label for="lattice">Lattice</label><div class="pv"><select id="lattice"></select></div></div>
-          <div class="prow" id="refineRow" hidden data-desc="Runs a box around the body -- half a body length upstream and to the sides, one and a half into the wake -- at twice the resolution, two fine steps to each tunnel step. The body is drawn again at the finer cells and the forces come from there. It costs what the box's cells do: about 3-5× the work in a crowded tunnel, against 16× for refining the whole tunnel.">
+          <div class="prow" id="refineRow" hidden data-desc="Runs a box around the body -- half a body length upstream and to the sides, one and a half into the wake -- at twice the resolution, two fine steps to each tunnel step. The body is drawn again at the finer cells and the forces come from there. It costs what the box's cells do: a step takes about 5-7× as long in a crowded tunnel, against 20-30× for refining the whole tunnel.">
             <label for="refine">Refine near body</label><div class="pv"><input type="checkbox" id="refine"><span class="u">2× finer</span></div></div>
           <div class="prow" data-desc="numba compiles the kernels for this CPU; numpy is the portable fallback; auto picks the fastest one available.">
             <label for="backend">Backend</label><div class="pv"><select id="backend"></select></div></div>

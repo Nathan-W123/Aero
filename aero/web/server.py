@@ -623,7 +623,7 @@ def _mesh_check(p: Dict[str, Any], case: Dict[str, Any]) -> Dict[str, Any]:
 def _refinement_check(p: Dict[str, Any], case: Dict[str, Any], solid: Optional[np.ndarray] = None,
                       solver=None) -> Dict[str, Any]:
     """Where the refined block goes and what it costs -- or why it cannot go anywhere."""
-    from ..lbm.refine3d import refinement_box
+    from ..lbm.refine3d import refined_cost, refinement_box
 
     if solver is not None and hasattr(solver, "box"):
         box = solver.box
@@ -633,16 +633,14 @@ def _refinement_check(p: Dict[str, Any], case: Dict[str, Any], solid: Optional[n
         except ValueError as exc:
             return {"status": "fail", "short": "refinement does not fit", "message": str(exc)}
     z0, z1, y0, y1, x0, x1 = box
-    coarse = float(np.prod(case["grid"]))
-    fine = 8.0 * (z1 - z0) * (y1 - y0) * (x1 - x0)
-    work = (coarse + 2.0 * fine) / coarse
+    cost = refined_cost(case["grid"], box)
     d = 2.0 * case["D"]
     return {"status": "pass",
-            "short": f"refined 2× near the body · {d:.0f} cells across · ~{work:.1f}× the work",
+            "short": f"refined 2× near the body · {d:.0f} cells across · ~{cost:.1f}× the time",
             "message": f"A {x1 - x0}×{y1 - y0}×{z1 - z0}-cell block around the body (x × y × z, tunnel cells) "
                        f"runs at twice the resolution, so the body is {d:.0f} fine cells across and the "
-                       f"forces come from there. One step costs about {work:.1f}× an unrefined one; refining "
-                       "the whole tunnel would cost 16×."}
+                       f"forces come from there. A step takes about {cost:.1f}× as long as an unrefined "
+                       "one; refining the whole tunnel takes 20-30×."}
 
 
 def _preflight(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -1146,8 +1144,10 @@ def _setup_info(p: Dict[str, Any], solver, label: str) -> Dict[str, Any]:
         cells = solver.cells
         info["refined"] = {"box": [int(v) for v in solver.box], "fine_cells": cells["fine"],
                            "omega_fine": _num(solver.omega_fine),
-                           "work": _num(cells["updates_per_step"] / cells["coarse"], 2),
-                           "work_uniform_fine": _num(cells["uniform_fine_updates_per_step"] / cells["coarse"], 2)}
+                           # time per step, estimated, and cell updates, against the plain tunnel
+                           "cost": _num(solver.cost, 2),
+                           "updates": _num(cells["updates_per_step"] / cells["coarse"], 2),
+                           "updates_uniform_fine": _num(cells["uniform_fine_updates_per_step"] / cells["coarse"], 2)}
     return info
 
 

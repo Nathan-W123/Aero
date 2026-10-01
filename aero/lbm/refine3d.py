@@ -12,9 +12,10 @@ forces are taken there.
 
 What it buys: the cells that decide the drag -- the boundary layer, the
 separation, the near wake -- at twice the resolution, for a fraction of
-refining everything.  Refining the whole tunnel twice over costs 16x (8x
-the cells, 2x the steps); a box a few diameters long costs what its cells
-do, typically 3-5x in a crowded tunnel and much less in a roomy one.
+refining everything.  Refining the whole tunnel twice over takes 16x the
+cell updates (8x the cells, 2x the steps) and, the arrays being larger,
+20-30x the time; a box a few diameters long costs what its cells do, about
+5-7x in a crowded tunnel and much less in a roomy one.
 
 Coupling
 --------
@@ -57,12 +58,23 @@ the second half), against the same tunnel refined everywhere:
     whole tunnel refined, 28 across (192x96x96)  1.2820
     ==========================================  =======  =============
 
-The box is 43 x 29 x 29 tunnel cells, so a step costs the tunnel's cells
-plus twice the box's eight-fold ones -- about 3.6x the plain grid's cell
-updates, against 16x for refining everything.  A decaying shear wave whose
-crests sit on the block's faces decays at the plain solver's rate (0.4% off
-the analytic one); see the transfer operators below for why that took
-fourth-order transfers.
+The box is 43 x 29 x 29 tunnel cells, so a step updates the tunnel's cells
+and, twice, the box's eight-fold ones: 3.9x the plain grid's cell updates,
+against 16x for refining everything.  Time per step on four cores:
+
+    ===========  =========  ==================  ==================
+    collision    plain      refined near body   whole tunnel
+    ===========  =========  ==================  ==================
+    regularized  15.1 ms    82 ms (5.4x)        307 ms (20x)
+    BGK           8.6 ms    60 ms (7.0x)        262 ms (31x)
+    ===========  =========  ==================  ==================
+
+A fine cell update costs about 1.5 tunnel ones (:data:`FINE_UPDATE_COST`):
+the fine grid takes the forces over the body's surface, at four times the
+links, and drives the interface.  A decaying shear wave whose crests sit on
+the block's faces decays at the plain solver's rate (0.4% off the analytic
+one); see the transfer operators below for why that took fourth-order
+transfers.
 
 Limits
 ------
@@ -103,6 +115,11 @@ BOX_GAP = 3
 MARGIN_UPSTREAM = 0.5
 MARGIN_LATERAL = 0.5
 MARGIN_DOWNSTREAM = 1.5
+
+#: Time per fine cell update, in tunnel cell updates: the fine grid also
+#: carries the body -- four times the surface links to take forces over --
+#: and the interface.  Measured; see Validation above.
+FINE_UPDATE_COST = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +163,17 @@ def refinement_box(
                 f"to refine around: it needs {BOX_GAP + 1} or more clear cells along {name}.")
         box += [a, b]
     return tuple(box)  # type: ignore[return-value]
+
+
+def refined_cost(coarse_shape: Sequence[int], box: Box) -> float:
+    """
+    The time a step takes with the block, in steps of the tunnel without it:
+    the tunnel, and two steps of the block, ghost layer included, at
+    :data:`FINE_UPDATE_COST` a cell.  An estimate from the cell counts.
+    """
+    z0, z1, y0, y1, x0, x1 = box
+    fine = (2 * (z1 - z0) + 2) * (2 * (y1 - y0) + 2) * (2 * (x1 - x0) + 2)
+    return 1.0 + REFINEMENT * FINE_UPDATE_COST * fine / float(np.prod(coarse_shape))
 
 
 def fine_body_mask(geom: Any, coarse_shape: Sequence[int], box: Box) -> np.ndarray:
@@ -200,6 +228,11 @@ def fine_body_mask(geom: Any, coarse_shape: Sequence[int], box: Box) -> np.ndarr
 # sat on the block's faces they took 3% off its amplitude in 200 steps, with
 # the error growing with the size of the block.  Cubic interpolation and a
 # corrected mean bring that to the 0.4% the plain solver itself makes.
+
+#: Coarse layers inside each face of the block restricted every step -- the
+#: ones the coupling reads -- and how often the whole block is.
+RESTRICT_BAND = 2
+FULL_RESTRICT_EVERY = 16
 
 #: Weights of the fourth-order restriction along one axis, over the fine
 #: cells at -3/4, -1/4, +1/4, +3/4 of a coarse cell from its centre: the mean
@@ -279,38 +312,109 @@ if _HAS_NUMBA:
                                     + h3 * 4.5 * (eu * eu * eu - eu * usq))
                 f[q, n] = feq + scale * (f[q, n] - feq)
 
-    @nb.njit(cache=True)
-    def _interp_kernel(src, axis, idx, w, out):                             # pragma: no cover
-        """``_interp`` on (Q, A, B) along axis 1 or 2, into ``out``."""
-        Q, A, B = src.shape
-        P = idx.shape[1]
-        for q in range(Q):
-            if axis == 1:
-                for m in range(idx.shape[0]):
-                    for b in range(B):
-                        acc = 0.0
-                        for p in range(P):
-                            acc += w[m, p] * src[q, idx[m, p], b]
-                        out[q, m, b] = acc
+    @nb.njit(cache=True, parallel=True)
+    def _face_kernel(h, axis, ie, we, ia, wa, ib, wb, out):               # pragma: no cover
+        """
+        One ghost face, tricubic, into ``out`` (Q, Ma, Mb): across ``axis`` of
+        the halo ``h`` (1 z, 2 y, 3 x) with the four-point stencil ``(ie, we)``,
+        then along the face's own two axes, in (z, y, x) order, with
+        ``(ia, wa)`` and ``(ib, wb)``.  One population per thread.
+        """
+        Q = h.shape[0]
+        if axis == 3:
+            Ha, Hb = h.shape[1], h.shape[2]
+        elif axis == 2:
+            Ha, Hb = h.shape[1], h.shape[3]
+        else:
+            Ha, Hb = h.shape[2], h.shape[3]
+        Ma, Mb = ia.shape[0], ib.shape[0]
+        for q in nb.prange(Q):
+            plane = np.empty((Ha, Hb))
+            if axis == 3:
+                for i in range(Ha):
+                    for j in range(Hb):
+                        plane[i, j] = (we[0] * h[q, i, j, ie[0]] + we[1] * h[q, i, j, ie[1]]
+                                       + we[2] * h[q, i, j, ie[2]] + we[3] * h[q, i, j, ie[3]])
+            elif axis == 2:
+                for i in range(Ha):
+                    for j in range(Hb):
+                        plane[i, j] = (we[0] * h[q, i, ie[0], j] + we[1] * h[q, i, ie[1], j]
+                                       + we[2] * h[q, i, ie[2], j] + we[3] * h[q, i, ie[3], j])
             else:
-                for a in range(A):
-                    for m in range(idx.shape[0]):
-                        acc = 0.0
-                        for p in range(P):
-                            acc += w[m, p] * src[q, a, idx[m, p]]
-                        out[q, a, m] = acc
+                for i in range(Ha):
+                    for j in range(Hb):
+                        plane[i, j] = (we[0] * h[q, ie[0], i, j] + we[1] * h[q, ie[1], i, j]
+                                       + we[2] * h[q, ie[2], i, j] + we[3] * h[q, ie[3], i, j])
+            half = np.empty((Ha, Mb))
+            for i in range(Ha):
+                for m in range(Mb):
+                    half[i, m] = (wb[m, 0] * plane[i, ib[m, 0]] + wb[m, 1] * plane[i, ib[m, 1]]
+                                  + wb[m, 2] * plane[i, ib[m, 2]] + wb[m, 3] * plane[i, ib[m, 3]])
+            for m in range(Ma):
+                r0, r1, r2, r3 = ia[m, 0], ia[m, 1], ia[m, 2], ia[m, 3]
+                w0, w1, w2, w3 = wa[m, 0], wa[m, 1], wa[m, 2], wa[m, 3]
+                for j in range(Mb):
+                    out[q, m, j] = w0 * half[r0, j] + w1 * half[r1, j] + w2 * half[r2, j] + w3 * half[r3, j]
 
     @nb.njit(cache=True, parallel=True)
-    def _restrict_kernel(ff, fc, z0, y0, x0, rw, ex, ey, ez, w, scale, h3):  # pragma: no cover
-        """The fourth-order restriction of a whole block, non-equilibrium rescaled, in one pass."""
+    def _write_face(f, axis, pos, A, B, wb, scale, ex, ey, ez, w, h3):      # pragma: no cover
+        """
+        One ghost face into ``f``: ``(1 - wb) A + wb B`` (two time levels),
+        its non-equilibrium part scaled by ``scale``, at index ``pos`` along
+        ``axis`` (0 z, 1 y, 2 x); the face's own axes follow in (z, y, x) order.
+        """
+        Q, M1, M2 = A.shape
+        wa = 1.0 - wb
+        for a in nb.prange(M1):
+            tmp = np.empty(Q)
+            for b in range(M2):
+                rho = 0.0
+                mx = 0.0
+                my = 0.0
+                mz = 0.0
+                for q in range(Q):
+                    v = wa * A[q, a, b] + wb * B[q, a, b]
+                    tmp[q] = v
+                    rho += v
+                    mx += ex[q] * v
+                    my += ey[q] * v
+                    mz += ez[q] * v
+                inv = 1.0 / rho if rho > 0.0 else 0.0
+                ux = mx * inv
+                uy = my * inv
+                uz = mz * inv
+                usq = ux * ux + uy * uy + uz * uz
+                for q in range(Q):
+                    eu = ex[q] * ux + ey[q] * uy + ez[q] * uz
+                    feq = w[q] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq
+                                        + h3 * 4.5 * (eu * eu * eu - eu * usq))
+                    val = feq + scale * (tmp[q] - feq)
+                    if axis == 2:
+                        f[q, a, b, pos] = val
+                    elif axis == 1:
+                        f[q, a, pos, b] = val
+                    else:
+                        f[q, pos, a, b] = val
+
+    @nb.njit(cache=True, parallel=True)
+    def _restrict_kernel(ff, fc, z0, y0, x0, rw, ex, ey, ez, w, scale, h3, band):  # pragma: no cover
+        """
+        The fourth-order restriction of a block, non-equilibrium rescaled, in
+        one pass: every cell, or with ``band`` > 0 only the cells that many
+        layers in from the block's faces.
+        """
         Q = ff.shape[0]
         nz = (ff.shape[1] - 2) // 2
         ny = (ff.shape[2] - 2) // 2
         nx = (ff.shape[3] - 2) // 2
         for k in nb.prange(nz):
             avg = np.empty(Q)
+            edge_k = band <= 0 or k < band or k >= nz - band
             for j in range(ny):
+                edge_kj = edge_k or j < band or j >= ny - band
                 for i in range(nx):
+                    if not (edge_kj or i < band or i >= nx - band):
+                        continue
                     rho = 0.0
                     mx = 0.0
                     my = 0.0
@@ -481,8 +585,9 @@ class RefinedSolver3D:
         self.Clz_history: List[float] = []
         self.Cd_p_history: List[float] = []
         self.Cd_v_history: List[float] = []
+        self._full_at = -1
         self._set_shell(self._shell())
-        self._restrict()                      # the coarse cells under the block start as the fine grid's
+        self._restrict(full=True)             # the coarse cells under the block start as the fine grid's
 
     # ------------------------------------------------------------------
     # Interface
@@ -493,18 +598,6 @@ class RefinedSolver3D:
         z0, z1, y0, y1, x0, x1 = self.box
         return self._coarse.f[:, z0 - 2:z1 + 2, y0 - 2:y1 + 2, x0 - 2:x1 + 2]
 
-    def _along(self, a: np.ndarray, axis: int, stencil) -> np.ndarray:
-        """Interpolate a (Q, A, B) plane along axis 1 or 2."""
-        idx, w = stencil
-        if not self._use_numba:
-            return _interp(a, axis, idx, w)
-        a = np.ascontiguousarray(a)
-        shape = list(a.shape)
-        shape[axis] = idx.shape[0]
-        out = np.empty(shape)
-        _interp_kernel(a, axis, idx, w, out)
-        return out
-
     def _shell(self) -> List[np.ndarray]:
         """
         The fine ghost layer interpolated from the coarse grid as it stands:
@@ -514,24 +607,24 @@ class RefinedSolver3D:
         """
         h = self._halo()
         sz, sy, sx = self._stencils
-
-        def plane(axis, stencil, e):                          # the ghost plane across one axis
-            idx, w = stencil
-            out = None
-            for p in range(4):
-                at = [slice(None)] * 4
-                at[axis] = idx[e, p]
-                term = h[tuple(at)] * w[e, p]
-                out = term if out is None else out + term
-            return out
-
+        # each face: across its normal, then along its own axes in (z, y, x) order
+        plan = ((3, sx, sz, sy), (2, sy, sz, sx), (1, sz, sy, sx))
         faces = []
-        for e in (0, -1):                                     # x faces: (Q, Mz, My)
-            faces.append(self._along(self._along(plane(3, sx, e), 2, sy), 1, sz))
-        for e in (0, -1):                                     # y faces: (Q, Mz, Mx)
-            faces.append(self._along(self._along(plane(2, sy, e), 2, sx), 1, sz))
-        for e in (0, -1):                                     # z faces: (Q, My, Mx)
-            faces.append(self._along(self._along(plane(1, sz, e), 2, sx), 1, sy))
+        if self._use_numba:
+            for axis, normal, (ia, wa), (ib, wb) in plan:
+                for e in (0, -1):
+                    out = np.empty((h.shape[0], ia.shape[0], ib.shape[0]))
+                    _face_kernel(h, axis, normal[0][e], normal[1][e], ia, wa, ib, wb, out)
+                    faces.append(out)
+            return faces
+        for axis, (idx, w), (ia, wa), (ib, wb) in plan:
+            for e in (0, -1):
+                at = [slice(None)] * 4
+                plane = 0.0
+                for p in range(4):
+                    at[axis] = idx[e, p]
+                    plane = plane + h[tuple(at)] * w[e, p]
+                faces.append(_interp(_interp(plane, 2, ib, wb), 1, ia, wa))
         return faces
 
     def prolong(self) -> None:
@@ -545,10 +638,27 @@ class RefinedSolver3D:
         fine = _interp(_interp(_interp(self._halo(), 3, *sx), 2, *sy), 1, *sz)
         self._fine.f[...] = _rescale_neq(fine, self._c2f, self.lattice, self._use_numba)
 
-    def _set_shell(self, faces: Sequence[np.ndarray]) -> None:
+    def _set_shell(self, faces: Sequence[np.ndarray], later: Optional[Sequence[np.ndarray]] = None,
+                   wb: float = 0.0) -> None:
+        """
+        Write the ghost layer: ``faces``, or between them and ``later`` at
+        weight ``wb`` (a time level part-way through the coarse step), each
+        with its non-equilibrium part rescaled for the fine grid.
+        """
         f = self._fine.f
+        later = faces if later is None else later
+        if self._use_numba:
+            ex, ey, ez = self._lat_e
+            lat = self.lattice
+            last = (f.shape[3] - 1, f.shape[2] - 1, f.shape[1] - 1)
+            for k, (A, B) in enumerate(zip(faces, later)):
+                axis = 2 - k // 2
+                pos = 0 if k % 2 == 0 else last[k // 2]
+                _write_face(f, axis, pos, A, B, wb, self._c2f, ex, ey, ez, lat.W, lat.h3_factor)
+            return
         lat, s = self.lattice, self._c2f
-        xm, xp, ym, yp, zm, zp = (_rescale_neq(face, s, lat, self._use_numba) for face in faces)
+        mixed = [a if wb == 0.0 else (1.0 - wb) * a + wb * b for a, b in zip(faces, later)]
+        xm, xp, ym, yp, zm, zp = (_rescale_neq(face, s, lat, False) for face in mixed)
         f[:, :, :, 0] = xm
         f[:, :, :, -1] = xp
         f[:, :, 0, :] = ym
@@ -556,16 +666,29 @@ class RefinedSolver3D:
         f[:, 0, :, :] = zm
         f[:, -1, :, :] = zp
 
-    def _restrict(self) -> None:
-        """The fine solution onto the coarse cells under the block (the ghost layer must be valid)."""
+    def _restrict(self, full: bool = True) -> None:
+        """
+        The fine solution onto the coarse cells under the block (the ghost
+        layer must be valid).  The coupling reads only the two coarse layers
+        inside each face, so a step restricts those (``full=False``); the
+        rest of the block -- what the viewer shows -- is brought up to date
+        every :data:`FULL_RESTRICT_EVERY` steps and whenever it is read.
+        """
         z0, z1, y0, y1, x0, x1 = self.box
         ff, fc = self._fine.f, self._coarse.f
         if self._use_numba:
             ex, ey, ez = self._lat_e
             _restrict_kernel(ff, fc, z0, y0, x0, RESTRICT_WEIGHTS, ex, ey, ez, self.lattice.W,
-                             self._f2c, self.lattice.h3_factor)
+                             self._f2c, self.lattice.h3_factor, 0 if full else RESTRICT_BAND)
         else:
             fc[:, z0:z1, y0:y1, x0:x1] = restrict_block(ff, self._f2c, self.lattice)
+        if full or not self._use_numba:
+            self._full_at = self.step_count
+
+    def _up_to_date(self) -> None:
+        """Restrict the whole block if a step has moved on since it last was."""
+        if self._full_at != self.step_count:
+            self._restrict(full=True)
 
     # ------------------------------------------------------------------
     # Time stepping
@@ -579,14 +702,14 @@ class RefinedSolver3D:
         self._set_shell(before)
         cd1, cy1, cz1 = self._fine._step()
         p1, v1 = self._fine._last_cd_p, self._fine._last_cd_v
-        self._set_shell([0.5 * (a + b) for a, b in zip(before, after)])
+        self._set_shell(before, after, 0.5)
         cd2, cy2, cz2 = self._fine._step()
         # the restriction reads a ring of fine cells round each coarse one,
         # so the ghost layer must hold the coarse grid at t + 1, not what
         # streamed into it
         self._set_shell(after)
-        self._restrict()
         self.step_count += 1
+        self._restrict(full=self.step_count % FULL_RESTRICT_EVERY == 0)
         self._last_cd_p = 0.5 * (p1 + self._fine._last_cd_p)
         self._last_cd_v = 0.5 * (v1 + self._fine._last_cd_v)
         return 0.5 * (cd1 + cd2), 0.5 * (cy1 + cy2), 0.5 * (cz1 + cz2)
@@ -633,6 +756,7 @@ class RefinedSolver3D:
     @property
     def f(self) -> np.ndarray:
         """The tunnel's distributions; under the block, the fine solution averaged."""
+        self._up_to_date()
         return self._coarse.f
 
     @property
@@ -645,6 +769,8 @@ class RefinedSolver3D:
 
     def macroscopic(self, f: Optional[np.ndarray] = None) -> tuple:
         """``(rho, ux, uy, uz)`` on the tunnel grid."""
+        if f is None:
+            self._up_to_date()
         return self._coarse.macroscopic(f)
 
     def fine_macroscopic(self) -> tuple:
@@ -660,3 +786,8 @@ class RefinedSolver3D:
         fine = int(np.prod(self._fine.f.shape[1:]))
         return {"coarse": coarse, "fine": fine, "updates_per_step": coarse + REFINEMENT * fine,
                 "uniform_fine_updates_per_step": REFINEMENT ** 4 * coarse}
+
+    @property
+    def cost(self) -> float:
+        """Estimated time per step, in steps of the tunnel without the block (:func:`refined_cost`)."""
+        return refined_cost((self.Nz, self.Ny, self.Nx), self.box)

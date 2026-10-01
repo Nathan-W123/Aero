@@ -119,7 +119,8 @@ def test_the_fine_block_runs_at_the_same_reynolds_number():
     assert s.u0 * (2 * s.D) / nu_f == pytest.approx(s.u0 * s.D / nu_c)
 
 
-def test_a_shear_wave_decays_at_the_right_rate_across_the_block():
+@pytest.mark.parametrize("backend", ["numpy", "numba"])
+def test_a_shear_wave_decays_at_the_right_rate_across_the_block(backend):
     """
     A decaying shear wave across a fully periodic box, half of it inside
     the refined block, with the block's faces on the wave's crests: what
@@ -130,7 +131,9 @@ def test_a_shear_wave_decays_at_the_right_rate_across_the_block():
     nz, ny, nx = 12, 32, 12
     amp, omega, steps = 0.02, 1.4, 200
     k = 2.0 * np.pi / ny
-    kw = dict(omega=omega, u0=0.0, D=4.0, backend="numpy", collision="bgk",
+    if backend == "numba" and not refine3d._HAS_NUMBA:
+        pytest.skip("numba not installed")
+    kw = dict(omega=omega, u0=0.0, D=4.0, backend=backend, collision="bgk",
               wall_bc="none", streamwise_bc="periodic")
     s = RefinedSolver3D(nz, ny, nx, np.zeros((nz, ny, nx), bool), (3, 9, 8, 24, 3, 9),
                         np.zeros((12, 32, 12), bool), **kw)
@@ -208,6 +211,18 @@ def test_part_of_the_body_outside_the_block_is_refused():
     with pytest.raises(ValueError, match="outside the refined block"):
         RefinedSolver3D(nz, ny, nx, solid, (4, 12, 4, 12, 6, 16), np.zeros((16, 16, 20), bool),
                         omega=1.5, u0=0.03, D=2.0, backend="numpy")
+
+
+def test_the_whole_block_is_restricted_whenever_the_field_is_read():
+    if not refine3d._HAS_NUMBA:
+        pytest.skip("numba not installed")
+    s = _small(body=False, backend="numba")
+    for _ in range(3):                              # not a multiple of FULL_RESTRICT_EVERY
+        s.step()
+    z0, z1, y0, y1, x0, x1 = s.box
+    s._coarse.f[:, z0 + 3, y0 + 3, x0 + 3] = -1.0   # a deep cell only a full restriction rewrites
+    rho = s.macroscopic()[0]
+    assert rho[z0 + 3, y0 + 3, x0 + 3] == pytest.approx(1.0)
 
 
 def test_forces_come_from_the_fine_grid_and_are_steady():

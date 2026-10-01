@@ -194,9 +194,9 @@ def test_sphere_band_is_unconfined_at_zero_blockage():
 
 def test_sphere_band_contains_the_measured_sweep_points():
     """
-    The two confinement measurements the slope was calibrated on, with the
-    frontal-area normalisation in place.  If someone retunes the slope or the
-    allowance, these have to keep passing.
+    The earlier calibration's measurements (r=7, Cd on the voxel frontal
+    area), with the frontal-area normalisation in place.  If someone retunes
+    the blockage law or the allowance, these have to keep passing.
     """
     from aero.benchmarks import assess_literature
     for blockage, cd in ((14 / 48, 3.4456), (14 / 96, 3.0063), (14 / 144, 2.9457)):
@@ -236,14 +236,16 @@ def test_sphere_confinement_weakens_with_re():
 
 
 def test_sphere_band_contains_the_re100_confinement_pair():
-    """The Re=100 pair the slope was calibrated on (r=7, 96-long tunnel, Cd on pi r^2)."""
+    """The Re=100 pair of the earlier calibration (r=7, 96-long tunnel, Cd on pi r^2)."""
     from aero.benchmarks import assess_literature, sphere_expected_cd
     for blockage, cd in ((14 / 48, 1.3607), (14 / 96, 1.2629)):
         status, msg = assess_literature(mode="3d", shape="sphere", re=100.0, cd=cd, blockage=blockage)
         assert status == "pass", msg
-    # 29% blockage at Re=100: the Re=20 slope said ~1.44; the measured one says ~1.28.
+    # 29% blockage at Re=100: a straight line through two points said +17%;
+    # four tunnels say the law is quadratic and +11% there.
+    from aero.benchmarks import schiller_naumann_cd
     _, conf, _ = sphere_expected_cd(100.0, 14 / 48)
-    assert conf == pytest.approx(1.276, abs=0.01)
+    assert 1.08 < conf / schiller_naumann_cd(100.0) < 1.15
 
 
 # ---------------------------------------------------------------------------

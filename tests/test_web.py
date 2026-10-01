@@ -665,7 +665,8 @@ def test_a_refined_run_completes_and_reports_its_block():
     web._run_job(job)
     assert job.state == "done", job.error
     ref = job.result["setup"]["refined"]
-    assert ref["fine_cells"] > 0 and 1.0 < ref["work"] < ref["work_uniform_fine"]
+    assert ref["fine_cells"] > 0 and 1.0 < ref["updates"] < ref["updates_uniform_fine"]
+    assert ref["cost"] > ref["updates"]
     assert "refined" in job.result["setup"]["label"]
     assert job.result["uncertainty"]["refinement"]["status"] == "pass"
     assert np.isfinite(job.result["coefficients"]["cd"])

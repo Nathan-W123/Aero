@@ -64,7 +64,7 @@ def test_a_calibrated_shape_is_more_certain_than_an_uploaded_one():
     sphere = blockage_correction("3d", 100.0, 0.2, "sphere")
     mesh = blockage_correction("3d", 100.0, 0.2, "mesh")
     assert sphere["relative_uncertainty"] < mesh["relative_uncertainty"]
-    assert "calibrated on this shape" in sphere["basis"] and "not calibrated" in mesh["basis"]
+    assert "measured for this shape" in sphere["basis"] and "not measured" in mesh["basis"]
 
 
 def test_an_uncalibrated_shape_takes_the_mean_of_the_calibrated_laws():

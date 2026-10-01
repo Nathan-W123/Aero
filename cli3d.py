@@ -557,10 +557,8 @@ def main() -> int:
             print(f"[X] {exc}")
             return 1
         z0, z1, y0, y1, x0, x1 = box
-        work = solver.cells
         print(f"Refined   : x[{x0},{x1}) y[{y0},{y1}) z[{z0},{z1}) at 2x  "
-              f"(~{work['updates_per_step'] / work['coarse']:.1f}x the work of the plain grid, "
-              f"{work['uniform_fine_updates_per_step'] / work['coarse']:.0f}x to refine it all)")
+              f"(~{solver.cost:.1f}x the time of the plain grid; refining it all takes 20-30x)")
     elif _use_multiblock:
         from aero.lbm.multiblock import MultiblockSolver3D
         _mb_kw = {k: v for k, v in _solver_kw.items() if k not in ("Nz", "Ny", "Nx", "solid")}
