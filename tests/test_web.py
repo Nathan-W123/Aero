@@ -560,3 +560,27 @@ def test_a_mesh_run_completes():
     assert job.state == "done", job.error
     assert job.result["setup"]["label"] == "mesh unit_sphere.stl"
     assert np.isfinite(job.result["coefficients"]["cd"])
+
+
+def test_a_part_too_thin_for_its_size_is_told_the_size_it_needs():
+    """The toy aircraft at 12 cells across is thinner than a cell everywhere."""
+    plane = _upload("simple_plane.stl")["id"]
+    p = _mesh_params(plane, mesh_size="12", nx="192", ny="96", nz="96")
+    m = web._preflight(p)["uncertainty"]["mesh"]
+    assert m["status"] == "fail" and m["short"].startswith("no cells at Size 12")
+    need = int(m["short"].rsplit(" ", 1)[1])
+    assert 40 <= need <= 96
+    assert f"Size {need}" in m["message"]
+    # at that size it is on the grid
+    ok = web._preflight(_mesh_params(plane, mesh_size=str(need), nx="192", ny="96", nz="96"))
+    assert ok["uncertainty"]["mesh"]["status"] == "pass"
+
+
+def test_the_sample_aircraft_keeps_its_shape_at_the_size_its_readme_gives():
+    plane = _upload("tunnel_plane.stl")["id"]
+    m = web._preflight(_mesh_params(plane, mesh_size="48", mesh_orient="none",
+                                    nx="144", ny="72", nz="96"))["uncertainty"]["mesh"]
+    assert m["status"] == "pass"
+    small = web._preflight(_mesh_params(plane, mesh_size="24", mesh_orient="none",
+                                        nx="144", ny="72", nz="96"))["uncertainty"]["mesh"]
+    assert small["status"] == "warn" and "needs about 48" in small["short"]

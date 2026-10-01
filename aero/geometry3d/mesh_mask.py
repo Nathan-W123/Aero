@@ -61,26 +61,18 @@ _RAY_JITTER_Y = 1.37e-7
 _RAY_JITTER_Z = 2.91e-7
 
 
-def voxelize_mesh(triangles: np.ndarray, nz: int, ny: int, nx: int) -> np.ndarray:
+def _column_crossings(tri: np.ndarray, nz: int, ny: int, nx: int):
     """
-    Solid mask of a closed triangle mesh in grid coordinates, shape (nz, ny, nx).
+    Where the surface crosses each column's ray along +x: ``(col, x)``, the
+    column ``k * ny + j`` and the crossing's x, sorted by column then x.
 
-    Cell (k, j, i) is solid when its centre (i + 1/2, j + 1/2, k + 1/2), in
-    (x, y, z) -- shifted by a hair, see ``_RAY_JITTER_X`` -- is inside the mesh.  One ray per (j, k) column, along +x: the
-    surface crossings in that column, sorted, pair up into inside spans
-    (parity), and each span fills the cells whose centres it covers.  Each
-    triangle is tested only against the columns under its own y-z footprint,
-    so the cost goes with the mesh's surface rather than with triangles x
-    cells; it gives what :func:`points_inside_mesh` gives at the cell
-    centres, a thousand times faster on the sample meshes.
-
-    A column with an odd number of crossings (a mesh that is not closed)
-    drops its last one rather than filling to the end of the tunnel.
+    Each triangle is tested only against the columns under its own y-z
+    footprint, so the cost goes with the mesh's surface rather than with
+    triangles x cells.
     """
-    tri = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
-    solid = np.zeros((nz, ny, nx), dtype=bool)
+    empty = (np.zeros(0, np.int64), np.zeros(0))
     if tri.size == 0:
-        return solid
+        return empty
     a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
     # which columns each triangle's y-z footprint can cover: centres j + 1/2 + jitter
     ys, zs = tri[:, :, 1], tri[:, :, 2]
@@ -95,7 +87,7 @@ def voxelize_mesh(triangles: np.ndarray, nz: int, ny: int, nx: int) -> np.ndarra
     count[np.abs(area) < 1e-14] = 0
     total = int(count.sum())
     if total == 0:
-        return solid
+        return empty
 
     # one entry per (triangle, candidate column)
     t = np.repeat(np.arange(len(tri)), count)
@@ -111,12 +103,14 @@ def voxelize_mesh(triangles: np.ndarray, nz: int, ny: int, nx: int) -> np.ndarra
     hit = (w0 >= 0.0) & (w1 >= 0.0) & (w2 >= 0.0)
     col = (kk * ny + jj)[hit]
     x = (w0 * at[:, 0] + w1 * bt[:, 0] + w2 * ct[:, 0])[hit]
-    if col.size == 0:
-        return solid
-
-    # sort the crossings along each column and pair them up
     order = np.lexsort((x, col))
-    col, x = col[order], x[order]
+    return col[order], x[order]
+
+
+def _fill_columns(col: np.ndarray, x: np.ndarray, nz: int, ny: int, nx: int) -> np.ndarray:
+    """Pair up each column's sorted crossings (parity) and fill the cells between."""
+    if col.size == 0:
+        return np.zeros((nz, ny, nx), dtype=bool)
     first = np.r_[0, np.flatnonzero(np.diff(col)) + 1]
     run = np.diff(np.r_[first, col.size])
     rank = np.arange(col.size) - np.repeat(first, run)
@@ -128,6 +122,55 @@ def voxelize_mesh(triangles: np.ndarray, nz: int, ny: int, nx: int) -> np.ndarra
     np.add.at(fill, (col[starts], i0), 1)
     np.add.at(fill, (col[starts], i1), -1)
     return (np.cumsum(fill, axis=1)[:, :nx] > 0).reshape(nz, ny, nx)
+
+
+def voxelize_mesh(triangles: np.ndarray, nz: int, ny: int, nx: int) -> np.ndarray:
+    """
+    Solid mask of a closed triangle mesh in grid coordinates, shape (nz, ny, nx).
+
+    Cell (k, j, i) is solid when its centre (i + 1/2, j + 1/2, k + 1/2), in
+    (x, y, z) -- shifted by a hair, see ``_RAY_JITTER_X`` -- is inside the
+    mesh.  One ray per (j, k) column, along +x: the surface crossings in that
+    column, sorted, pair up into inside spans (parity), and each span fills
+    the cells whose centres it covers.  It gives what
+    :func:`points_inside_mesh` gives at the cell centres, a thousand times
+    faster on the sample meshes.
+
+    A column with an odd number of crossings (a mesh that is not closed)
+    drops its last one rather than filling to the end of the tunnel.
+    """
+    tri = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    return _fill_columns(*_column_crossings(tri, nz, ny, nx), nz, ny, nx)
+
+
+def silhouette_coverage(triangles: np.ndarray, nz: int, ny: int, nx: int) -> float:
+    """
+    How much of its shape a mesh keeps on the grid, 0 to 1.
+
+    Looking along each axis in turn: of the grid columns the surface passes
+    through, the fraction that hold at least one solid cell.  A column the
+    surface crosses but no cell centre lies inside is a part thinner than a
+    cell there -- a wing seen from above, say -- so this falls where volume
+    would not: a toy aircraft's fuselage carries nearly all its volume and
+    is on the grid well before its wings are.  The smallest of the three
+    views is returned.  Aerofoils taper to nothing at their trailing edges,
+    so an aircraft stays a few percent short of 1 at any size.
+    """
+    tri = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    dims = {0: nx, 1: ny, 2: nz}
+    worst = 1.0
+    for along in (0, 1, 2):
+        rest = [ax for ax in (0, 1, 2) if ax != along]
+        perm = [along, *rest]                       # this axis becomes the rays' x
+        t = tri[:, :, perm]
+        n_x, n_y, n_z = (dims[ax] for ax in perm)
+        col, x = _column_crossings(t, n_z, n_y, n_x)
+        if col.size == 0:
+            continue
+        crossed = np.unique(col)
+        filled = _fill_columns(col, x, n_z, n_y, n_x).any(axis=2).ravel()
+        worst = min(worst, float(filled[crossed].mean()))
+    return worst
 
 
 class MeshMask(Geometry3D):

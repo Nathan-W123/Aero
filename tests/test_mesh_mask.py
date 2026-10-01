@@ -138,3 +138,18 @@ def test_mesh_mask_uses_the_fast_voxelizer():
     solid = mask.mark_solid(48, 48, 96)
     assert time.perf_counter() - t < 2.0          # was ~13 s with a point test per cell
     assert solid.sum() > 1000
+
+
+def test_silhouette_coverage_sees_parts_thinner_than_a_cell():
+    """A sphere is whole at any size; a toy aircraft's wings appear only when it is large."""
+    from aero.geometry3d.mesh_mask import silhouette_coverage
+    from aero.geometry3d.stl_prep import prepare_mesh_triangles
+
+    def coverage(name, size):
+        n = int(size * 1.5) + 4
+        tris, _ = prepare_mesh_triangles(load_stl_triangles(str(SAMPLES / name)), n, n, 2 * n, fit_frac=size / n)
+        return silhouette_coverage(tris, n, n, 2 * n)
+
+    assert coverage("unit_sphere.stl", 12) > 0.95
+    assert coverage("simple_plane.stl", 12) < 0.05            # nothing of it lands on the grid
+    assert coverage("simple_plane.stl", 96) > 0.9

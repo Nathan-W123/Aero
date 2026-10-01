@@ -474,33 +474,116 @@ def _mesh_blockage(solid: np.ndarray, size: float) -> Dict[str, Any]:
                        "above ~3% of the area expect it by 10% or more."}
 
 
+#: A part "keeps its shape" on the grid when this much of its silhouette,
+#: seen along each axis, lands on solid cells (see silhouette_coverage).
+#: Aerofoils taper to nothing, so an aircraft tops out a few percent short
+#: of 1; the sample tunnel_plane.stl reaches this at 48 cells across.
+SHAPE_KEPT = 0.85
+#: Sizes tried, in cells across, smallest first, when looking for the one a
+#: part needs: most parts stop at the first, and the big ones cost the most.
+_SIZE_STEPS = (8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160)
+#: Parts above this many triangles are not searched: each try voxelizes
+#: them twelve times, and the checks must keep up with typing.
+_SIZE_SEARCH_TRIANGLES_MAX = 400_000
+_SIZE_NEEDED: Dict[str, Optional[int]] = {}
+#: Where on the grid the part is tried, in cells: coverage swings by a tenth
+#: with how a thin part happens to sit between cell centres, so each size
+#: is the mean over these.
+_GRID_OFFSETS = ((0.0, 0.0, 0.0), (0.5, 0.5, 0.5), (0.25, 0.75, 0.4), (0.75, 0.25, 0.65))
+
+
+_SHAPE_KEPT_AT: Dict[str, float] = {}
+
+
+def _shape_kept(mesh: Dict[str, Any], orient: str, rot: List[float], size: float) -> float:
+    """The part's silhouette coverage at ``size`` cells across, on a grid just big enough for it."""
+    key = json.dumps([mesh["id"], orient, rot, size])
+    if key not in _SHAPE_KEPT_AT:
+        _SHAPE_KEPT_AT[key] = _shape_kept_now(mesh, orient, rot, size)
+        while len(_SHAPE_KEPT_AT) > 256:
+            _SHAPE_KEPT_AT.pop(next(iter(_SHAPE_KEPT_AT)))
+    return _SHAPE_KEPT_AT[key]
+
+
+def _shape_kept_now(mesh: Dict[str, Any], orient: str, rot: List[float], size: float) -> float:
+    from ..geometry3d.mesh_mask import silhouette_coverage
+    from ..geometry3d.stl_prep import prepare_mesh_triangles
+
+    tris, _ = prepare_mesh_triangles(mesh["tris"], 64, 64, 64, fit_frac=size / 64.0, mesh_orient=orient,
+                                     mesh_rot_x=rot[0], mesh_rot_y=rot[1], mesh_rot_z=rot[2])
+    v = tris.reshape(-1, 3)
+    lo = v.min(axis=0)
+    n = np.ceil(v.max(axis=0) - lo).astype(int) + 5             # (x, y, z)
+    return float(np.mean([silhouette_coverage(tris - lo + 2.0 + np.asarray(off), int(n[2]), int(n[1]), int(n[0]))
+                          for off in _GRID_OFFSETS]))
+
+
+def _size_needed(p: Dict[str, Any], mesh: Dict[str, Any]) -> Optional[int]:
+    """
+    The smallest size, in cells across, from which the part keeps its shape;
+    None when no size tried does (or the part is too big to search).
+    It depends on the part and its orientation, not on the tunnel, so it is
+    worked out once per part and orientation.  (Coverage mostly grows with
+    size but not strictly, so this is the first size that reaches it.)
+    """
+    orient = p.get("mesh_orient", "auto")
+    orient = orient if orient in ("auto", "none") else "auto"
+    rot = [_f(p, f"mesh_rot_{a}", 0.0) for a in "xyz"]
+    key = json.dumps([mesh["id"], orient, rot])
+    if key not in _SIZE_NEEDED:
+        need = None
+        if mesh["triangles"] <= _SIZE_SEARCH_TRIANGLES_MAX:
+            need = next((s for s in _SIZE_STEPS if _shape_kept(mesh, orient, rot, s) >= SHAPE_KEPT), None)
+        _SIZE_NEEDED[key] = need
+    return _SIZE_NEEDED[key]
+
+
 def _mesh_check(p: Dict[str, Any], case: Dict[str, Any]) -> Dict[str, Any]:
-    """How the uploaded mesh landed on the grid: cells, frontal area, closedness."""
+    """How the uploaded mesh landed on the grid: cells, how much of its shape, closedness."""
     from ..forces3d import projected_frontal_area
 
     mesh = MESHES.get(str(p.get("mesh_id", ""))) or {}
     solid = _solid_for(p, case)
     cells = int(solid.sum())
+    size = case["D"]
+    need = _size_needed(p, mesh) if mesh else None
+
+    def advice():
+        if need is None:
+            return (f"No size up to {_SIZE_STEPS[-1]} cells keeps its shape: check that it is a "
+                    "closed solid rather than a single sheet.")
+        if need <= size:
+            return "A little larger keeps more of it."
+        room = int(np.ceil(1.5 * need / 8.0) * 8)
+        return (f"It keeps its shape from about Size {need}, which needs a tunnel more than {need} "
+                f"cells high and wide ({room} or so keeps the walls clear).")
+
     if cells == 0:
-        return {"status": "fail", "short": "the mesh covers no cells",
-                "message": "At this size the whole surface falls between cell centres. "
-                           "Make it larger (Size), or check that the STL is a closed surface."}
+        return {"status": "fail",
+                "short": f"no cells at Size {size:g}" + (f" · needs about {need}" if need else ""),
+                "message": "At this size the whole part is thinner than a cell, so it falls between "
+                           "the cell centres and the solver would see nothing. " + advice()}
     nz, ny, _ = case["grid"]
     ratio = projected_frontal_area(solid) / float(ny * nz)
+    orient = p.get("mesh_orient", "auto")
+    kept = _shape_kept(mesh, orient if orient in ("auto", "none") else "auto",
+                       [_f(p, f"mesh_rot_{a}", 0.0) for a in "xyz"], size) if mesh else 1.0
     short = f"{cells:,} solid cells"
     notes = []
+    if kept < SHAPE_KEPT:
+        short += f" · {kept:.0%} of its shape" + (f" · needs about {need}" if need and need > size else "")
+        notes.append(f"At Size {size:g} only {kept:.0%} of the part's silhouette lands on cells: what is "
+                     "thinner than a cell -- wings, fins, edges -- falls between the cell centres. " + advice())
     if mesh.get("open_edges"):
         short += " · not closed"
         notes.append(f"The surface has {mesh['open_edges']:,} open edges, so what is inside it is "
                      "ambiguous and cells may be missing or extra: check the preview.")
-    if cells < 100:
-        notes.append(f"Only {cells} cells: parts thinner than a cell fall between the cell centres "
-                     "at this size.")
     if notes:
         return {"status": "warn", "short": short, "message": " ".join(notes)}
     return {"status": "pass", "short": short,
-            "message": f"{cells:,} solid cells, blocking {ratio * 100:.1f}% of the tunnel's "
-                       "cross-section by area -- the area the force coefficients are normalised by."}
+            "message": f"{cells:,} solid cells, keeping {kept:.0%} of the part's shape, and blocking "
+                       f"{ratio * 100:.1f}% of the tunnel's cross-section by area -- the area the force "
+                       "coefficients are normalised by."}
 
 
 
