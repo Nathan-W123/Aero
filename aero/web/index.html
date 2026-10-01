@@ -1450,7 +1450,10 @@ const tunnel = (() => {
       }
       [a, b] = [b, a];
     }
-    return Uint8Array.from(a, v => Math.round(v * 255));
+    // A part thinner than two cells (a wing, a fin) blurs below the 0.5 the
+    // surface is drawn at and would vanish from the view though the solver
+    // has it; its cells are held at 0.75, which draws them about a cell thick.
+    return Uint8Array.from(a, (v, i) => S[i] && v < 0.5 ? 191 : Math.round(v * 255));
   }
 
   function boxDims(){

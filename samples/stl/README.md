@@ -10,6 +10,7 @@ Public-domain test geometry for 3D mesh runs (`--shape mesh`).
 | `cube_20mm.stl` | trimesh | 20 mm cube (arbitrary units) |
 | `sphere.stl` | [stl-creator](https://github.com/elerac/stl-creator) | ASCII sphere, radius 0.5 |
 | `simple_plane.stl` | [simple-plane](https://github.com/RLuckom/simple-plane) | Small toy-style airplane (OpenSCAD) |
+| `tunnel_plane.stl` | `make_tunnel_plane.py` (this repo) | Simple aircraft made for the tunnel: one closed surface, thick wings and tail (NACA 0018 / 0020) that survive a coarse grid. Axes are the tunnel's (x downstream, y up, z across): use orientation **as in the file** |
 
 Use `--mesh-orient auto` (default) to PCA-align the mesh: stream +x, wingspan +y, thickness +z.
 
@@ -41,6 +42,10 @@ python3 cli3d.py --shape mesh --stl-path samples/stl/simple_plane.stl \
 3. Set **Size** (cells across) and check the preview: parts thinner than a cell
    at that size fall between the cell centres (`simple_plane.stl`'s wings fill
    in only from ~80 cells across)
+
+`tunnel_plane.stl`: orientation **as in the file**, Size 48 in a 144 x 72 x 96
+tunnel (wing root two cells thick, 1.8% blockage by area), or Size 64 in
+192 x 96 x 128 for a smoother aircraft.
 
 ## GUI
 
